@@ -1012,6 +1012,9 @@ pub trait FileSystemMakerData: Send + Sync {
 pub type FileSystemNewFunction =
     fn(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError>;
 
+//分布式初始化器
+//该宏用于定义一个分布式的文件系统初始化器数组
+//FSMAKER存放FileSystemMaker的数组
 #[macro_export]
 macro_rules! define_filesystem_maker_slice {
     ($name:ident) => {
@@ -1026,7 +1029,12 @@ macro_rules! define_filesystem_maker_slice {
 /// 调用指定数组中的所有初始化器
 #[macro_export]
 macro_rules! producefs {
-    ($initializer_slice:ident,$filesystem:ident,$raw_data : ident) => {
+    ($initializer_slice:ident,$filesystem:ident,$raw_data : ident) => {{
+    
+        log::info!("Available filesystems: :");
+        for maker in $initializer_slice.iter() {
+            log::info!("  {}", maker.name);
+        }
         match $initializer_slice.iter().find(|&m| m.name == $filesystem) {
             Some(maker) => {
                 let mount_data = match $filesystem {
@@ -1043,7 +1051,7 @@ macro_rules! producefs {
                 Err(SystemError::EINVAL)
             }
         }
-    };
+    }};
 }
 
 define_filesystem_maker_slice!(FSMAKER);

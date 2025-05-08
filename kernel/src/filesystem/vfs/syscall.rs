@@ -1732,6 +1732,13 @@ impl Syscall {
         let fstype_str = user_access::check_and_clone_cstr(filesystemtype, Some(MAX_PATHLEN))?;
         let fstype_str = fstype_str.to_str().map_err(|_| SystemError::EINVAL)?;
 
+        let source = if !_source.is_null() {
+            let source_cstr = user_access::check_and_clone_cstr(_source, Some(MAX_PATHLEN))?;
+            Some(source_cstr.into_string().map_err(|_| SystemError::EINVAL)?)
+        } else {
+            None
+        };
+        //挂载文件系统
         let fstype = producefs!(FSMAKER, fstype_str, data)?;
 
         Vcore::do_mount(fstype, &target)?;

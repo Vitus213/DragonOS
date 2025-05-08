@@ -11,7 +11,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-
+use crate::filesystem::vfs::FileSystemMakerData;
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::device::device_number::DeviceNumber;
 use crate::filesystem::page_cache::PageCache;
@@ -1981,4 +1981,28 @@ impl Iterator for ClusterIter<'_> {
         self.current_cluster = new;
         return ret;
     }
+}
+pub fn fat_new(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError> {
+    // 从 data 中提取 gendisk
+    let gendisk = data
+        .and_then(|d| d.as_any().downcast_ref::<Arc<GenDisk>>())
+        .ok_or(SystemError::EINVAL)?;
+
+    // 创建 FAT 文件系统实例
+    let fs = FATFileSystem::new(gendisk.clone())?;
+
+    // 返回动态文件系统实例
+    Ok(fs as Arc<dyn FileSystem> )
+}
+pub fn vfat_new(data: Option<&dyn FileSystemMakerData>) -> Result<Arc<dyn FileSystem>, SystemError> {
+    // 从 data 中提取 gendisk
+    let gendisk = data
+        .and_then(|d| d.as_any().downcast_ref::<Arc<GenDisk>>())
+        .ok_or(SystemError::EINVAL)?;
+
+    // 创建 VFAT 文件系统实例
+    let fs = FATFileSystem::new(gendisk.clone())?;
+
+    // 返回动态文件系统实例
+    Ok(fs as Arc<dyn FileSystem> )
 }
