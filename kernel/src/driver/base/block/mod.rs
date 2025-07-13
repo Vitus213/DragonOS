@@ -1,6 +1,7 @@
 pub mod block_device;
 pub mod disk_info;
 pub mod gendisk;
+pub mod loopdevice;
 pub mod manager;
 
 #[derive(Debug)]
