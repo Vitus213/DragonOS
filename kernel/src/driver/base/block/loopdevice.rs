@@ -172,6 +172,7 @@ impl KObject for LoopBus {
 
 /// Loop设备驱动
 #[derive(Debug)]
+#[cast_to([sync] Driver)]
 pub struct LoopDeviceDriver {
     common_data: SpinLock<DriverCommonData>,
     kobj_state: LockedKObjectState,
@@ -290,11 +291,14 @@ pub fn loop_driver() -> Option<Arc<LoopDeviceDriver>> {
 /// 初始化 Loop 设备子系统
 #[unified_init(INITCALL_POSTCORE)]
 pub fn loop_init() -> Result<(), SystemError> {
+    log::info!("Initializing Loop device subsystem");
+
     // 初始化管理器
     unsafe {
         LOOP_MANAGER = Some(LoopManager::new());
     }
-
+    // 注册 Loop 设备 ID 分配器
+    // loop_manager().register_id_allocator("loop", Arc::new(LoopManager::new())); // Removed: No such method
     // 创建并注册总线
     let bus = LoopBus::new();
     bus_manager().register(bus.clone())?;
@@ -314,13 +318,27 @@ pub fn loop_init() -> Result<(), SystemError> {
         LOOP_DRIVER = Some(driver);
     }
 
+    // 创建并注册8个loop设备
+    for i in 0..LoopManager::MAX_DEVICES {
+        let dummy_inode = Arc::new(DummyIndexNode::new(i)); // 创建一个虚拟的文件节点
+        if let Err(e) = create_loop_device(dummy_inode) {
+            log::error!("Failed to create loop device {}: {:?}", i, e);
+        } else {
+            log::info!("Successfully created loop device loop{}", i);
+        }
+    }
+    log::info!("initializing loop device complete");
+
     Ok(())
+
 }
 
 /// 创建并注册一个新的 loop 设备
 pub fn create_loop_device(file_inode: Arc<dyn IndexNode>) -> Result<Arc<LoopDevice>, SystemError> {
+    log::info!("starting to create loop device");
+    log::info!("Creating loop device for file: {:?}", file_inode);
     // 创建设备 ID
-    let dev_id = DeviceId::new(None, None).unwrap_or_else(|| DeviceId::new(Some("loop"), Some("unknown".to_string())).unwrap());
+    let dev_id = DeviceId::new(None, None).unwrap_or_else(|| DeviceId::new(Some("loop"), Some("unknown".to_string())).expect("Failed to create device ID"));
     
     // 创建 loop 设备
     let loop_device = LoopDevice::new(file_inode, dev_id)
@@ -352,7 +370,6 @@ pub struct LoopDevice{
     locked_kobj_state: LockedKObjectState,//对Kobject状态的锁
     self_ref: Weak<Self>,//对自身的弱引用
     fs: RwLock<Weak<DevFS>>,//文件系统弱引用
-    metadata: Metadata,
 }
 //Inner内数据会改变所以加锁
 pub struct LoopDeviceInner{
@@ -390,10 +407,10 @@ impl LoopDevice{
         self.inner.lock()
     }
 
-    /// 创建新的 loop 设备
+    //将文件绑定到空余的loop设备中,在loop设备里面包着一个indexnode,indexnode是一个trait对文件的一个抽象
     pub fn new(file_inode: Arc<dyn IndexNode>, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
         let devname = loop_manager().alloc_id()?;
-        
+        log::info!("Find loop device with name: {}", devname.name());
         // 获取文件大小
         let file_size = match file_inode.metadata() {
             Ok(metadata) => metadata.size,
@@ -419,27 +436,10 @@ impl LoopDevice{
                 device_common: DeviceCommonData::default(),
             }),
             block_dev_meta: BlockDevMeta::new(devname, Major::new(7)), // Loop 设备主设备号为 7
-            dev_id,
+            dev_id,// DeviceId { ty: "loop", name: "loop3" }
             locked_kobj_state: LockedKObjectState::default(),
             self_ref: self_ref.clone(),
             fs: RwLock::new(Weak::default()),
-            metadata: Metadata {
-                dev_id: 0,
-                inode_id: InodeId::new(1),
-                size: file_size,
-                blk_size: 0,
-                blocks: 0,
-                atime: crate::time::PosixTimeSpec::default(),
-                mtime: crate::time::PosixTimeSpec::default(),
-                ctime: crate::time::PosixTimeSpec::default(),
-                btime: crate::time::PosixTimeSpec::default(),
-                file_type: crate::filesystem::vfs::FileType::BlockDevice,
-                mode: crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o644),
-                nlinks: 1,
-                uid: 0,
-                gid: 0,
-                raw_dev: DeviceNumber::new(Major::new(7), 0),
-            },
         });
 
         Some(dev)
@@ -531,6 +531,7 @@ impl KObject for LoopDevice {
     }
 }
 
+//对loopdevice进行抽象
 impl IndexNode for LoopDevice {
     fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
         todo!()
@@ -564,7 +565,25 @@ impl IndexNode for LoopDevice {
         Err(SystemError::ENOSYS)
     }
      fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
-        Ok(self.metadata.clone())
+        let file_metadata = self.inner().file_inode.metadata()?;
+        let metadata = Metadata{
+            dev_id: 0,
+            inode_id: InodeId::new(0), // Loop 设备通常没有实际的 inode ID
+            size: self.inner().file_size as i64,
+            blk_size: LBA_SIZE as usize,
+            blocks: (self.inner().file_size + LBA_SIZE - 1) / LBA_SIZE as usize, // 计算块数
+            atime: file_metadata.atime,
+            mtime: file_metadata.mtime,
+            ctime: file_metadata.ctime,
+            btime: file_metadata.btime,
+            file_type: crate::filesystem::vfs::FileType::BlockDevice,
+            mode: crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o644),
+            nlinks: 1,
+            uid: 0, // 默认用户 ID
+            gid: 0, // 默认组 ID
+            raw_dev: self.inner().device_number,
+        };
+        Ok(metadata.clone())
     }
 }
 
@@ -656,7 +675,6 @@ impl BlockDevice for LoopDevice {
         drop(inner);
         GeneralBlockRange::new(0, blocks).unwrap()
     }
-
     fn read_at_sync(
         &self,
         lba_id_start: BlockId,
@@ -730,7 +748,7 @@ impl BlockDevice for LoopDevice {
     }
 }
 
-/// Loop 设备管理器
+/// Loop 设备管理器,负责分配和释放 Loop 设备 ID
 static mut LOOP_MANAGER: Option<LoopManager> = None;
 
 #[inline]
@@ -744,6 +762,7 @@ pub struct LoopManager {
 }
 
 struct InnerLoopManager {
+    //管理loop设备分配情况
     id_bmp: bitmap::StaticBitmap<{ LoopManager::MAX_DEVICES }>,
     devname: [Option<DevName>; LoopManager::MAX_DEVICES],
 }
@@ -785,6 +804,72 @@ impl LoopManager {
         }
         self.inner().id_bmp.set(id, false);
         self.inner().devname[id] = None;
+    }
+}
+
+/// 定义一个虚拟的 IndexNode 实现，用于占位
+#[derive(Debug)]
+struct DummyIndexNode {
+    id: usize,
+}
+
+impl DummyIndexNode {
+    pub fn new(id: usize) -> Self {
+        Self { id }
+    }
+}
+
+impl IndexNode for DummyIndexNode {
+    fn fs(&self) -> Arc<dyn crate::filesystem::vfs::FileSystem> {
+        todo!()
+    }
+
+    fn as_any_ref(&self) -> &dyn core::any::Any {
+        self
+    }
+
+    fn read_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &mut [u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn write_at(
+        &self,
+        _offset: usize,
+        _len: usize,
+        _buf: &[u8],
+        _data: SpinLockGuard<crate::filesystem::vfs::FilePrivateData>,
+    ) -> Result<usize, SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {
+        Err(SystemError::ENOSYS)
+    }
+
+    fn metadata(&self) -> Result<crate::filesystem::vfs::Metadata, SystemError> {
+        Ok(crate::filesystem::vfs::Metadata {
+            dev_id: 0,
+            inode_id: InodeId::new(self.id),
+            size: 0,
+            blk_size: 0,
+            blocks: 0,
+            atime: crate::time::PosixTimeSpec::default(),
+            mtime: crate::time::PosixTimeSpec::default(),
+            ctime: crate::time::PosixTimeSpec::default(),
+            btime: crate::time::PosixTimeSpec::default(),
+            file_type: crate::filesystem::vfs::FileType::BlockDevice,
+            mode: crate::filesystem::vfs::syscall::ModeType::from_bits_truncate(0o644),
+            nlinks: 1,
+            uid: 0,
+            gid: 0,
+            raw_dev: DeviceNumber::new(Major::new(7), self.id as u32),
+        })
     }
 }
 
