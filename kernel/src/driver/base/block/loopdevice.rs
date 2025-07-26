@@ -430,18 +430,34 @@ impl BlockDevice for LoopDevice {
 #[derive(Debug)]
 #[cast_to([sync] Driver)]
 pub struct LoopDeviceDriver {
-    common_data: SpinLock<DriverCommonData>,
+    inner: SpinLock<InnerLoopDeviceDriver>,
     kobj_state: LockedKObjectState,
-    kobject_common: SpinLock<KObjectCommonData>,
 }
-
+struct InnerLoopDeviceDriver{
+    driver_common: DriverCommonData,
+    kobj_common: KObjectCommonData,
+}
+impl Debug for InnerLoopDeviceDriver {
+    fn fmt(&self, f: &mut Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("InnerLoopDeviceDriver")
+            .field("driver_common", &self.driver_common)
+            .field("kobj_common", &self.kobj_common)
+            .finish()
+    }
+}
 impl LoopDeviceDriver {
     pub fn new() -> Arc<Self> {
+        let inner = InnerLoopDeviceDriver{
+            driver_common: DriverCommonData::default(),
+            kobj_common: KObjectCommonData::default(),
+        };
         Arc::new(Self {
-            common_data: SpinLock::new(DriverCommonData::default()),
+            inner: SpinLock::new(inner),
             kobj_state: LockedKObjectState::default(),
-            kobject_common: SpinLock::new(KObjectCommonData::default()),
         })
+    }
+    fn inner(&self) -> SpinLockGuard<InnerLoopDeviceDriver> {
+        self.inner.lock()
     }
 }
 
@@ -450,24 +466,24 @@ impl Driver for LoopDeviceDriver {
         Some(IdTable::new("loop".to_string(), None))
     }
 
-    fn devices(&self) -> Vec<Arc<dyn Device>> {
-        self.common_data.lock().devices.clone()
+     fn devices(&self) -> Vec<Arc<dyn Device>> {
+        self.inner().driver_common.devices.clone()
     }
 
     fn add_device(&self, device: Arc<dyn Device>) {
-        self.common_data.lock().push_device(device);
+        self.inner().driver_common.push_device(device);
     }
 
     fn delete_device(&self, device: &Arc<dyn Device>) {
-        self.common_data.lock().delete_device(device);
+        self.inner().driver_common.delete_device(device);
     }
 
     fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.common_data.lock().bus.clone()
+        self.inner().driver_common.bus.clone()
     }
 
     fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.common_data.lock().bus = bus;
+        self.inner().driver_common.bus = bus;
     }
 }
 
@@ -477,35 +493,35 @@ impl KObject for LoopDeviceDriver {
     }
 
     fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.kobject_common.lock().kern_inode = inode;
+        self.inner().kobj_common.kern_inode = inode;
     }
 
     fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.kobject_common.lock().kern_inode.clone()
+        self.inner().kobj_common.kern_inode.clone()
     }
 
     fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.kobject_common.lock().parent.clone()
+        self.inner().kobj_common.parent.clone()
     }
 
     fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.kobject_common.lock().parent = parent;
+        self.inner().kobj_common.parent = parent;
     }
 
     fn kset(&self) -> Option<Arc<KSet>> {
-        self.kobject_common.lock().kset.clone()
+        self.inner().kobj_common.kset.clone()
     }
 
     fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.kobject_common.lock().kset = kset;
+        self.inner().kobj_common.kset = kset;
     }
 
     fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.kobject_common.lock().kobj_type
+        self.inner().kobj_common.kobj_type
     }
 
     fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.kobject_common.lock().kobj_type = ktype;
+        self.inner().kobj_common.kobj_type = ktype;
     }
 
     fn name(&self) -> String {
@@ -526,6 +542,56 @@ impl KObject for LoopDeviceDriver {
 
     fn set_kobj_state(&self, state: KObjectState) {
         *self.kobj_state.write() = state;
+    }
+}
+//负责管理 Loop 设备 ID 的分配和释放
+pub struct LoopManager {
+    inner: SpinLock<InnerLoopManager>,
+}
+
+struct InnerLoopManager {
+    //管理loop设备分配情况
+    id_bmp: bitmap::StaticBitmap<{ LoopManager::MAX_DEVICES }>,
+    devname: [Option<DevName>; LoopManager::MAX_DEVICES],
+}
+
+impl LoopManager {
+    pub const MAX_DEVICES: usize = 8; // 最多支持 8 个 loop 设备
+
+    pub fn new() -> Self {
+        Self {
+            inner: SpinLock::new(InnerLoopManager {
+                id_bmp: bitmap::StaticBitmap::new(),
+                devname: [const { None }; Self::MAX_DEVICES],
+            }),
+        }
+    }
+
+    fn inner(&self) -> SpinLockGuard<InnerLoopManager> {
+        self.inner.lock()
+    }
+
+    pub fn alloc_id(&self) -> Option<DevName> {
+        let mut inner = self.inner();
+        let idx = inner.id_bmp.first_false_index()?;
+        inner.id_bmp.set(idx, true);
+        let name = Self::format_name(idx);
+        inner.devname[idx] = Some(name.clone());
+        Some(name)
+    }
+
+    /// 生成 loop 设备名称，如 'loop0', 'loop1' 等
+    fn format_name(id: usize) -> DevName {
+        DevName::new(format!("loop{}", id), id)
+    }
+
+    #[allow(dead_code)]
+    pub fn free_id(&self, id: usize) {
+        if id >= Self::MAX_DEVICES {
+            return;
+        }
+        self.inner().id_bmp.set(id, false);
+        self.inner().devname[id] = None;
     }
 }
 /// Loop设备总线
@@ -706,6 +772,7 @@ pub fn loop_init() -> Result<(), SystemError> {
     // 创建并注册8个loop设备
     for i in 0..LoopManager::MAX_DEVICES {
         let dummy_inode = Arc::new(DummyIndexNode::new(i)); // 创建一个虚拟的文件节点
+        log::info!("Creating loop device loop{}", i);
         if let Err(e) = create_loop_device(dummy_inode) {
             log::error!("Failed to create loop device {}: {:?}", i, e);
         } else {
@@ -757,56 +824,7 @@ fn loop_manager() -> &'static LoopManager {
     unsafe { LOOP_MANAGER.as_ref().unwrap() }
 }
 
-//负责管理 Loop 设备 ID 的分配和释放
-pub struct LoopManager {
-    inner: SpinLock<InnerLoopManager>,
-}
 
-struct InnerLoopManager {
-    //管理loop设备分配情况
-    id_bmp: bitmap::StaticBitmap<{ LoopManager::MAX_DEVICES }>,
-    devname: [Option<DevName>; LoopManager::MAX_DEVICES],
-}
-
-impl LoopManager {
-    pub const MAX_DEVICES: usize = 8; // 最多支持 8 个 loop 设备
-
-    pub fn new() -> Self {
-        Self {
-            inner: SpinLock::new(InnerLoopManager {
-                id_bmp: bitmap::StaticBitmap::new(),
-                devname: [const { None }; Self::MAX_DEVICES],
-            }),
-        }
-    }
-
-    fn inner(&self) -> SpinLockGuard<InnerLoopManager> {
-        self.inner.lock()
-    }
-
-    pub fn alloc_id(&self) -> Option<DevName> {
-        let mut inner = self.inner();
-        let idx = inner.id_bmp.first_false_index()?;
-        inner.id_bmp.set(idx, true);
-        let name = Self::format_name(idx);
-        inner.devname[idx] = Some(name.clone());
-        Some(name)
-    }
-
-    /// 生成 loop 设备名称，如 'loop0', 'loop1' 等
-    fn format_name(id: usize) -> DevName {
-        DevName::new(format!("loop{}", id), id)
-    }
-
-    #[allow(dead_code)]
-    pub fn free_id(&self, id: usize) {
-        if id >= Self::MAX_DEVICES {
-            return;
-        }
-        self.inner().id_bmp.set(id, false);
-        self.inner().devname[id] = None;
-    }
-}
 
 /// 定义一个虚拟的 IndexNode 实现，用于占位
 #[derive(Debug)]
