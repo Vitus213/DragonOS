@@ -39,330 +39,8 @@ use crate::{
         spinlock::{SpinLock, SpinLockGuard},
     },
 };
-
-/// Loop设备总线
-#[derive(Debug)]
-pub struct LoopBus {
-    private_data: SpinLock<LoopBusPrivate>,
-    subsystem: SubSysPrivate,
-    kobj_state: LockedKObjectState,
-}
-
-#[derive(Debug)]
-struct LoopBusPrivate {
-    kobject_common: KObjectCommonData, 
-}
-
-impl LoopBus {
-    pub fn new() -> Arc<Self> {
-        let subsystem = SubSysPrivate::new("loop".to_string(), None, None, &[]);
-        Arc::new(Self {
-            private_data: SpinLock::new(LoopBusPrivate {
-                kobject_common: KObjectCommonData::default(),
-            }),
-            subsystem,
-            kobj_state: LockedKObjectState::default(),
-        })
-    }
-}
-
-impl Bus for LoopBus {
-    fn name(&self) -> String {
-        "loop".to_string()
-    }
-
-    fn dev_name(&self) -> String {
-        "loop".to_string()
-    }
-
-    fn root_device(&self) -> Option<Weak<dyn Device>> {
-        None
-    }
-
-    fn set_root_device(&self, _device: Option<Weak<dyn Device>>) {
-        // Loop总线不需要根设备
-    }
-
-    fn subsystem(&self) -> &SubSysPrivate {
-        &self.subsystem
-    }
-
-    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        Ok(())
-    }
-
-    fn shutdown(&self, _device: &Arc<dyn Device>) {
-        // Loop设备关闭逻辑
-    }
-
-    fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
-        Ok(())
-    }
-
-    fn match_device(
-        &self,
-        device: &Arc<dyn Device>,
-        _driver: &Arc<dyn Driver>,
-    ) -> Result<bool, SystemError> {
-        // 检查设备是否为loop设备
-        if device.id_table().name().starts_with("loop") {
-            return Ok(true);
-        }
-        Ok(false)
-    }
-}
-
-impl KObject for LoopBus {
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.private_data.lock().kobject_common.kern_inode = inode;
-    }
-
-    fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.private_data.lock().kobject_common.kern_inode.clone()
-    }
-
-    fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.private_data.lock().kobject_common.parent.clone()
-    }
-
-    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.private_data.lock().kobject_common.parent = parent;
-    }
-
-    fn kset(&self) -> Option<Arc<KSet>> {
-        self.private_data.lock().kobject_common.kset.clone()
-    }
-
-    fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.private_data.lock().kobject_common.kset = kset;
-    }
-
-    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.private_data.lock().kobject_common.kobj_type
-    }
-
-    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.private_data.lock().kobject_common.kobj_type = ktype;
-    }
-
-    fn name(&self) -> String {
-        "loop".to_string()
-    }
-
-    fn set_name(&self, _name: String) {
-        // do nothing
-    }
-
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
-        self.kobj_state.read()
-    }
-
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
-        self.kobj_state.write()
-    }
-
-    fn set_kobj_state(&self, state: KObjectState) {
-        *self.kobj_state.write() = state;
-    }
-}
-
-/// Loop设备驱动
-#[derive(Debug)]
-#[cast_to([sync] Driver)]
-pub struct LoopDeviceDriver {
-    common_data: SpinLock<DriverCommonData>,
-    kobj_state: LockedKObjectState,
-    kobject_common: SpinLock<KObjectCommonData>,
-}
-
-impl LoopDeviceDriver {
-    pub fn new() -> Arc<Self> {
-        Arc::new(Self {
-            common_data: SpinLock::new(DriverCommonData::default()),
-            kobj_state: LockedKObjectState::default(),
-            kobject_common: SpinLock::new(KObjectCommonData::default()),
-        })
-    }
-}
-
-impl Driver for LoopDeviceDriver {
-    fn id_table(&self) -> Option<IdTable> {
-        Some(IdTable::new("loop".to_string(), None))
-    }
-
-    fn devices(&self) -> Vec<Arc<dyn Device>> {
-        self.common_data.lock().devices.clone()
-    }
-
-    fn add_device(&self, device: Arc<dyn Device>) {
-        self.common_data.lock().push_device(device);
-    }
-
-    fn delete_device(&self, device: &Arc<dyn Device>) {
-        self.common_data.lock().delete_device(device);
-    }
-
-    fn bus(&self) -> Option<Weak<dyn Bus>> {
-        self.common_data.lock().bus.clone()
-    }
-
-    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
-        self.common_data.lock().bus = bus;
-    }
-}
-
-impl KObject for LoopDeviceDriver {
-    fn as_any_ref(&self) -> &dyn Any {
-        self
-    }
-
-    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
-        self.kobject_common.lock().kern_inode = inode;
-    }
-
-    fn inode(&self) -> Option<Arc<KernFSInode>> {
-        self.kobject_common.lock().kern_inode.clone()
-    }
-
-    fn parent(&self) -> Option<Weak<dyn KObject>> {
-        self.kobject_common.lock().parent.clone()
-    }
-
-    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
-        self.kobject_common.lock().parent = parent;
-    }
-
-    fn kset(&self) -> Option<Arc<KSet>> {
-        self.kobject_common.lock().kset.clone()
-    }
-
-    fn set_kset(&self, kset: Option<Arc<KSet>>) {
-        self.kobject_common.lock().kset = kset;
-    }
-
-    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
-        self.kobject_common.lock().kobj_type
-    }
-
-    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
-        self.kobject_common.lock().kobj_type = ktype;
-    }
-
-    fn name(&self) -> String {
-        "loop".to_string()
-    }
-
-    fn set_name(&self, _name: String) {
-        // do nothing
-    }
-
-    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
-        self.kobj_state.read()
-    }
-
-    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
-        self.kobj_state.write()
-    }
-
-    fn set_kobj_state(&self, state: KObjectState) {
-        *self.kobj_state.write() = state;
-    }
-}
-
-/// Loop总线全局实例
-static mut LOOP_BUS: Option<Arc<LoopBus>> = None;
-/// Loop驱动全局实例  
-static mut LOOP_DRIVER: Option<Arc<LoopDeviceDriver>> = None;
-
-/// 获取loop总线实例
-pub fn loop_bus() -> Option<Arc<LoopBus>> {
-    unsafe { LOOP_BUS.clone() }
-}
-
-/// 获取loop驱动实例
-pub fn loop_driver() -> Option<Arc<LoopDeviceDriver>> {
-    unsafe { LOOP_DRIVER.clone() }
-}
-
-/// 初始化 Loop 设备子系统
-#[unified_init(INITCALL_POSTCORE)]
-pub fn loop_init() -> Result<(), SystemError> {
-    log::info!("Initializing Loop device subsystem");
-
-    // 初始化管理器
-    unsafe {
-        LOOP_MANAGER = Some(LoopManager::new());
-    }
-    // 注册 Loop 设备 ID 分配器
-    // loop_manager().register_id_allocator("loop", Arc::new(LoopManager::new())); // Removed: No such method
-    // 创建并注册总线
-    let bus = LoopBus::new();
-    bus_manager().register(bus.clone())?;
-    unsafe {
-        LOOP_BUS = Some(bus);
-    }
-
-    // 创建并注册驱动
-    let driver = LoopDeviceDriver::new();
-    if let Some(bus) = loop_bus() {
-        driver.set_bus(Some(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>))));
-    }
-    
-    use crate::driver::base::device::driver::driver_manager;
-    driver_manager().register(driver.clone())?;
-    unsafe {
-        LOOP_DRIVER = Some(driver);
-    }
-
-    // 创建并注册8个loop设备
-    for i in 0..LoopManager::MAX_DEVICES {
-        let dummy_inode = Arc::new(DummyIndexNode::new(i)); // 创建一个虚拟的文件节点
-        if let Err(e) = create_loop_device(dummy_inode) {
-            log::error!("Failed to create loop device {}: {:?}", i, e);
-        } else {
-            log::info!("Successfully created loop device loop{}", i);
-        }
-    }
-    log::info!("initializing loop device complete");
-
-    Ok(())
-
-}
-
-/// 创建并注册一个新的 loop 设备
-pub fn create_loop_device(file_inode: Arc<dyn IndexNode>) -> Result<Arc<LoopDevice>, SystemError> {
-    log::info!("starting to create loop device");
-    log::info!("Creating loop device for file: {:?}", file_inode);
-    // 创建设备 ID
-    let dev_id = DeviceId::new(None, None).unwrap_or_else(|| DeviceId::new(Some("loop"), Some("unknown".to_string())).expect("Failed to create device ID"));
-    
-    // 创建 loop 设备
-    let loop_device = LoopDevice::new(file_inode, dev_id)
-        .ok_or(SystemError::ENOMEM)?;
-
-    // 设置总线
-    if let Some(bus) = loop_bus() {
-        loop_device.set_bus(Some(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>))));
-    }
-
-    // 注册到设备管理器
-    use crate::driver::base::device::device_manager;
-    device_manager().add_device(loop_device.clone())?;
-
-    // 注册到块设备管理器
-    block_dev_manager().register(loop_device.clone() as Arc<dyn BlockDevice>)?;
-    
-    // 注册到 DevFS
-    devfs_register(loop_device.dev_name().name(), loop_device.clone())?;
-    
-    Ok(loop_device)
-}
-
-/// Loop 设备
+const LOOP_BASENAME: &str = "loop";
+//LoopDevice是一个虚拟的块设备，它将文件映射到块设备上.
 pub struct LoopDevice{
     inner:SpinLock<LoopDeviceInner>,//加锁保护LoopDeviceInner
     block_dev_meta: BlockDevMeta,
@@ -474,7 +152,6 @@ impl LoopDevice{
     }
 }
 
-const LOOP_BASENAME: &str = "loop";
 impl KObject for LoopDevice {
     fn as_any_ref(&self) -> &dyn Any {
         self
@@ -747,6 +424,330 @@ impl BlockDevice for LoopDevice {
         Vec::new()
     }
 }
+
+
+/// Loop设备驱动
+#[derive(Debug)]
+#[cast_to([sync] Driver)]
+pub struct LoopDeviceDriver {
+    common_data: SpinLock<DriverCommonData>,
+    kobj_state: LockedKObjectState,
+    kobject_common: SpinLock<KObjectCommonData>,
+}
+
+impl LoopDeviceDriver {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            common_data: SpinLock::new(DriverCommonData::default()),
+            kobj_state: LockedKObjectState::default(),
+            kobject_common: SpinLock::new(KObjectCommonData::default()),
+        })
+    }
+}
+
+impl Driver for LoopDeviceDriver {
+    fn id_table(&self) -> Option<IdTable> {
+        Some(IdTable::new("loop".to_string(), None))
+    }
+
+    fn devices(&self) -> Vec<Arc<dyn Device>> {
+        self.common_data.lock().devices.clone()
+    }
+
+    fn add_device(&self, device: Arc<dyn Device>) {
+        self.common_data.lock().push_device(device);
+    }
+
+    fn delete_device(&self, device: &Arc<dyn Device>) {
+        self.common_data.lock().delete_device(device);
+    }
+
+    fn bus(&self) -> Option<Weak<dyn Bus>> {
+        self.common_data.lock().bus.clone()
+    }
+
+    fn set_bus(&self, bus: Option<Weak<dyn Bus>>) {
+        self.common_data.lock().bus = bus;
+    }
+}
+
+impl KObject for LoopDeviceDriver {
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        self.kobject_common.lock().kern_inode = inode;
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        self.kobject_common.lock().kern_inode.clone()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        self.kobject_common.lock().parent.clone()
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        self.kobject_common.lock().parent = parent;
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        self.kobject_common.lock().kset.clone()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        self.kobject_common.lock().kset = kset;
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        self.kobject_common.lock().kobj_type
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.kobject_common.lock().kobj_type = ktype;
+    }
+
+    fn name(&self) -> String {
+        "loop".to_string()
+    }
+
+    fn set_name(&self, _name: String) {
+        // do nothing
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        self.kobj_state.read()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        self.kobj_state.write()
+    }
+
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.kobj_state.write() = state;
+    }
+}
+/// Loop设备总线
+#[derive(Debug)]
+pub struct LoopBus {
+    private_data: SpinLock<LoopBusPrivate>,
+    subsystem: SubSysPrivate,
+    kobj_state: LockedKObjectState,
+}
+
+#[derive(Debug)]
+struct LoopBusPrivate {
+    kobject_common: KObjectCommonData, 
+}
+
+impl LoopBus {
+    pub fn new() -> Arc<Self> {
+        let subsystem = SubSysPrivate::new("loop".to_string(), None, None, &[]);
+        Arc::new(Self {
+            private_data: SpinLock::new(LoopBusPrivate {
+                kobject_common: KObjectCommonData::default(),
+            }),
+            subsystem,
+            kobj_state: LockedKObjectState::default(),
+        })
+    }
+}
+
+impl Bus for LoopBus {
+    fn name(&self) -> String {
+        "loop".to_string()
+    }
+
+    fn dev_name(&self) -> String {
+        "loop".to_string()
+    }
+
+    fn root_device(&self) -> Option<Weak<dyn Device>> {
+        None
+    }
+
+    fn set_root_device(&self, _device: Option<Weak<dyn Device>>) {
+        // Loop总线不需要根设备
+    }
+
+    fn subsystem(&self) -> &SubSysPrivate {
+        &self.subsystem
+    }
+
+    fn remove(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn shutdown(&self, _device: &Arc<dyn Device>) {
+        // Loop设备关闭逻辑
+    }
+
+    fn resume(&self, _device: &Arc<dyn Device>) -> Result<(), SystemError> {
+        Ok(())
+    }
+
+    fn match_device(
+        &self,
+        device: &Arc<dyn Device>,
+        _driver: &Arc<dyn Driver>,
+    ) -> Result<bool, SystemError> {
+        // 检查设备是否为loop设备
+        if device.id_table().name().starts_with("loop") {
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
+impl KObject for LoopBus {
+    fn as_any_ref(&self) -> &dyn Any {
+        self
+    }
+
+    fn set_inode(&self, inode: Option<Arc<KernFSInode>>) {
+        self.private_data.lock().kobject_common.kern_inode = inode;
+    }
+
+    fn inode(&self) -> Option<Arc<KernFSInode>> {
+        self.private_data.lock().kobject_common.kern_inode.clone()
+    }
+
+    fn parent(&self) -> Option<Weak<dyn KObject>> {
+        self.private_data.lock().kobject_common.parent.clone()
+    }
+
+    fn set_parent(&self, parent: Option<Weak<dyn KObject>>) {
+        self.private_data.lock().kobject_common.parent = parent;
+    }
+
+    fn kset(&self) -> Option<Arc<KSet>> {
+        self.private_data.lock().kobject_common.kset.clone()
+    }
+
+    fn set_kset(&self, kset: Option<Arc<KSet>>) {
+        self.private_data.lock().kobject_common.kset = kset;
+    }
+
+    fn kobj_type(&self) -> Option<&'static dyn KObjType> {
+        self.private_data.lock().kobject_common.kobj_type
+    }
+
+    fn set_kobj_type(&self, ktype: Option<&'static dyn KObjType>) {
+        self.private_data.lock().kobject_common.kobj_type = ktype;
+    }
+
+    fn name(&self) -> String {
+        "loop".to_string()
+    }
+
+    fn set_name(&self, _name: String) {
+        // do nothing
+    }
+
+    fn kobj_state(&self) -> RwLockReadGuard<KObjectState> {
+        self.kobj_state.read()
+    }
+
+    fn kobj_state_mut(&self) -> RwLockWriteGuard<KObjectState> {
+        self.kobj_state.write()
+    }
+
+    fn set_kobj_state(&self, state: KObjectState) {
+        *self.kobj_state.write() = state;
+    }
+}
+
+/// Loop总线全局实例
+static mut LOOP_BUS: Option<Arc<LoopBus>> = None;
+/// Loop驱动全局实例  
+static mut LOOP_DRIVER: Option<Arc<LoopDeviceDriver>> = None;
+
+/// 获取loop总线实例
+pub fn loop_bus() -> Option<Arc<LoopBus>> {
+    unsafe { LOOP_BUS.clone() }
+}
+
+/// 获取loop驱动实例
+pub fn loop_driver() -> Option<Arc<LoopDeviceDriver>> {
+    unsafe { LOOP_DRIVER.clone() }
+}
+
+/// 初始化 Loop 设备子系统
+#[unified_init(INITCALL_POSTCORE)]
+pub fn loop_init() -> Result<(), SystemError> {
+    log::info!("Initializing Loop device subsystem");
+
+    // 初始化管理器
+    unsafe {
+        LOOP_MANAGER = Some(LoopManager::new());
+    }
+    // 注册 Loop 设备 ID 分配器
+    // loop_manager().register_id_allocator("loop", Arc::new(LoopManager::new())); // Removed: No such method
+    // 创建并注册总线
+    let bus = LoopBus::new();
+    bus_manager().register(bus.clone())?;
+    unsafe {
+        LOOP_BUS = Some(bus);
+    }
+
+    // 创建并注册驱动
+    let driver = LoopDeviceDriver::new();
+    if let Some(bus) = loop_bus() {
+        driver.set_bus(Some(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>))));
+    }
+    
+    use crate::driver::base::device::driver::driver_manager;
+    driver_manager().register(driver.clone())?;
+    unsafe {
+        LOOP_DRIVER = Some(driver);
+    }
+
+    // 创建并注册8个loop设备
+    for i in 0..LoopManager::MAX_DEVICES {
+        let dummy_inode = Arc::new(DummyIndexNode::new(i)); // 创建一个虚拟的文件节点
+        if let Err(e) = create_loop_device(dummy_inode) {
+            log::error!("Failed to create loop device {}: {:?}", i, e);
+        } else {
+            log::info!("Successfully created loop device loop{}", i);
+        }
+    }
+    log::info!("initializing loop device complete");
+
+    Ok(())
+
+}
+
+/// 创建并注册一个新的 loop 设备
+pub fn create_loop_device(file_inode: Arc<dyn IndexNode>) -> Result<Arc<LoopDevice>, SystemError> {
+    log::info!("starting to create loop device");
+    log::info!("Creating loop device for file: {:?}", file_inode);
+    // 创建设备 ID
+    let dev_id = DeviceId::new(None, None).unwrap_or_else(|| DeviceId::new(Some("loop"), Some("unknown".to_string())).expect("Failed to create device ID"));
+    
+    // 创建 loop 设备
+    let loop_device = LoopDevice::new(file_inode, dev_id)
+        .ok_or(SystemError::ENOMEM)?;
+
+    // 设置总线
+    if let Some(bus) = loop_bus() {
+        loop_device.set_bus(Some(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>))));
+    }
+
+    // 注册到设备管理器
+    use crate::driver::base::device::device_manager;
+    device_manager().add_device(loop_device.clone())?;
+
+    // 注册到块设备管理器
+    block_dev_manager().register(loop_device.clone() as Arc<dyn BlockDevice>)?;
+    
+    // 注册到 DevFS
+    devfs_register(loop_device.dev_name().name(), loop_device.clone())?;
+    
+    Ok(loop_device)
+}
+
+
 
 /// Loop 设备管理器,负责分配和释放 Loop 设备 ID
 static mut LOOP_MANAGER: Option<LoopManager> = None;
