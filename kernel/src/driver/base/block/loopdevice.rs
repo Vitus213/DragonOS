@@ -84,24 +84,33 @@ impl LoopDevice{
     fn inner(&self) -> SpinLockGuard<LoopDeviceInner> {
         self.inner.lock()
     }
-
     //将文件绑定到空余的loop设备中,在loop设备里面包着一个indexnode,indexnode是一个trait对文件的一个抽象
-    pub fn new(file_inode: Arc<dyn IndexNode>, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
+    pub fn new(file_inode: Option<Arc<dyn IndexNode>>, dev_id: Arc<DeviceId>) -> Option<Arc<Self>> {
         let devname = loop_manager().alloc_id()?;
         log::info!("Find loop device with name: {}", devname.name());
-        // 获取文件大小
-        let file_size = match file_inode.metadata() {
-            Ok(metadata) => metadata.size,
-            Err(_) => {
-                error!("Failed to get file metadata for loop device");
-                return None;
+        
+        // 获取文件大小，如果没有文件则为 0
+        let file_size = if let Some(ref inode) = file_inode {
+            match inode.metadata() {
+                Ok(metadata) => metadata.size,
+                Err(_) => {
+                    error!("Failed to get file metadata for loop device");
+                    return None;
+                }
             }
+        } else {
+            0 // 没有绑定文件时，大小为 0
         };
+        log::info!("Loop device file size: {}", file_size);
+        // 创建默认的虚拟 inode（如果没有提供文件）
+        let actual_file_inode = file_inode.unwrap_or_else(|| {
+            Arc::new(DummyIndexNode::new(0))
+        });
         
         let dev = Arc::new_cyclic(|self_ref| Self {
             inner: SpinLock::new(
             LoopDeviceInner {
-                file_inode,
+                file_inode: actual_file_inode,
                 file_size: file_size as usize,
                 device_number: DeviceNumber::new(Major::new(7), 0), // Loop 设备主设备号为 7
                 offset: 0,
@@ -114,7 +123,7 @@ impl LoopDevice{
                 device_common: DeviceCommonData::default(),
             }),
             block_dev_meta: BlockDevMeta::new(devname, Major::new(7)), // Loop 设备主设备号为 7
-            dev_id,// DeviceId { ty: "loop", name: "loop3" }
+            dev_id,
             locked_kobj_state: LockedKObjectState::default(),
             self_ref: self_ref.clone(),
             fs: RwLock::new(Weak::default()),
@@ -350,7 +359,10 @@ impl BlockDevice for LoopDevice {
         let inner = self.inner();
         let blocks = inner.file_size / LBA_SIZE;
         drop(inner);
-        GeneralBlockRange::new(0, blocks).unwrap()
+        GeneralBlockRange::new(0, blocks).unwrap_or(GeneralBlockRange {
+            lba_start: 0,
+            lba_end: 0,
+        })
     }
     fn read_at_sync(
         &self,
@@ -771,9 +783,9 @@ pub fn loop_init() -> Result<(), SystemError> {
 
     // 创建并注册8个loop设备
     for i in 0..LoopManager::MAX_DEVICES {
-        let dummy_inode = Arc::new(DummyIndexNode::new(i)); // 创建一个虚拟的文件节点
+        //let dummy_inode = Arc::new(DummyIndexNode::new(i)); // 创建一个虚拟的文件节点
         log::info!("Creating loop device loop{}", i);
-        if let Err(e) = create_loop_device(dummy_inode) {
+        if let Err(e) = create_loop_device(i as u32,Arc::new(DummyIndexNode::new(i))) {
             log::error!("Failed to create loop device {}: {:?}", i, e);
         } else {
             log::info!("Successfully created loop device loop{}", i);
@@ -786,31 +798,40 @@ pub fn loop_init() -> Result<(), SystemError> {
 }
 
 /// 创建并注册一个新的 loop 设备
-pub fn create_loop_device(file_inode: Arc<dyn IndexNode>) -> Result<Arc<LoopDevice>, SystemError> {
+pub fn create_loop_device(device_num: u32,file_inode: Arc<dyn IndexNode>) -> Result<Arc<LoopDevice>, SystemError> {
     log::info!("starting to create loop device");
     log::info!("Creating loop device for file: {:?}", file_inode);
     // 创建设备 ID
-    let dev_id = DeviceId::new(None, None).unwrap_or_else(|| DeviceId::new(Some("loop"), Some("unknown".to_string())).expect("Failed to create device ID"));
-    
+    let device_name = format!("loop{}", device_num);
+    let dev_id = DeviceId::new(None, Some(device_name)).expect("Failed to create device ID");
+    log::info!("Loop device ID: {:?}", dev_id);
     // 创建 loop 设备
-    let loop_device = LoopDevice::new(file_inode, dev_id)
+    let loop_device = LoopDevice::new(Some(file_inode), dev_id)
         .ok_or(SystemError::ENOMEM)?;
-
+    log::info!("Loop device created: {:?}", loop_device);
     // 设置总线
     if let Some(bus) = loop_bus() {
         loop_device.set_bus(Some(Arc::downgrade(&(bus.clone() as Arc<dyn Bus>))));
     }
-
-    // 注册到设备管理器
+    log::info!("Loop device bus set: {:?}", loop_device.bus());
+    //关联loop设备驱动
+    if let Some(driver) = loop_driver(){
+        loop_device.set_driver(Some(Arc::downgrade(&(driver.clone() as Arc<dyn Driver>))));
+        // 同时将设备添加到驱动的设备列表中
+        driver.add_device(loop_device.clone() as Arc<dyn Device>);
+        log::info!("Loop device driver set: {:?}", loop_device.driver());
+    }
+    // 注册到设备管理器,提前给loopdevice绑定一个驱动
     use crate::driver::base::device::device_manager;
     device_manager().add_device(loop_device.clone())?;
-
+    log::info!("Loop device registered to device manager: {:?}", loop_device);
     // 注册到块设备管理器
     block_dev_manager().register(loop_device.clone() as Arc<dyn BlockDevice>)?;
-    
-    // 注册到 DevFS
+    log::info!("Loop device registered to block device manager: {:?}", loop_device);
+   // 注册到 DevFS
+   log::info!("fuck {:?}",loop_device.dev_name().name());
     devfs_register(loop_device.dev_name().name(), loop_device.clone())?;
-    
+    log::info!("Loop device registered to DevFS: {:?}", loop_device);
     Ok(loop_device)
 }
 
