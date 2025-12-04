@@ -456,14 +456,15 @@ impl EventPoll {
                 push_back.push(epitem);
                 break;
             }
-            let mut ep_events = EPollEventType::from_bits_truncate(epitem.event.read().events);
-            // 再次poll获取事件(为了防止水平触发一直加入队列)
+            let mut ep_events = EPollEventType::empty();
             let revents = epitem.ep_item_poll();
+            let priv_bits = EPollEventType::from_bits_truncate(epitem.event.read().events)
+                .intersection(EPollEventType::EP_PRIVATE_BITS);
             if revents.is_empty() {
                 // TODO: one-shot event will be lost here
                 // continue;
             }
-            ep_events |= revents;
+            ep_events |= revents | priv_bits;
             // 构建触发事件结构体
             let event = EPollEvent {
                 events: ep_events.bits,

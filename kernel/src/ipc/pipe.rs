@@ -490,9 +490,15 @@ impl IndexNode for LockedPipeInode {
             guard.writer -= 1;
             // 如果已经没有写端了，则唤醒读端
             if guard.writer == 0 {
+                // 写端耗尽意味着读端应收到 POLLHUP，唤醒等待者与 epoll
+                let poll_data = FilePrivateData::Pipefs(PipeFsPrivateData { flags });
+                let pollflag =
+                    EPollEventType::from_bits_truncate(guard.poll(&poll_data)? as u32);
                 drop(guard); // 先释放 inner 锁，避免潜在的死锁
                 self.read_wait_queue
                     .wakeup_all(Some(ProcessState::Blocked(true)));
+                // 唤醒所有依赖 epoll 的等待者，确保 HUP 事件可见
+                EventPoll::wakeup_epoll(&self.epitems, pollflag)?;
                 return Ok(());
             }
         }

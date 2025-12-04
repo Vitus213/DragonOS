@@ -43,7 +43,8 @@ impl<'a> PollAdapter<'a> {
                 continue;
             }
             let mut epoll_event = EPollEvent::default();
-            let poll_flags = PollFlags::from_bits_truncate(pollfd.events);
+            let mut poll_flags = PollFlags::from_bits_truncate(pollfd.events);
+            poll_flags |= PollFlags::POLLERR | PollFlags::POLLHUP;
             let ep_events: EPollEventType = poll_flags.into();
             epoll_event.set_events(ep_events.bits());
             epoll_event.set_data(i as u64);
