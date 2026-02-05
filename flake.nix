@@ -80,7 +80,8 @@
                 vmstateDir = "${buildDir}/vmstate";
               };
 
-              startPkg = qemuScripts.${target};
+              startPkg = qemuScripts.script.${target};
+              testPkg = qemuScripts.testScript.${target};
               rootfsPkg = pkgs.callPackage ./user/default.nix {
                 inherit
                   lib
@@ -95,6 +96,21 @@
                   diskPath
                   ;
               };
+
+              # 一键化构建测试脚本 (test-syscall: make kernel + rootfs + test)
+              testApp = pkgs.writeScriptBin "dragonos-test-syscall" ''
+                #!${pkgs.runtimeShell}
+                set -e
+
+                echo "==> Step 1: Building kernel with make kernel..."
+                ${pkgs.gnumake}/bin/make kernel
+
+                echo "==> Step 2: Building rootfs (re-evaluating userland packages)..."
+                ${pkgs.nix}/bin/nix run .#rootfs-${target}
+
+                echo "==> Step 3: Starting DragonOS syscall test with monitoring..."
+                exec ${pkgs.nix}/bin/nix run .#test-${target} -- "$@"
+              '';
 
               # 一键化构建启动脚本 (yolo: You Only Live Once - 一条命令跑通全部)
               runApp = pkgs.writeScriptBin "dragonos-yolo" ''
@@ -113,6 +129,12 @@
             in
             {
               apps = {
+                # test-syscall-${target}: 一键化构建并测试syscall (make kernel + rootfs + test with monitoring)
+                "test-syscall-${target}" = {
+                  type = "app";
+                  program = "${testApp}/bin/dragonos-test-syscall";
+                  meta.description = "一键化构建并测试syscall (${target})";
+                };
                 # yolo-${target}: 一键化构建启动命令 (make kernel + rootfs + start)
                 "yolo-${target}" = {
                   type = "app";
@@ -134,10 +156,18 @@
                   program = "${rootfsPkg}/bin/dragonos-rootfs";
                   meta.description = "构建 ${target} rootfs 镜像";
                 };
+                # test-${target}: 运行带监控的syscall测试 (需要先构建kernel和rootfs)
+                "test-${target}" = {
+                  type = "app";
+                  program = "${testPkg}/bin/dragonos-test";
+                  meta.description = "运行 ${target} syscall测试 (带监控)";
+                };
               };
               packages = {
+                "test-syscall-${target}" = testApp;
                 "yolo-${target}" = runApp;
                 "start-${target}" = startPkg;
+                "test-${target}" = testPkg;
                 "rootfs-${target}" = rootfsPkg;
               };
             };
@@ -200,9 +230,11 @@
               echo "要运行 DragonOS，请构建内核、rootfs，再QEMU运行"
               echo ""
               echo "  一键运行:    nix run .#yolo-x86_64"
+              echo "  一键测试:    nix run .#test-syscall-x86_64"
               echo "  构建内核:    make kernel"
               echo "  构建 rootfs: nix run .#rootfs-x86_64"
               echo "  QEMU 运行:   nix run .#start-x86_64"
+              echo "  运行测试:    nix run .#test-x86_64 (需要先构建kernel和rootfs)"
               echo ""
               echo "  文档：       https://docs.dragonos.org.cn/"
             '';

@@ -99,12 +99,16 @@ let
       arch,
       isNographic,
       qemuBin,
+      testMode ? false,
     }:
     let
       qemuConfig = mkQemuArgs { inherit arch isNographic; };
       qemuFlagsStr = lib.escapeShellArgs qemuConfig.flags;
 
       initProgram = if arch == "riscv64" then "/bin/riscv_rust_init" else "/bin/busybox init";
+
+      # cmdline 中的 AUTO_TEST 参数
+      autoTestValue = if testMode then "syscall" else testOpt.autotest;
 
       # Define static parts of arguments using Nix lists
       commonArchArgs =
@@ -159,8 +163,14 @@ let
           '';
 
       # VM 状态目录配置
-      vmstateDirStr = if vmstateDir != null then vmstateDir else "";
-      hasVmstateDir = vmstateDir != null;
+      vmstateDirStr =
+        if vmstateDir != null then
+          vmstateDir
+        else if testMode then
+          "./bin/vmstate"
+        else
+          "";
+      hasVmstateDir = vmstateDir != null || testMode;
 
     in
     pkgs.writeScriptBin name ''
@@ -173,7 +183,7 @@ let
         local start_port=$1
         local port=$start_port
         while [ $port -lt 65535 ]; do
-          if ! ${pkgs.iproute2}/bin/ss -tuln | grep -q ":$port "; then
+          if ! ${pkgs.iproute2}/bin/ss -tuln 2>/dev/null | grep -q ":$port "; then
             echo $port
             return 0
           fi
@@ -188,10 +198,10 @@ let
       ACCEL="tcg"
       if [ -e /dev/kvm ] && [ -w /dev/kvm ]; then ACCEL="kvm"; fi
 
+      VMSTATE_DIR="${vmstateDirStr}"
       ${
         if hasVmstateDir then
           ''
-            VMSTATE_DIR="${vmstateDirStr}"
             mkdir -p "$VMSTATE_DIR"
             echo "$HOST_PORT" > "$VMSTATE_DIR/port"
           ''
@@ -199,25 +209,13 @@ let
           ""
       }
 
-      cleanup() {
-        sudo rm -f /dev/shm/${baseConfig.shmId}
-        ${if hasVmstateDir then ''rm -f "$VMSTATE_DIR/pid"'' else ""}
-      }
-      trap cleanup EXIT
-      # FIXED: 既然用了 sudo 运行 qemu，这里创建 shm 也需要权限，
-      # 但实际上 qemu 会自己创建，这里只需要保证清理。
-      # 原脚本是 rm -rf ... -> qemu -> rm -rf ...
-
       EXTRA_CMDLINE="${qemuConfig.cmdlineExtra}"
-
-      # FIXED: 补全缺失的默认内核参数 AUTO_TEST 和 SYSCALL_TEST_DIR
-      FINAL_CMDLINE="init=${initProgram} AUTO_TEST=${testOpt.autotest} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} $EXTRA_CMDLINE"
+      FINAL_CMDLINE="init=${initProgram} AUTO_TEST=${autoTestValue} SYSCALL_TEST_DIR=${testOpt.syscall.testDir} $EXTRA_CMDLINE"
 
       ARCH_FLAGS=( ${lib.escapeShellArgs commonArchArgs} )
       ${archSpecificBash}
 
       BOOT_ARGS=( "-kernel" "${kernelPath}" "-append" "$FINAL_CMDLINE" )
-
       DISK_ARGS=( ${lib.escapeShellArgs diskArgs} )
 
       # 动态网络配置（使用动态分配的端口）
@@ -234,19 +232,67 @@ let
       echo -e "=================================================================="
       echo ""
 
-      # --- 3. 执行 ---
-      ${qemuBin} --version
-
-      # 使用 exec 方式启动 QEMU，保持交互能力并记录 PID
-      # 参考 tools/run-qemu.sh 的 launch_qemu 函数实现
+      # --- 执行 ---
       ${
-        if hasVmstateDir then
+        if testMode then
           ''
-            sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            TAIL_PID=""
+
+            cleanup() {
+              if [ -n "$TAIL_PID" ]; then
+                kill $TAIL_PID 2>/dev/null || true
+              fi
+              if [ -f "$VMSTATE_DIR/pid" ]; then
+                QEMU_PID=$(cat "$VMSTATE_DIR/pid" 2>/dev/null)
+                if [ -n "$QEMU_PID" ]; then
+                  sudo kill -TERM $QEMU_PID 2>/dev/null || true
+                  sleep 2
+                  sudo kill -9 $QEMU_PID 2>/dev/null || true
+                fi
+                rm -f "$VMSTATE_DIR/pid"
+              fi
+              sudo rm -f /dev/shm/${baseConfig.shmId} 2>/dev/null || true
+            }
+            trap cleanup EXIT
+
+            rm -f serial_opt.txt
+
+            sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" \
+              ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" > /dev/null 2>&1 &
+
+            sleep 2
+            tail -f serial_opt.txt 2>/dev/null &
+            TAIL_PID=$!
+            sleep 3
+
+            export ROOT_PATH="$(pwd)"
+            export VMSTATE_DIR="$VMSTATE_DIR"
+            bash user/apps/tests/syscall/gvisor/monitor_test_results.sh
+            TEST_RESULT=$?
+
+            kill $TAIL_PID 2>/dev/null || true
+            exit $TEST_RESULT
           ''
         else
           ''
-            sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+            cleanup() {
+              sudo rm -f /dev/shm/${baseConfig.shmId}
+              ${if hasVmstateDir then ''rm -f "$VMSTATE_DIR/pid"'' else ""}
+            }
+            trap cleanup EXIT
+
+            ${qemuBin} --version
+
+            ${
+              if hasVmstateDir then
+                ''
+                  sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "$VMSTATE_DIR/pid" ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+                ''
+              else
+                ''
+                  sudo ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" -L ${qemuFirmware} "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "$@"
+                ''
+            }
           ''
       }
     '';
@@ -260,5 +306,18 @@ let
       qemuBin = "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";
     }
   );
+
+  testScript = lib.genAttrs [ "x86_64" "riscv64" ] (
+    arch:
+    mkRunScript {
+      name = "dragonos-test";
+      inherit arch;
+      isNographic = true;
+      qemuBin = "${pkgs.qemu_kvm}/bin/qemu-system-${arch}";
+      testMode = true;
+    }
+  );
 in
-script
+{
+  inherit script testScript;
+}
