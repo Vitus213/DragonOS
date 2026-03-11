@@ -28,6 +28,7 @@ use crate::{
         process::ArchPCBInfo,
         CurrentIrqArch, SigStackArch,
     },
+    cgroup::{cgroup_root_node, CgroupNode, TaskCgroupRef},
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
     filesystem::{
@@ -253,6 +254,7 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.raw_pid(), pcb.clone());
+        pcb.task_cgroup_node().add_task(pcb.raw_pid());
     }
 
     pub(crate) fn exchange_tid_and_raw_pids(
@@ -261,16 +263,31 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         let mut all_proc = all_process().lock_irqsave();
         let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
-        let left_pid = left.raw_pid();
-        let right_pid = right.raw_pid();
-        if left_pid == right_pid {
+        let left_old_pid = left.raw_pid();
+        let right_old_pid = right.raw_pid();
+        if left_old_pid == right_old_pid {
             return Err(SystemError::EINVAL);
         }
-        if !map.contains_key(&left_pid) || !map.contains_key(&right_pid) {
+        if !map.contains_key(&left_old_pid) || !map.contains_key(&right_old_pid) {
             return Err(SystemError::ESRCH);
         }
+
+        let left_cgroup = left.task_cgroup_node();
+        let right_cgroup = right.task_cgroup_node();
+
         left.exchange_tid_with(right)?;
-        exchange_raw_pids_locked(map, left, right)
+        exchange_raw_pids_locked(map, left, right)?;
+
+        left_cgroup.remove_task(left_old_pid);
+        right_cgroup.remove_task(right_old_pid);
+        if !left.is_exited() {
+            left_cgroup.add_task(left.raw_pid());
+        }
+        if !right.is_exited() {
+            right_cgroup.add_task(right.raw_pid());
+        }
+
+        Ok(())
     }
 
     /// ### 获取所有进程的pid
@@ -626,6 +643,16 @@ impl ProcessManager {
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
 
+        if current_pcb.raw_pid() == RawPid(0) {
+            log::error!(
+                "Idle process (pid=0) attempted to exit with code {}. Halting current cpu.",
+                exit_code
+            );
+            loop {
+                spin_loop();
+            }
+        }
+
         if current_pcb.raw_pid() == RawPid(1) {
             log::error!(
                 "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
@@ -699,6 +726,8 @@ impl ProcessManager {
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
+            // Linux 语义：zombie 不应出现在 cgroup.procs 中。
+            pcb.task_cgroup_node().remove_task(raw_pid);
 
             let rq = cpu_rq(smp_get_processor_id().data() as usize);
             let (rq, guard) = rq.self_lock();
@@ -832,6 +861,7 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
+            pcb.task_cgroup_node().remove_task(pid);
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
                 let parent_ns = parent.active_pid_ns();
@@ -1103,6 +1133,8 @@ pub struct ProcessControlBlock {
 
     /// namespace代理
     nsproxy: RwLock<Arc<NsProxy>>,
+    /// 任务所属 cgroup（v2）
+    task_cgroup: RwLock<TaskCgroupRef>,
 
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
@@ -1234,6 +1266,11 @@ impl ProcessControlBlock {
             // 其他进程继承父进程的namespace
             ProcessManager::current_pcb().nsproxy().clone()
         };
+        let task_cgroup = if is_idle {
+            TaskCgroupRef::new(cgroup_root_node())
+        } else {
+            ProcessManager::current_pcb().task_cgroup_ref()
+        };
 
         let (raw_pid, ppid, cwd, cred, tty): (
             RawPid,
@@ -1278,6 +1315,7 @@ impl ProcessControlBlock {
                 thread_pid: RwLock::new(None),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RwLock::new(nsproxy),
+                task_cgroup: RwLock::new(task_cgroup),
                 basic: basic_info,
                 preempt_count,
                 flags,
@@ -2066,6 +2104,29 @@ impl ProcessControlBlock {
         let old = guard.clone();
         *guard = nsproxy;
         return old;
+    }
+
+    pub fn task_cgroup_ref(&self) -> TaskCgroupRef {
+        self.task_cgroup.read().clone()
+    }
+
+    pub fn task_cgroup_node(&self) -> Arc<CgroupNode> {
+        self.task_cgroup.read().node()
+    }
+
+    pub fn set_task_cgroup_node(&self, node: Arc<CgroupNode>) {
+        let mut task_cgroup = self.task_cgroup.write();
+        let old = task_cgroup.node();
+        if Arc::ptr_eq(&old, &node) {
+            return;
+        }
+        old.remove_task(self.raw_pid());
+        node.add_task(self.raw_pid());
+        *task_cgroup = TaskCgroupRef::new(node);
+    }
+
+    pub fn set_task_cgroup_node_for_fork(&self, node: Arc<CgroupNode>) {
+        *self.task_cgroup.write() = TaskCgroupRef::new(node);
     }
 
     pub fn is_thread_group_leader(&self) -> bool {
