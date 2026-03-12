@@ -29,3 +29,4 @@ config/rootfs.generated.toml
 *.cpio.xz
 *.cpio*
 .direnv/
+*.pyc
