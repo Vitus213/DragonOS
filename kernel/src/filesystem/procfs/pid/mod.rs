@@ -15,6 +15,7 @@ use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
 mod cmdline;
+mod cgroup;
 mod exe;
 mod fd;
 mod fdinfo;
@@ -28,6 +29,7 @@ mod status;
 mod task;
 
 use cmdline::CmdlineFileOps;
+use cgroup::CgroupFileOps;
 use exe::ExeSymOps;
 use fd::FdDirOps;
 use fdinfo::FdInfoDirOps;
@@ -70,6 +72,9 @@ impl PidDirOps {
     )] = &[
         ("cmdline", |ops, parent| {
             CmdlineFileOps::new_inode(ops.pid, parent)
+        }),
+        ("cgroup", |ops, parent| {
+            CgroupFileOps::new_inode(ops.pid, parent)
         }),
         ("maps", |ops, parent| {
             MapsFileOps::new_inode(ops.pid, parent)
