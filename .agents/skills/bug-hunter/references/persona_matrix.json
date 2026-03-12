@@ -1,0 +1,44 @@
+{
+  "personas": [
+    {
+      "name": "Security Sentinel",
+      "focus": ["cwe", "authz", "injection", "secret-handling"],
+      "weight": 5.0
+    },
+    {
+      "name": "Concurrency Engineer",
+      "focus": ["race", "atomicity", "deadlock", "lifecycle"],
+      "weight": 4.0
+    },
+    {
+      "name": "Performance Analyst",
+      "focus": ["complexity", "alloc", "hotpath", "n_plus_1"],
+      "weight": 3.0
+    },
+    {
+      "name": "Diverse Reviewer A",
+      "focus": ["logic", "edge-case", "error-path"],
+      "weight": 2.0
+    },
+    {
+      "name": "Diverse Reviewer B",
+      "focus": ["logic", "edge-case", "state-transition"],
+      "weight": 2.0
+    },
+    {
+      "name": "Diverse Reviewer C",
+      "focus": ["api-contract", "compat", "errno"],
+      "weight": 2.0
+    },
+    {
+      "name": "Diverse Reviewer D",
+      "focus": ["resource", "cleanup", "lifetime"],
+      "weight": 2.0
+    },
+    {
+      "name": "Diverse Reviewer E",
+      "focus": ["surprising-behavior", "invariant"],
+      "weight": 2.0
+    }
+  ]
+}
