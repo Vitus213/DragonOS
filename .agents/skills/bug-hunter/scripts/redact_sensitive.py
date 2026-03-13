@@ -6,8 +6,12 @@ from __future__ import annotations
 import argparse
 import re
 import sys
+from typing import Pattern
 
-PATTERNS = [
+
+# Ordered from high-confidence credential signatures to generic key/value forms.
+# Keep this order stable to avoid generic patterns masking more specific ones.
+PATTERNS: list[tuple[Pattern[str], str]] = [
     (
         re.compile(r"(?i)(api[_-]?key\s*[=:]\s*)([\"']?[A-Za-z0-9_\-]{16,}[\"']?)"),
         r"\1<REDACTED_API_KEY>",
@@ -35,6 +39,7 @@ PATTERNS = [
 
 
 def redact(text: str) -> str:
+    """Return text with known secret-like substrings replaced."""
     out = text
     for pattern, replacement in PATTERNS:
         out = pattern.sub(replacement, out)
@@ -49,6 +54,7 @@ def main() -> int:
     parser.add_argument("-o", "--output", help="Output file (defaults to stdout)")
     args = parser.parse_args()
 
+    # Stage1 may run in pipelines; support both file and stdin streaming modes.
     if args.input:
         with open(args.input, "r", encoding="utf-8") as f:
             src = f.read()
