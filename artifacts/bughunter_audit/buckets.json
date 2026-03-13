@@ -1,0 +1,109 @@
+{
+  "schema_version": "1.0",
+  "buckets": [
+    {
+      "bucket_id": "BUG-001",
+      "file": ".agents/skills/bug-hunter/scripts/debate_picker.py",
+      "line": 25,
+      "primary_type": "logic",
+      "type_conflict": false,
+      "types": [
+        "logic"
+      ],
+      "severities": [
+        "major"
+      ],
+      "evidence_count": 1,
+      "findings": [
+        {
+          "file": ".agents/skills/bug-hunter/scripts/debate_picker.py",
+          "line": 25,
+          "type": "logic",
+          "severity": "major",
+          "description": "debate candidate score uses plain confidence average, not Stage4 weighted score with fix_code penalty, so borderline classification can drift from final verdict threshold.",
+          "fix_code": "Use the same scoring function as weighted_vote.py (agent weight + fix_code penalty) to compute borderline/dispute score.",
+          "confidence": 0.88,
+          "agent": "Diverse Reviewer C"
+        }
+      ]
+    },
+    {
+      "bucket_id": "BUG-002",
+      "file": ".agents/skills/bug-hunter/scripts/debate_picker.py",
+      "line": 25,
+      "primary_type": "logic",
+      "type_conflict": false,
+      "types": [
+        "logic"
+      ],
+      "severities": [
+        "major"
+      ],
+      "evidence_count": 1,
+      "findings": [
+        {
+          "file": ".agents/skills/bug-hunter/scripts/debate_picker.py",
+          "line": 25,
+          "type": "logic",
+          "severity": "major",
+          "description": "Stage3 debate selection is based on unweighted confidence mean, which is inconsistent with consensus score used by acceptance gate and may surface non-borderline buckets as disputed.",
+          "fix_code": "Import a shared score helper and evaluate debate interval against the same score scale used for acceptance decisions.",
+          "confidence": 0.84,
+          "agent": "Performance Analyst"
+        }
+      ]
+    },
+    {
+      "bucket_id": "BUG-003",
+      "file": ".agents/skills/bug-hunter/scripts/render_report.py",
+      "line": 56,
+      "primary_type": "logic",
+      "type_conflict": false,
+      "types": [
+        "logic"
+      ],
+      "severities": [
+        "minor"
+      ],
+      "evidence_count": 1,
+      "findings": [
+        {
+          "file": ".agents/skills/bug-hunter/scripts/render_report.py",
+          "line": 56,
+          "type": "logic",
+          "severity": "minor",
+          "description": "accepted findings sorting misses evidence_count tie-breaker required by report spec, causing nondeterministic order for equal severity and score.",
+          "fix_code": "Extend sorting key with -int(item.get('evidence_count', 0)) after severity and score.",
+          "confidence": 0.76,
+          "agent": "Diverse Reviewer A"
+        }
+      ]
+    },
+    {
+      "bucket_id": "BUG-004",
+      "file": ".agents/skills/bug-hunter/scripts/render_report.py",
+      "line": 56,
+      "primary_type": "logic",
+      "type_conflict": false,
+      "types": [
+        "logic"
+      ],
+      "severities": [
+        "minor"
+      ],
+      "evidence_count": 1,
+      "findings": [
+        {
+          "file": ".agents/skills/bug-hunter/scripts/render_report.py",
+          "line": 56,
+          "type": "logic",
+          "severity": "minor",
+          "description": "report ordering does not apply the documented third key evidence_count when severity and score tie.",
+          "fix_code": "Sort accepted by (severity_rank, -score, -evidence_count).",
+          "confidence": 0.74,
+          "agent": "Diverse Reviewer D"
+        }
+      ]
+    }
+  ]
+}

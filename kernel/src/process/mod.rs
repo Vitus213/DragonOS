@@ -28,7 +28,6 @@ use crate::{
         process::ArchPCBInfo,
         CurrentIrqArch, SigStackArch,
     },
-    cgroup::{cgroup_root_node, CgroupNode, TaskCgroupRef},
     driver::tty::tty_core::TtyCore,
     exception::InterruptArch,
     filesystem::{
@@ -254,7 +253,6 @@ impl ProcessManager {
             .as_mut()
             .unwrap()
             .insert(pcb.raw_pid(), pcb.clone());
-        pcb.task_cgroup_node().add_task(pcb.raw_pid());
     }
 
     pub(crate) fn exchange_tid_and_raw_pids(
@@ -263,31 +261,16 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         let mut all_proc = all_process().lock_irqsave();
         let map = all_proc.as_mut().ok_or(SystemError::EINVAL)?;
-        let left_old_pid = left.raw_pid();
-        let right_old_pid = right.raw_pid();
-        if left_old_pid == right_old_pid {
+        let left_pid = left.raw_pid();
+        let right_pid = right.raw_pid();
+        if left_pid == right_pid {
             return Err(SystemError::EINVAL);
         }
-        if !map.contains_key(&left_old_pid) || !map.contains_key(&right_old_pid) {
+        if !map.contains_key(&left_pid) || !map.contains_key(&right_pid) {
             return Err(SystemError::ESRCH);
         }
-
-        let left_cgroup = left.task_cgroup_node();
-        let right_cgroup = right.task_cgroup_node();
-
         left.exchange_tid_with(right)?;
-        exchange_raw_pids_locked(map, left, right)?;
-
-        left_cgroup.remove_task(left_old_pid);
-        right_cgroup.remove_task(right_old_pid);
-        if !left.is_exited() {
-            left_cgroup.add_task(left.raw_pid());
-        }
-        if !right.is_exited() {
-            right_cgroup.add_task(right.raw_pid());
-        }
-
-        Ok(())
+        exchange_raw_pids_locked(map, left, right)
     }
 
     /// ### 获取所有进程的pid
@@ -643,16 +626,6 @@ impl ProcessManager {
         // 检查是否是init进程尝试退出，如果是则产生panic
         let current_pcb = ProcessManager::current_pcb();
 
-        if current_pcb.raw_pid() == RawPid(0) {
-            log::error!(
-                "Idle process (pid=0) attempted to exit with code {}. Halting current cpu.",
-                exit_code
-            );
-            loop {
-                spin_loop();
-            }
-        }
-
         if current_pcb.raw_pid() == RawPid(1) {
             log::error!(
                 "Init process (pid=1) attempted to exit with code {}. This should not happen and indicates a serious system error.",
@@ -711,6 +684,7 @@ impl ProcessManager {
             }
 
             pcb.exit_files();
+            pcb.exit_timers();
             // TODO 由于未实现进程组，tty记录的前台进程组等于当前进程，故退出前要置空
             // 后续相关逻辑需要在SYS_EXIT_GROUP系统调用中实现
             if let Some(tty) = pcb.sig_info_irqsave().tty() {
@@ -726,8 +700,6 @@ impl ProcessManager {
             pcb.sched_info
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
-            // Linux 语义：zombie 不应出现在 cgroup.procs 中。
-            pcb.task_cgroup_node().remove_task(raw_pid);
 
             let rq = cpu_rq(smp_get_processor_id().data() as usize);
             let (rq, guard) = rq.self_lock();
@@ -861,7 +833,6 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
-            pcb.task_cgroup_node().remove_task(pid);
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
                 let parent_ns = parent.active_pid_ns();
@@ -1133,8 +1104,6 @@ pub struct ProcessControlBlock {
 
     /// namespace代理
     nsproxy: RwLock<Arc<NsProxy>>,
-    /// 任务所属 cgroup（v2）
-    task_cgroup: RwLock<TaskCgroupRef>,
 
     basic: RwLock<ProcessBasicInfo>,
     /// 当前进程的自旋锁持有计数
@@ -1167,6 +1136,10 @@ pub struct ProcessControlBlock {
 
     /// prctl(PR_SET/GET_NO_NEW_PRIVS) 状态：线程级（task）语义。
     no_new_privs: AtomicBool,
+
+    /// prctl(PR_SET/GET_KEEPCAPS) 状态：线程级（task）语义。
+    /// 当为 true 时，进程改变 UID/GID 后会保留 capabilities。
+    keepcaps: AtomicBool,
 
     /// prctl(PR_SET/GET_DUMPABLE) 状态。
     /// Linux: 0=SUID_DUMP_DISABLE, 1=SUID_DUMP_USER；2(SUID_DUMP_ROOT) 不允许通过 PR_SET_DUMPABLE 设置。
@@ -1266,11 +1239,6 @@ impl ProcessControlBlock {
             // 其他进程继承父进程的namespace
             ProcessManager::current_pcb().nsproxy().clone()
         };
-        let task_cgroup = if is_idle {
-            TaskCgroupRef::new(cgroup_root_node())
-        } else {
-            ProcessManager::current_pcb().task_cgroup_ref()
-        };
 
         let (raw_pid, ppid, cwd, cred, tty): (
             RawPid,
@@ -1315,7 +1283,6 @@ impl ProcessControlBlock {
                 thread_pid: RwLock::new(None),
                 pid_links: core::array::from_fn(|_| PidLink::default()),
                 nsproxy: RwLock::new(nsproxy),
-                task_cgroup: RwLock::new(task_cgroup),
                 basic: basic_info,
                 preempt_count,
                 flags,
@@ -1332,6 +1299,7 @@ impl ProcessControlBlock {
                 pdeath_signal: AtomicSignal::new(Signal::INVALID),
 
                 no_new_privs: AtomicBool::new(false),
+                keepcaps: AtomicBool::new(false),
                 // 默认设置为 SUID_DUMP_USER(=1)，满足 gVisor 的 SetGetDumpability 预期。
                 dumpable: AtomicU8::new(1),
                 parent_pcb: RwLock::new(ppcb.clone()),
@@ -1581,6 +1549,16 @@ impl ProcessControlBlock {
         if value {
             self.no_new_privs.store(true, Ordering::SeqCst);
         }
+    }
+
+    #[inline(always)]
+    pub fn keepcaps(&self) -> bool {
+        self.keepcaps.load(Ordering::SeqCst)
+    }
+
+    #[inline(always)]
+    pub fn set_keepcaps(&self, value: bool) {
+        self.keepcaps.store(value, Ordering::SeqCst);
     }
 
     #[inline(always)]
@@ -2002,6 +1980,44 @@ impl ProcessControlBlock {
         return self.posix_timers.lock_irqsave();
     }
 
+    /// 清理当前进程/线程的定时器
+    ///
+    /// 参考 Linux do_exit() 中的定时器清理逻辑：
+    /// ```c
+    /// if (group_dead) {
+    ///     hrtimer_cancel(&tsk->signal->real_timer);
+    ///     exit_itimers(tsk);
+    /// }
+    /// ```
+    ///
+    /// DragonOS 中 alarm_timer 是 per-PCB 的，因此每个线程退出时
+    /// 都需要取消自己的 alarm timer。itimers 和 posix_timers 仅在
+    /// 线程组 leader 退出时（group_dead）清理。
+    fn exit_timers(&self) {
+        // 1. 取消当前线程的 alarm timer
+        if let Some(alarm) = self.alarm_timer.lock_irqsave().take() {
+            alarm.cancel();
+        }
+
+        let group_dead = self.is_thread_group_leader();
+        if group_dead {
+            // 2. 取消 ITIMER_REAL
+            if let Some(real_itimer) = self.itimers.lock_irqsave().real.take() {
+                real_itimer.timer.cancel();
+            }
+
+            // 3. 删除所有 POSIX interval timers
+            let mut posix_timers = self.posix_timers.lock_irqsave();
+            let timer_ids: alloc::vec::Vec<i32> = posix_timers.timer_ids().collect();
+            let self_arc = self.self_ref.upgrade();
+            if let Some(ref pcb) = self_arc {
+                for id in timer_ids {
+                    let _ = posix_timers.delete(pcb, id);
+                }
+            }
+        }
+    }
+
     /// Exit fd table when process exit
     fn exit_files(&self) {
         // 关闭文件描述符表
@@ -2104,29 +2120,6 @@ impl ProcessControlBlock {
         let old = guard.clone();
         *guard = nsproxy;
         return old;
-    }
-
-    pub fn task_cgroup_ref(&self) -> TaskCgroupRef {
-        self.task_cgroup.read().clone()
-    }
-
-    pub fn task_cgroup_node(&self) -> Arc<CgroupNode> {
-        self.task_cgroup.read().node()
-    }
-
-    pub fn set_task_cgroup_node(&self, node: Arc<CgroupNode>) {
-        let mut task_cgroup = self.task_cgroup.write();
-        let old = task_cgroup.node();
-        if Arc::ptr_eq(&old, &node) {
-            return;
-        }
-        old.remove_task(self.raw_pid());
-        node.add_task(self.raw_pid());
-        *task_cgroup = TaskCgroupRef::new(node);
-    }
-
-    pub fn set_task_cgroup_node_for_fork(&self, node: Arc<CgroupNode>) {
-        *self.task_cgroup.write() = TaskCgroupRef::new(node);
     }
 
     pub fn is_thread_group_leader(&self) -> bool {

@@ -183,10 +183,6 @@ impl UtsNamespace {
         }
     }
 
-    pub fn user_ns(&self) -> &Arc<UserNamespace> {
-        &self._user_ns
-    }
-
     pub fn set_hostname(&self, hostname: &[u8]) -> Result<(), SystemError> {
         // 验证长度
         if !NewUtsName::validate_len(hostname.len()) {

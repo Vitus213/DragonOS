@@ -12,8 +12,7 @@ pub struct SysClone;
 
 impl SysClone {
     fn flags(args: &[usize]) -> CloneFlags {
-        // Linux 语义：legacy clone() 仅使用低 32 位 flags。
-        CloneFlags::from_bits_truncate((args[0] as u64) & 0xffff_ffff)
+        CloneFlags::from_bits_truncate(args[0] as u64)
     }
 
     fn stack(args: &[usize]) -> usize {

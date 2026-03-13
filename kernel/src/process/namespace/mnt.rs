@@ -69,6 +69,7 @@ impl MntNamespace {
             MountPropagation::new_private(),
             None,
             MountFlags::empty(),
+            None,
         );
 
         let result = Arc::new_cyclic(|self_ref| Self {
@@ -88,10 +89,6 @@ impl MntNamespace {
             .expect("Failed to add root mount");
 
         return result;
-    }
-
-    pub fn user_ns(&self) -> &Arc<UserNamespace> {
-        &self._user_ns
     }
 
     /// 强制替换本MountNamespace的根挂载文件系统

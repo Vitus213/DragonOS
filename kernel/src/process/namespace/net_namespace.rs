@@ -337,10 +337,6 @@ impl NetNamespace {
         Ok(netns)
     }
 
-    pub fn user_ns(&self) -> &Arc<UserNamespace> {
-        &self._user_ns
-    }
-
     pub(super) fn copy_net_ns(
         &self,
         clone_flags: &CloneFlags,
