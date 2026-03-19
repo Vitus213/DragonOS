@@ -17,7 +17,6 @@ use crate::{
     filesystem::kernfs::KernFSInode,
     filesystem::vfs::{
         file::{FileFlags, FilePrivateData},
-        mount::MountPath,
         permission::PermissionMask,
         vcore::generate_inode_id,
         FileSystem, FileSystemMakerData, FileType, FsInfo, IndexNode, InodeFlags, InodeMode, Magic,
@@ -124,15 +123,9 @@ pub fn cgroup2_init() -> Result<(), SystemError> {
             let cgroup_dir = ensure_dir(&fs_dir, "cgroup", InodeMode::from_bits_truncate(0o755))?;
 
             let cgroup_fs = Cgroup2Fs::new(cgroup_root().root(), false);
-            let mntfs = cgroup_dir.mount(
+            cgroup_dir.mount(
                 cgroup_fs,
                 crate::filesystem::vfs::mount::MountFlags::empty(),
-            )?;
-            let root_ino = root_inode.metadata()?.inode_id;
-            ProcessManager::current_mntns().add_mount(
-                Some(root_ino),
-                Arc::new(MountPath::from("/sys/fs/cgroup")),
-                mntfs,
             )?;
 
             ::log::info!("Cgroup2 mounted at /sys/fs/cgroup");
@@ -153,7 +146,7 @@ fn ensure_dir(
 
     if let Some(kernfs_parent) = parent.as_any_ref().downcast_ref::<KernFSInode>() {
         return match kernfs_parent.add_dir(name.to_string(), mode, None, None) {
-            Ok(inode) => Ok(inode),
+            Ok(_) => parent.find(name),
             Err(SystemError::EEXIST) => parent.find(name),
             Err(e) => Err(e),
         };
@@ -599,24 +592,35 @@ impl Cgroup2Inode {
         Ok(())
     }
 
+    /// Check if a cgroup has any tasks or populated descendants.
+    ///
+    /// Uses depth-limited recursion to prevent stack overflow.
+    /// Maximum recursion depth is set to 128 levels, which is far beyond any
+    /// reasonable cgroup hierarchy depth.
     fn is_populated(cgroup: &Arc<CgroupNode>) -> bool {
+        const MAX_DEPTH: usize = 128;
+        Self::is_populated_helper(cgroup, MAX_DEPTH)
+    }
+
+    fn is_populated_helper(cgroup: &Arc<CgroupNode>, depth: usize) -> bool {
+        // Depth limit to prevent stack overflow
+        if depth == 0 {
+            return false;
+        }
+
+        // Check if this cgroup has tasks
         if cgroup.has_tasks() {
             return true;
         }
-        let root = cgroup_root();
-        for child_name in cgroup.children_names() {
-            let mut path = crate::cgroup::cgroup_path_relative_to_node(cgroup, &root.root());
-            if path == "/" {
-                path = format!("/{}", child_name);
-            } else {
-                path = format!("{}/{}", path, child_name);
-            }
-            if let Ok(node) = crate::cgroup::find_node_by_abs_path(&path) {
-                if Self::is_populated(&node) {
-                    return true;
-                }
+
+        // Recursively check children using direct child references instead of
+        // path-based lookup to avoid issues with path resolution
+        for child in cgroup.children() {
+            if Self::is_populated_helper(&child, depth - 1) {
+                return true;
             }
         }
+
         false
     }
 
@@ -676,112 +680,127 @@ impl Cgroup2Inode {
         Ok(n)
     }
 
-    fn write_file(
-        this: &Arc<Cgroup2Inode>,
-        inner: &mut Cgroup2InodeInner,
-        offset: usize,
-        buf: &[u8],
-    ) -> Result<usize, SystemError> {
-        match &mut inner.kind {
-            Cgroup2InodeKind::File { cgroup, ty, data } => match ty {
-                CgroupCoreFile::Procs => {
-                    if offset != 0 {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
-                    let pid_str = input.trim();
-                    let current = ProcessManager::current_pcb();
-                    let task = if pid_str == "0" {
-                        current.clone()
-                    } else {
-                        let pid_num = pid_str.parse::<usize>().map_err(|_| SystemError::EINVAL)?;
-                        ProcessManager::find_task_by_vpid(crate::process::RawPid::new(pid_num))
-                            .ok_or(SystemError::ESRCH)?
-                    };
-                    let src = task.task_cgroup_node();
-                    let fs_nsdelegate = this
-                        .fs()
-                        .as_any_ref()
-                        .downcast_ref::<Cgroup2Fs>()
-                        .map(|fs| fs.nsdelegate())
-                        .unwrap_or(false);
-                    if fs_nsdelegate {
-                        let ns_root = current.nsproxy().cgroup_ns.root_cgroup().clone();
-                        if !ns_root.is_ancestor_of(cgroup) {
-                            return Err(SystemError::ENOENT);
-                        }
-                        if !ns_root.is_ancestor_of(&src) {
-                            return Err(SystemError::ENOENT);
-                        }
-                    }
-                    if Arc::ptr_eq(&src, cgroup) {
-                        return Ok(buf.len());
-                    }
-                    Self::check_attach_permissions(this.fs().root_inode(), &src, cgroup)?;
-                    let leader = {
-                        let ti = task.threads_read_irqsave();
-                        ti.group_leader().unwrap_or_else(|| task.clone())
-                    };
-                    let others = leader.threads_read_irqsave().group_tasks_clone();
+    // Writes must not keep the inode's inner lock across permission checks or
+    // task migration, otherwise a write to cgroup.procs can re-enter metadata()
+    // on the same inode and self-deadlock.
+    fn write_file(this: &Arc<Cgroup2Inode>, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+        let (cgroup, ty) = {
+            let inner = this.inner.lock();
+            match &inner.kind {
+                Cgroup2InodeKind::File { cgroup, ty, .. } => (cgroup.clone(), *ty),
+                _ => return Err(SystemError::EISDIR),
+            }
+        };
 
-                    let mut to_move = Vec::new();
-                    if !leader.is_exited() {
-                        to_move.push(leader.clone());
+        match ty {
+            CgroupCoreFile::Procs => {
+                if offset != 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+                let pid_str = input.trim();
+                let current = ProcessManager::current_pcb();
+                let task = if pid_str == "0" {
+                    current.clone()
+                } else {
+                    let pid_num = pid_str.parse::<usize>().map_err(|_| SystemError::EINVAL)?;
+                    ProcessManager::find_task_by_vpid(crate::process::RawPid::new(pid_num))
+                        .ok_or(SystemError::ESRCH)?
+                };
+                let src = task.task_cgroup_node();
+                let fs_nsdelegate = this
+                    .fs()
+                    .as_any_ref()
+                    .downcast_ref::<Cgroup2Fs>()
+                    .map(|fs| fs.nsdelegate())
+                    .unwrap_or(false);
+                if fs_nsdelegate {
+                    let ns_root = current.nsproxy().cgroup_ns.root_cgroup().clone();
+                    if !ns_root.is_ancestor_of(&cgroup) {
+                        return Err(SystemError::ENOENT);
                     }
-                    for weak in others {
-                        if let Some(t) = weak.upgrade() {
-                            if !t.is_exited() {
-                                to_move.push(t);
-                            }
+                    if !ns_root.is_ancestor_of(&src) {
+                        return Err(SystemError::ENOENT);
+                    }
+                }
+                if Arc::ptr_eq(&src, &cgroup) {
+                    return Ok(buf.len());
+                }
+                Self::check_attach_permissions(this.fs().root_inode(), &src, &cgroup)?;
+                let leader = {
+                    let ti = task.threads_read_irqsave();
+                    ti.group_leader().unwrap_or_else(|| task.clone())
+                };
+                let others = leader.threads_read_irqsave().group_tasks_clone();
+
+                let mut to_move = Vec::new();
+                if !leader.is_exited() {
+                    to_move.push(leader.clone());
+                }
+                for weak in others {
+                    if let Some(t) = weak.upgrade() {
+                        if !t.is_exited() {
+                            to_move.push(t);
                         }
                     }
-                    if to_move.is_empty() {
-                        return Err(SystemError::ESRCH);
-                    }
-                    let moved_tasks = to_move.len();
+                }
+                if to_move.is_empty() {
+                    return Err(SystemError::ESRCH);
+                }
+                let moved_tasks = to_move.len();
 
-                    let _cgroup_guard = cgroup_accounting_lock().lock();
-                    cgroup_migrate_vet_dst_with_src(&src, cgroup, moved_tasks)?;
+                let _cgroup_guard = cgroup_accounting_lock().lock();
+                cgroup_migrate_vet_dst_with_src(&src, &cgroup, moved_tasks)?;
 
-                    for t in to_move {
-                        t.set_task_cgroup_node(cgroup.clone());
-                    }
-                    Ok(buf.len())
+                for t in to_move {
+                    t.set_task_cgroup_node(cgroup.clone());
                 }
-                CgroupCoreFile::SubtreeControl => {
-                    if offset != 0 {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
-                    if !ProcessManager::current_pcb().cred().has_cap_sys_admin() {
-                        return Err(SystemError::EPERM);
-                    }
-                    let new_data = Self::apply_subtree_control(cgroup, input)?;
-                    data.clear();
-                    data.extend_from_slice(&new_data);
-                    inner.metadata.size = data.len() as i64;
-                    Ok(buf.len())
+                Ok(buf.len())
+            }
+            CgroupCoreFile::SubtreeControl => {
+                if offset != 0 {
+                    return Err(SystemError::EINVAL);
                 }
-                CgroupCoreFile::PidsMax => {
-                    if offset != 0 {
-                        return Err(SystemError::EINVAL);
-                    }
-                    let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
-                    let new_limit = Self::parse_pids_max(input)?;
-                    cgroup.set_pids_max(new_limit);
-                    let new_data = Self::encode_pids_max(new_limit);
-                    data.clear();
-                    data.extend_from_slice(&new_data);
-                    inner.metadata.size = data.len() as i64;
-                    Ok(buf.len())
+                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+                if !ProcessManager::current_pcb().cred().has_cap_sys_admin() {
+                    return Err(SystemError::EPERM);
                 }
-                CgroupCoreFile::Controllers
-                | CgroupCoreFile::Events
-                | CgroupCoreFile::Type
-                | CgroupCoreFile::PidsCurrent
-                | CgroupCoreFile::PidsEvents => Err(SystemError::EINVAL),
-            },
-            _ => Err(SystemError::EISDIR),
+                let new_data = Self::apply_subtree_control(&cgroup, input)?;
+                let mut inner = this.inner.lock();
+                match &mut inner.kind {
+                    Cgroup2InodeKind::File { data, .. } => {
+                        data.clear();
+                        data.extend_from_slice(&new_data);
+                        inner.metadata.size = data.len() as i64;
+                        Ok(buf.len())
+                    }
+                    _ => Err(SystemError::EISDIR),
+                }
+            }
+            CgroupCoreFile::PidsMax => {
+                if offset != 0 {
+                    return Err(SystemError::EINVAL);
+                }
+                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+                let new_limit = Self::parse_pids_max(input)?;
+                cgroup.set_pids_max(new_limit);
+                let new_data = Self::encode_pids_max(new_limit);
+                let mut inner = this.inner.lock();
+                match &mut inner.kind {
+                    Cgroup2InodeKind::File { data, .. } => {
+                        data.clear();
+                        data.extend_from_slice(&new_data);
+                        inner.metadata.size = data.len() as i64;
+                        Ok(buf.len())
+                    }
+                    _ => Err(SystemError::EISDIR),
+                }
+            }
+            CgroupCoreFile::Controllers
+            | CgroupCoreFile::Events
+            | CgroupCoreFile::Type
+            | CgroupCoreFile::PidsCurrent
+            | CgroupCoreFile::PidsEvents => Err(SystemError::EINVAL),
         }
     }
 }
@@ -912,8 +931,7 @@ impl IndexNode for Cgroup2Inode {
     ) -> Result<usize, SystemError> {
         let n = core::cmp::min(len, buf.len());
         let this = self.self_ref.upgrade().unwrap();
-        let mut inner = self.inner.lock();
-        Cgroup2Inode::write_file(&this, &mut inner, offset, &buf[..n])
+        Cgroup2Inode::write_file(&this, offset, &buf[..n])
     }
 
     fn metadata(&self) -> Result<Metadata, SystemError> {
