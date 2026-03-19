@@ -944,12 +944,12 @@ impl IndexNode for MountFSInode {
             mount_flags,
         );
 
+        let mount_path = Arc::new(MountPath::from(self.absolute_path()?));
+
         // Perform all potentially-failing operations first before registering in peer group
         self.mount_fs
             .add_mount(metadata.inode_id, new_mount_fs.clone())?;
 
-        let mount_path = self.absolute_path();
-        let mount_path = Arc::new(MountPath::from(mount_path?));
         ProcessManager::current_mntns().add_mount(
             Some(metadata.inode_id),
             mount_path,
