@@ -313,8 +313,30 @@ pub fn cgroup_path_relative_to_node(node: &Arc<CgroupNode>, view_root: &Arc<Cgro
     format!("/{}", down.join("/"))
 }
 
+fn cgroup_path_projected_from_view(node: &Arc<CgroupNode>, view_root: &Arc<CgroupNode>) -> String {
+    let node_path = cgroup_path_components(node);
+    let root_path = cgroup_path_components(view_root);
+    let common = cgroup_common_ancestor(node, view_root);
+    let common_depth = cgroup_path_components(&common).len();
+
+    let up = root_path.len().saturating_sub(common_depth);
+    let down = &node_path[common_depth..];
+
+    if up == 0 && down.is_empty() {
+        return "/".to_string();
+    }
+
+    let mut parts = Vec::with_capacity(up + down.len());
+    for _ in 0..up {
+        parts.push("..".to_string());
+    }
+    parts.extend(down.iter().cloned());
+
+    format!("/{}", parts.join("/"))
+}
+
 pub fn cgroup_path_from_view(node: &Arc<CgroupNode>, view_root: &Arc<CgroupNode>) -> String {
-    cgroup_path_relative_to_node(node, view_root)
+    cgroup_path_projected_from_view(node, view_root)
 }
 
 pub fn cgroup_common_ancestor(left: &Arc<CgroupNode>, right: &Arc<CgroupNode>) -> Arc<CgroupNode> {
@@ -437,4 +459,35 @@ fn normalize_cgroup_abs_path(path: &str) -> Result<String, SystemError> {
     }
 
     Ok(out.join("/"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cgroup_path_from_view_same_node_is_root() {
+        let root = CgroupRoot::new();
+        let node = root.create_child(&root.root(), "same").unwrap();
+
+        assert_eq!(cgroup_path_from_view(&node, &node), "/");
+    }
+
+    #[test]
+    fn cgroup_path_from_view_descendant_stays_relative() {
+        let root = CgroupRoot::new();
+        let parent = root.create_child(&root.root(), "parent").unwrap();
+        let child = root.create_child(&parent, "child").unwrap();
+
+        assert_eq!(cgroup_path_from_view(&child, &parent), "/child");
+    }
+
+    #[test]
+    fn cgroup_path_from_view_sibling_uses_parent_segments() {
+        let root = CgroupRoot::new();
+        let left = root.create_child(&root.root(), "left").unwrap();
+        let right = root.create_child(&root.root(), "right").unwrap();
+
+        assert_eq!(cgroup_path_from_view(&right, &left), "/../right");
+    }
 }
