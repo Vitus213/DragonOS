@@ -229,12 +229,18 @@ impl<'a> PollAdapter<'a> {
             })
         };
 
-        let events = EventPoll::epoll_wait_with_file(
+        // `poll(2)` 需要保留自身的 restart 语义：底层 epoll 被信号打断时，
+        // 这里不能直接把 EINTR 暴露给用户态，而是要交回 poll syscall
+        // 去设置 restart block，并由信号层按 SA_RESTART 决定是否重启。
+        let events = match EventPoll::epoll_wait_with_file(
             self.ep_file.clone(),
             &mut epoll_events,
             len,
             remain_timeout,
-        )?;
+        ) {
+            Err(SystemError::EINTR) => Err(SystemError::ERESTARTNOHAND),
+            other => other,
+        }?;
 
         // 处理返回的事件，将它们映射回所有相关的 pollfd 条目
         for event in epoll_events.iter().take(events) {
