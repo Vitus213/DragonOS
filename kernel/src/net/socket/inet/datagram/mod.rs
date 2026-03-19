@@ -17,6 +17,7 @@ use crate::net::socket::{IpOption, PIPV6};
 use crate::process::namespace::net_namespace::NetNamespace;
 use crate::process::namespace::NamespaceOps;
 use crate::process::ProcessManager;
+use crate::time::{Duration, Instant};
 use crate::{libs::rwsem::RwSem, net::socket::endpoint::Endpoint};
 use alloc::collections::VecDeque;
 use alloc::sync::{Arc, Weak};
@@ -26,7 +27,10 @@ use core::sync::atomic::{
 };
 use smoltcp::wire::{IpAddress::*, IpEndpoint, IpListenEndpoint, IpVersion};
 
-use super::{InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4, UNSPECIFIED_LOCAL_ENDPOINT_V6};
+use super::{
+    common::ensure_bound_dual_stack_remote_compatible, InetSocket, UNSPECIFIED_LOCAL_ENDPOINT_V4,
+    UNSPECIFIED_LOCAL_ENDPOINT_V6,
+};
 
 mod option;
 
@@ -264,6 +268,17 @@ impl UdpSocket {
         }
     }
 
+    fn send_timeout(&self) -> Option<crate::time::Duration> {
+        let us = self
+            .send_timeout_us
+            .load(core::sync::atomic::Ordering::Relaxed);
+        if us == u64::MAX {
+            None
+        } else {
+            Some(crate::time::Duration::from_micros(us))
+        }
+    }
+
     #[inline]
     fn loopback_send_len_result(
         payload_len: usize,
@@ -274,6 +289,23 @@ impl UdpSocket {
         } else {
             Ok(payload_len)
         }
+    }
+
+    #[inline]
+    fn validate_bound_send_dest(
+        &self,
+        bound: &inner::BoundUdp,
+        dest: IpEndpoint,
+    ) -> Result<(), SystemError> {
+        if self.ip_version != IpVersion::Ipv6 {
+            return Ok(());
+        }
+
+        if let Some(local_addr) = bound.endpoint().addr {
+            ensure_bound_dual_stack_remote_compatible(local_addr, dest.addr)?;
+        }
+
+        Ok(())
     }
 
     fn loopback_accepts_with_preconnect(
@@ -846,6 +878,7 @@ impl UdpSocket {
                     let dest = to
                         .or_else(|| bound.remote_endpoint().ok())
                         .ok_or(SystemError::EDESTADDRREQ)?;
+                    self.validate_bound_send_dest(bound, dest)?;
                     let bound_iface = bound.inner().iface().clone();
                     let is_multicast = dest.addr.is_multicast();
                     let mcast_ifindex = if is_multicast {
@@ -1395,11 +1428,29 @@ impl Socket for UdpSocket {
             return Err(SystemError::EPIPE);
         }
 
-        if flags.contains(PMSG::DONTWAIT) {
-            log::warn!("Nonblock send is not implemented yet");
-        }
+        if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
+            return self.try_send(buffer, None);
+        } else {
+            let deadline = self.send_timeout().map(|t| Instant::now() + t);
+            loop {
+                // Re-check shutdown state inside the loop
+                let shutdown_bits = self.shutdown.load(Ordering::Acquire);
+                if shutdown_bits & 0x02 != 0 {
+                    return Err(SystemError::EPIPE);
+                }
 
-        return self.try_send(buffer, None);
+                match self.try_send(buffer, None) {
+                    Ok(len) => return Ok(len),
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        let timeout = deadline
+                            .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
+                        self.wait_queue
+                            .wait_event_io_interruptible_timeout(|| self.can_send(), timeout)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     }
 
     fn send_to(&self, buffer: &[u8], flags: PMSG, address: Endpoint) -> Result<usize, SystemError> {
@@ -1409,15 +1460,35 @@ impl Socket for UdpSocket {
             return Err(SystemError::EPIPE);
         }
 
-        if flags.contains(PMSG::DONTWAIT) {
-            log::warn!("Nonblock send is not implemented yet");
-        }
+        let remote = if let Endpoint::Ip(remote) = address {
+            remote
+        } else {
+            return Err(SystemError::EINVAL);
+        };
 
-        if let Endpoint::Ip(remote) = address {
+        if self.is_nonblock() || flags.contains(PMSG::DONTWAIT) {
             return self.try_send(buffer, Some(remote));
-        }
+        } else {
+            let deadline = self.send_timeout().map(|t| Instant::now() + t);
+            loop {
+                // Re-check shutdown state inside the loop
+                let shutdown_bits = self.shutdown.load(Ordering::Acquire);
+                if shutdown_bits & 0x02 != 0 {
+                    return Err(SystemError::EPIPE);
+                }
 
-        return Err(SystemError::EINVAL);
+                match self.try_send(buffer, Some(remote)) {
+                    Ok(len) => return Ok(len),
+                    Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                        let timeout = deadline
+                            .map(|d| d.duration_since(Instant::now()).unwrap_or(Duration::ZERO));
+                        self.wait_queue
+                            .wait_event_io_interruptible_timeout(|| self.can_send(), timeout)?;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
     }
 
     fn recv(&self, buffer: &mut [u8], flags: PMSG) -> Result<usize, SystemError> {
@@ -1461,6 +1532,17 @@ impl Socket for UdpSocket {
                 }
             }
         }
+    }
+
+    fn read_to_user_buffer(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        crate::net::socket::base::read_to_user_buffer_via_kernel_buf(
+            self,
+            user_buffer,
+            self.recv_buffer_size(),
+        )
     }
 
     fn recv_from(

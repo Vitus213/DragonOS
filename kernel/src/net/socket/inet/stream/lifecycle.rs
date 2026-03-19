@@ -5,6 +5,7 @@ use alloc::sync::Arc;
 use system_error::SystemError;
 
 use super::inner;
+use super::poll_util;
 use super::TcpSocket;
 
 impl TcpSocket {
@@ -35,7 +36,7 @@ impl TcpSocket {
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let (listening, err) = match inner {
             inner::Inner::Init(init) => {
-                let listen_result = init.listen(backlog);
+                let listen_result = init.listen(backlog, self.netns());
                 match listen_result {
                     Ok(listening) => {
                         // DragonOS backlog emulation: listener is represented by multiple
@@ -43,9 +44,19 @@ impl TcpSocket {
                         // Linux commonly drops incoming SYN (no RST). To implement this
                         // without changing smoltcp semantics, register the active listen port
                         // in the iface common registry.
+                        //
+                        // For INADDR_ANY listeners, listen sockets span multiple interfaces,
+                        // so register on each unique interface.
                         let port = listening.get_name().port;
-                        if let Some(b) = listening.inners.first() {
-                            b.iface().common().register_tcp_listen_port(port, backlog);
+                        let me = self.self_ref.upgrade().unwrap();
+                        let mut registered_ifaces: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                        for b in &listening.inners {
+                            let nic_id = b.iface().nic_id();
+                            if !registered_ifaces.contains(&nic_id) {
+                                b.iface().common().register_tcp_listen_port(port, backlog);
+                                b.iface().common().bind_socket(me.clone());
+                                registered_ifaces.push(nic_id);
+                            }
                         }
                         (inner::Inner::Listening(listening), None)
                     }
@@ -65,14 +76,21 @@ impl TcpSocket {
 
     pub fn try_accept(&self) -> Result<(Arc<TcpSocket>, smoltcp::wire::IpEndpoint), SystemError> {
         // 主动推进协议栈：避免依赖后台 poll 线程，保证 accept 在无事件通知场景下也能前进。
-        if let Some(iface) = self
-            .inner
-            .read()
-            .as_ref()
-            .and_then(|inner| inner.iface())
-            .cloned()
+        // For INADDR_ANY listeners, poll all interfaces that have listen sockets.
         {
-            iface.poll();
+            let reader = self.inner.read();
+            if let Some(inner::Inner::Listening(listening)) = reader.as_ref() {
+                let mut polled_nics: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                for b in &listening.inners {
+                    let nic_id = b.iface().nic_id();
+                    if !polled_nics.contains(&nic_id) {
+                        b.iface().poll();
+                        polled_nics.push(nic_id);
+                    }
+                }
+            } else if let Some(iface) = reader.as_ref().and_then(|inner| inner.iface()).cloned() {
+                iface.poll();
+            }
         }
 
         match self
@@ -111,7 +129,6 @@ impl TcpSocket {
         &self,
         remote_endpoint: smoltcp::wire::IpEndpoint,
     ) -> Result<(), SystemError> {
-        // log::debug!("TcpSocket::start_connect: remote={:?}", remote_endpoint);
         let mut writer = self.inner.write();
         let inner = writer.take().expect("Tcp inner::Inner is None");
         let (init, result) = match inner {
@@ -315,8 +332,19 @@ impl TcpSocket {
                     let local = listening.get_name();
                     let port = local.port;
 
-                    if let Some(b) = listening.inners.first() {
-                        b.iface().common().unregister_tcp_listen_port(port);
+                    // Unregister listen port and unbind socket from all unique interfaces.
+                    // For INADDR_ANY listeners, listen sockets span multiple interfaces.
+                    {
+                        let me = self.self_ref.upgrade().unwrap();
+                        let mut unregistered: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                        for b in &listening.inners {
+                            let nic_id = b.iface().nic_id();
+                            if !unregistered.contains(&nic_id) {
+                                b.iface().common().unregister_tcp_listen_port(port);
+                                b.iface().common().unbind_socket(me.clone());
+                                unregistered.push(nic_id);
+                            }
+                        }
                     }
 
                     for bound in &listening.inners {
@@ -426,19 +454,43 @@ impl TcpSocket {
     }
 
     pub fn close_socket(&self) -> Result<(), SystemError> {
+        // 先把 iface 推进到稳定态，再决定 close(2) 是走 FIN 还是 RST。
+        // 否则 loopback 上尚未被 poll 到接收队列的数据会让 unread 误判为 0，
+        // 导致本应 abort(RST) 的场景被错误地当成 graceful close(FIN)。
+        if let Some(iface) = self
+            .inner
+            .read()
+            .as_ref()
+            .and_then(|inner| inner.iface())
+            .cloned()
+        {
+            if let Some(netns) = iface.common().net_namespace() {
+                netns.wakeup_poll_thread();
+            }
+            poll_util::poll_iface_until_quiescent(iface.as_ref());
+        }
+
         let mut writer = self.inner.write();
         let Some(inner) = writer.take() else {
             log::warn!("TcpSocket::close: already closed, unexpected");
             return Ok(());
         };
 
+        let mut post_poll_iface: Option<Arc<dyn crate::net::Iface>> = None;
+
         // close(fd) must not break in-flight syscalls that already hold a
         // reference to this socket object (gVisor ClosedWriteBlockingSocket).
         // So we do NOT leave self.inner as None; we always reinsert it below.
-        if let Some(iface) = inner.iface() {
-            iface
-                .common()
-                .unbind_socket(self.self_ref.upgrade().unwrap());
+        //
+        // For Listening sockets, unbind_socket must be done per-iface inside the
+        // Listening match arm (INADDR_ANY spans multiple interfaces). For all other
+        // states, inner.iface() returns the single owning iface.
+        if !matches!(inner, inner::Inner::Listening(_)) {
+            if let Some(iface) = inner.iface() {
+                iface
+                    .common()
+                    .unbind_socket(self.self_ref.upgrade().unwrap());
+            }
         }
 
         match inner {
@@ -457,11 +509,12 @@ impl TcpSocket {
                     let local_port = conn.get_name().port;
                     let iface = conn.iface().clone();
                     let me: alloc::sync::Weak<dyn InetSocket> = self.self_ref.clone();
-                    conn.close();
+                    conn.with_mut(|socket| socket.close());
                     if conn.owns_port() {
                         iface.port_manager().unbind_port(Types::Tcp, local_port);
                     }
                     iface.common().defer_tcp_close(handle, local_port, me);
+                    post_poll_iface = Some(iface);
                     writer.replace(inner::Inner::Established(conn));
                 }
             }
@@ -481,14 +534,14 @@ impl TcpSocket {
                 let unread = es.with(|socket| socket.recv_queue());
                 if linger_abort || unread > 0 {
                     es.with_mut(|socket| socket.abort());
-                    es.iface().poll();
                 } else {
-                    es.close();
+                    es.with_mut(|socket| socket.close());
                 }
                 if es.owns_port() {
                     iface.port_manager().unbind_port(Types::Tcp, local_port);
                 }
                 iface.common().defer_tcp_close(handle, local_port, me);
+                post_poll_iface = Some(iface);
                 writer.replace(inner::Inner::Established(es));
             }
             inner::Inner::SelfConnected(sc) => {
@@ -506,8 +559,20 @@ impl TcpSocket {
             inner::Inner::Listening(mut ls) => {
                 // close(listen_fd) should stop listening on the port.
                 let port = ls.get_name().port;
-                if let Some(b) = ls.inners.first() {
-                    b.iface().common().unregister_tcp_listen_port(port);
+                // Unregister listen port and unbind socket from all unique interfaces.
+                // For INADDR_ANY listeners, listen sockets span multiple interfaces,
+                // so we must clean up each one.
+                {
+                    let me = self.self_ref.upgrade().unwrap();
+                    let mut cleaned: alloc::vec::Vec<usize> = alloc::vec::Vec::new();
+                    for b in &ls.inners {
+                        let nic_id = b.iface().nic_id();
+                        if !cleaned.contains(&nic_id) {
+                            b.iface().common().unregister_tcp_listen_port(port);
+                            b.iface().common().unbind_socket(me.clone());
+                            cleaned.push(nic_id);
+                        }
+                    }
                 }
                 ls.close();
                 // IMPORTANT:
@@ -535,6 +600,13 @@ impl TcpSocket {
             }
         };
         drop(writer);
+        if let Some(iface) = post_poll_iface {
+            if let Some(netns) = iface.common().net_namespace() {
+                netns.wakeup_poll_thread();
+            }
+            poll_util::poll_iface_until_quiescent(iface.as_ref());
+            iface.common().notify_all_bound_sockets();
+        }
         self.notify();
         Ok(())
     }

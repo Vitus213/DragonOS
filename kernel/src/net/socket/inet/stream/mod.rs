@@ -168,9 +168,31 @@ impl Socket for TcpSocket {
             return ret;
         }
 
+        let waitall = flags.contains(PMSG::WAITALL)
+            && !flags.contains(PMSG::PEEK)
+            && !flags.contains(PMSG::TRUNC);
+        let mut total_read = 0usize;
+
         let ret = loop {
-            match self.try_recv_with_flags(buffer, flags) {
+            match self.try_recv_with_flags(&mut buffer[total_read..], flags) {
+                Ok(n) => {
+                    total_read += n;
+                    if n == 0 {
+                        // EOF or no more bytes available.
+                        break Ok(total_read);
+                    }
+                    if total_read == buffer.len() {
+                        break Ok(total_read);
+                    }
+                    if !waitall {
+                        break Ok(total_read);
+                    }
+                    continue;
+                }
                 Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    if total_read > 0 && !waitall {
+                        break Ok(total_read);
+                    }
                     // Poll in a loop until no more events. This is critical for loopback:
                     // - Poll 1: TX sends data to loopback queue, RX processes existing packets
                     // - Poll 2: RX processes the data we just transmitted (loopback roundtrip)
@@ -179,29 +201,36 @@ impl Socket for TcpSocket {
                     {
                         poll_util::poll_iface_until_quiescent(iface.as_ref());
                     }
-                    // After polling, check if EPOLLIN is now set before waiting.
-                    // update_events() was called by poll() -> notify(), so pollee is fresh.
-                    let events = EP::from_bits_truncate(
-                        self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
-                    );
+                    // 与 connect() 同理，不能只依赖缓存的 pollee 位。
+                    // 否则若“最后一次 notify() 先发生、而当前线程尚未真正入睡”，
+                    // 后续没有新事件时就会因为错过唤醒而永久睡眠。
+                    // 这里在入睡前主动重新检查真实 socket 状态，避免先唤后睡。
+                    let events = self.check_io_event();
                     if events.intersects(EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR)
                     {
                         continue; // Data available now, retry recv
                     }
-                    // Wait for EPOLLIN. The poll thread's notify() updates pollee after polling.
-                    self.wait_queue.wait_event_io_interruptible_timeout(
+                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
                         || {
-                            let events = EP::from_bits_truncate(
-                                self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
-                            );
-                            events.intersects(
+                            self.check_io_event().intersects(
                                 EP::EPOLLIN | EP::EPOLLHUP | EP::EPOLLRDHUP | EP::EPOLLERR,
                             )
                         },
                         self.recv_timeout(),
-                    )?;
+                    );
+                    if let Err(e) = wait_ret {
+                        if total_read > 0 {
+                            break Ok(total_read);
+                        }
+                        break Err(e);
+                    }
                 }
-                result => break result,
+                Err(e) => {
+                    if total_read > 0 {
+                        break Ok(total_read);
+                    }
+                    break Err(e);
+                }
             }
         };
 
@@ -211,6 +240,13 @@ impl Socket for TcpSocket {
             }
         }
         ret
+    }
+
+    fn read_to_user_buffer(
+        &self,
+        user_buffer: &mut crate::syscall::user_buffer::UserBuffer<'_>,
+    ) -> Result<usize, SystemError> {
+        self.read_to_user_buffer_impl(user_buffer)
     }
 
     fn send(&self, buffer: &[u8], _flags: PMSG) -> Result<usize, SystemError> {
@@ -229,50 +265,62 @@ impl Socket for TcpSocket {
             return ret;
         }
 
-        // 先尝试写一次：写到多少就返回多少（允许短写）。
-        match self.try_send(buffer) {
-            Ok(n) => {
-                if n > 0 {
+        // Linux 语义（tcp_sendmsg）：阻塞发送会尽量持续发送直到：
+        // 1) 请求数据全部写入；或
+        // 2) 在尚未写入任何字节前遇到错误（返回错误）；或
+        // 3) 已写入部分数据后遇到错误/中断（返回短写）。
+        let mut total_sent = 0usize;
+
+        while total_sent < buffer.len() {
+            match self.try_send(&buffer[total_sent..]) {
+                Ok(n) => {
+                    if n == 0 {
+                        if total_sent > 0 {
+                            break;
+                        }
+                        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+                    }
+                    total_sent += n;
                     self.notify();
+                    continue;
                 }
-                return Ok(n);
-            }
-            Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => { /* fallthrough: block */ }
-            Err(e) => return Err(e),
-        }
+                Err(SystemError::EAGAIN_OR_EWOULDBLOCK) => {
+                    // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
+                    if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned()
+                    {
+                        poll_util::poll_iface_until_quiescent(iface.as_ref());
+                    }
 
-        let ret = loop {
-            // loopback 场景需要把协议栈推进到“真正可写/不可写”的稳定状态，避免丢唤醒。
-            if let Some(iface) = self.inner.read().as_ref().and_then(|i| i.iface()).cloned() {
-                poll_util::poll_iface_until_quiescent(iface.as_ref());
-            }
+                    // 与 recv/connect 同理，不能只看缓存事件位；等待前需要主动刷新。
+                    let events = self.check_io_event();
+                    if events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR) {
+                        continue;
+                    }
 
-            // 若已经可写，重试一次并直接返回（允许短写）。
-            let events = EP::from_bits_truncate(
-                self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
-            );
-            if events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR) {
-                break self.try_send(buffer);
-            }
-
-            // 等待可写或超时/信号。
-            self.wait_queue.wait_event_io_interruptible_timeout(
-                || {
-                    let events = EP::from_bits_truncate(
-                        self.pollee.load(core::sync::atomic::Ordering::SeqCst) as u32,
+                    let wait_ret = self.wait_queue.wait_event_io_interruptible_timeout(
+                        || {
+                            self.check_io_event()
+                                .intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR)
+                        },
+                        self.send_timeout(),
                     );
-                    events.intersects(EP::EPOLLOUT | EP::EPOLLHUP | EP::EPOLLERR)
-                },
-                self.send_timeout(),
-            )?;
-        };
-
-        if let Ok(n) = ret {
-            if n > 0 {
-                self.notify();
+                    if let Err(e) = wait_ret {
+                        if total_sent > 0 {
+                            break;
+                        }
+                        return Err(e);
+                    }
+                }
+                Err(e) => {
+                    if total_sent > 0 {
+                        break;
+                    }
+                    return Err(e);
+                }
             }
         }
-        ret
+
+        Ok(total_sent)
     }
 
     fn send_buffer_size(&self) -> usize {
