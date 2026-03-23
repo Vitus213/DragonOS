@@ -12,7 +12,11 @@ use crate::{
     },
     process::{ProcessManager, RawPid},
 };
-use alloc::{format, sync::{Arc, Weak}, vec::Vec};
+use alloc::{
+    format,
+    sync::{Arc, Weak},
+    vec::Vec,
+};
 use system_error::SystemError;
 
 #[derive(Debug)]

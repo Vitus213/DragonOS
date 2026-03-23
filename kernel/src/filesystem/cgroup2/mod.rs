@@ -683,7 +683,11 @@ impl Cgroup2Inode {
     // Writes must not keep the inode's inner lock across permission checks or
     // task migration, otherwise a write to cgroup.procs can re-enter metadata()
     // on the same inode and self-deadlock.
-    fn write_file(this: &Arc<Cgroup2Inode>, offset: usize, buf: &[u8]) -> Result<usize, SystemError> {
+    fn write_file(
+        this: &Arc<Cgroup2Inode>,
+        offset: usize,
+        buf: &[u8],
+    ) -> Result<usize, SystemError> {
         let (cgroup, ty) = {
             let inner = this.inner.lock();
             match &inner.kind {

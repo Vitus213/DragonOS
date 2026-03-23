@@ -14,8 +14,8 @@ use crate::{
 use alloc::sync::{Arc, Weak};
 use system_error::SystemError;
 
-mod cmdline;
 mod cgroup;
+mod cmdline;
 mod exe;
 mod fd;
 mod fdinfo;
@@ -28,8 +28,8 @@ mod statm;
 mod status;
 mod task;
 
-use cmdline::CmdlineFileOps;
 use cgroup::CgroupFileOps;
+use cmdline::CmdlineFileOps;
 use exe::ExeSymOps;
 use fd::FdDirOps;
 use fdinfo::FdInfoDirOps;
