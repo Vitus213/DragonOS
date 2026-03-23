@@ -1,151 +1,187 @@
 #!/usr/bin/env python3
-"""Generate multiple shuffled passes from a unified diff."""
+"""Generate deterministic shuffled diff passes for Stage1 review."""
 
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
+import os
 import random
-import re
 import sys
 from dataclasses import dataclass
-from typing import List
 
 
-DIFF_START = re.compile(r"^diff --git ")
-HUNK_START = re.compile(r"^@@ ")
+@dataclass(frozen=True)
+class FileBlock:
+    """A unified diff file block with optional per-file hunks."""
 
-
-@dataclass
-class Hunk:
     header: str
-    lines: List[str]
+    hunks: tuple[str, ...]
+    path: str
+
+    def render(self) -> str:
+        if not self.hunks:
+            return self.header
+        return self.header + "".join(self.hunks)
 
 
-@dataclass
-class FilePatch:
-    file_hint: str
-    prelude: List[str]
-    hunks: List[Hunk]
+def read_input(path: str | None) -> str:
+    if path:
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    return sys.stdin.read()
 
 
-def split_file_patches(diff_text: str) -> List[List[str]]:
-    lines = diff_text.splitlines(keepends=True)
-    chunks: List[List[str]] = []
-    current: List[str] = []
+def split_file_blocks(text: str) -> list[str]:
+    lines = text.splitlines(keepends=True)
+    if not lines:
+        return []
+
+    blocks: list[list[str]] = []
+    current: list[str] = []
+    saw_git_block = False
+
     for line in lines:
-        if DIFF_START.match(line) and current:
-            chunks.append(current)
+        if line.startswith("diff --git "):
+            saw_git_block = True
+            if current:
+                blocks.append(current)
             current = [line]
-        else:
-            current.append(line)
-    if current:
-        chunks.append(current)
-    return chunks
-
-
-def parse_file_patch(lines: List[str]) -> FilePatch:
-    prelude: List[str] = []
-    hunks: List[Hunk] = []
-    current_hunk_header = ""
-    current_hunk_lines: List[str] = []
-
-    file_hint = "unknown"
-    for ln in lines:
-        if ln.startswith("+++ b/"):
-            file_hint = ln[len("+++ b/") :].strip()
-
-    in_hunk = False
-    for ln in lines:
-        if HUNK_START.match(ln):
-            if in_hunk:
-                hunks.append(Hunk(current_hunk_header, current_hunk_lines))
-            current_hunk_header = ln
-            current_hunk_lines = []
-            in_hunk = True
             continue
+        current.append(line)
 
-        if in_hunk:
-            current_hunk_lines.append(ln)
+    if current:
+        blocks.append(current)
+
+    if saw_git_block:
+        return ["".join(block) for block in blocks]
+
+    # Fallback for plain patches without git headers: keep original diff as one block.
+    return [text]
+
+
+def parse_path(block_text: str) -> str:
+    for line in block_text.splitlines():
+        if line.startswith("+++ b/"):
+            return line[6:].strip()
+        if line.startswith("diff --git "):
+            parts = line.split()
+            if len(parts) >= 4 and parts[3].startswith("b/"):
+                return parts[3][2:]
+    return "<unknown>"
+
+
+def split_hunks(block_text: str) -> FileBlock:
+    lines = block_text.splitlines(keepends=True)
+    header: list[str] = []
+    hunks: list[list[str]] = []
+    current_hunk: list[str] | None = None
+
+    for line in lines:
+        if line.startswith("@@ "):
+            if current_hunk is not None:
+                hunks.append(current_hunk)
+            current_hunk = [line]
+            continue
+        if current_hunk is None:
+            header.append(line)
         else:
-            prelude.append(ln)
+            current_hunk.append(line)
 
-    if in_hunk:
-        hunks.append(Hunk(current_hunk_header, current_hunk_lines))
+    if current_hunk is not None:
+        hunks.append(current_hunk)
 
-    if not hunks:
-        hunks = [Hunk("", [])]
-
-    return FilePatch(file_hint=file_hint, prelude=prelude, hunks=hunks)
-
-
-def render_patch(file_patch: FilePatch, hunk_order: List[int]) -> str:
-    out = "".join(file_patch.prelude)
-    for idx in hunk_order:
-        h = file_patch.hunks[idx]
-        out += h.header
-        out += "".join(h.lines)
-    return out
-
-
-def main() -> int:
-    parser = argparse.ArgumentParser(description="Create shuffled diff passes")
-    parser.add_argument("input", nargs="?", help="Input diff file (defaults to stdin)")
-    parser.add_argument(
-        "-p", "--passes", type=int, default=8, help="Number of shuffled passes"
+    return FileBlock(
+        header="".join(header),
+        hunks=tuple("".join(hunk) for hunk in hunks),
+        path=parse_path(block_text),
     )
-    parser.add_argument("-s", "--seed", type=int, default=42, help="Base seed")
-    parser.add_argument("-o", "--output", help="Output JSON file (defaults to stdout)")
-    args = parser.parse_args()
 
-    if args.input:
-        with open(args.input, "r", encoding="utf-8") as f:
-            diff_text = f.read()
-    else:
-        diff_text = sys.stdin.read()
 
-    chunk_lines = split_file_patches(diff_text)
-    file_patches = [parse_file_patch(chunk) for chunk in chunk_lines]
+def rotate_items(items: list[str], rng: random.Random) -> list[str]:
+    if len(items) <= 1:
+        return items[:]
+    offset = rng.randrange(len(items))
+    return items[offset:] + items[:offset]
 
-    passes = []
-    indices = list(range(len(file_patches)))
-    for i in range(args.passes):
-        rng = random.Random(args.seed + i)
-        file_order = indices[:]
-        rng.shuffle(file_order)
 
-        rendered = []
-        manifest = []
-        for file_idx in file_order:
-            fp = file_patches[file_idx]
-            hunk_order = list(range(len(fp.hunks)))
-            rng.shuffle(hunk_order)
-            rendered.append(render_patch(fp, hunk_order))
-            manifest.append(
-                {
-                    "file": fp.file_hint,
-                    "hunk_count": len(fp.hunks),
-                    "hunk_order": hunk_order,
-                }
-            )
+def shuffle_block(block: FileBlock, rng: random.Random) -> FileBlock:
+    hunks = list(block.hunks)
+    if len(hunks) > 1:
+        rng.shuffle(hunks)
+        hunks = rotate_items(hunks, rng)
+    return FileBlock(header=block.header, hunks=tuple(hunks), path=block.path)
 
-        passes.append(
+
+def shuffle_passes(text: str, passes: int, seed: int) -> dict[str, object]:
+    file_blocks = [split_hunks(block) for block in split_file_blocks(text)]
+    rendered_original = [block.render() for block in file_blocks]
+
+    payload_passes: list[dict[str, object]] = []
+    for pass_id in range(1, passes + 1):
+        rng = random.Random(seed + pass_id * 1009)
+        block_order = list(file_blocks)
+        if len(block_order) > 1:
+            rng.shuffle(block_order)
+            block_order = rotate_items(block_order, rng)
+        shuffled = [shuffle_block(block, rng) for block in block_order]
+        diff_text = "".join(block.render() for block in shuffled)
+        payload_passes.append(
             {
-                "pass_id": i + 1,
-                "seed": args.seed + i,
-                "manifest": manifest,
-                "diff_text": "".join(rendered),
+                "pass_id": pass_id,
+                "seed": seed + pass_id * 1009,
+                "file_order": [block.path for block in shuffled],
+                "block_count": len(shuffled),
+                "diff": diff_text,
             }
         )
 
-    payload = {"passes": passes}
-    text = json.dumps(payload, ensure_ascii=False, indent=2)
+    return {
+        "schema_version": "1.0",
+        "strategy": "deterministic_file_and_hunk_shuffle",
+        "original_block_count": len(rendered_original),
+        "passes": payload_passes,
+    }
+
+
+def derive_seed(text: str) -> int:
+    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser(
+        description="Generate deterministic shuffled diff passes"
+    )
+    parser.add_argument("input", nargs="?", help="Input diff file (defaults to stdin)")
+    parser.add_argument(
+        "--passes", type=int, default=8, help="Number of shuffled passes to emit"
+    )
+    parser.add_argument(
+        "--seed",
+        type=int,
+        help="Base seed; defaults to sha256-derived stable seed from input diff",
+    )
+    parser.add_argument(
+        "-o", "--output", help="Output JSON path (defaults to stdout)"
+    )
+    args = parser.parse_args()
+
+    if args.passes < 1:
+        raise ValueError("passes must be >= 1")
+
+    text = read_input(args.input)
+    seed = args.seed if args.seed is not None else derive_seed(text)
+    payload = shuffle_passes(text, args.passes, seed)
+    output = json.dumps(payload, ensure_ascii=False, indent=2)
 
     if args.output:
+        os.makedirs(os.path.dirname(args.output) or ".", exist_ok=True)
         with open(args.output, "w", encoding="utf-8") as f:
-            f.write(text)
+            f.write(output)
     else:
-        sys.stdout.write(text)
+        sys.stdout.write(output)
     return 0
 
 

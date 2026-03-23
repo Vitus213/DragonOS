@@ -6,14 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from typing import Any
 
 
-def load_json(path: str):
+def load_json(path: str) -> dict[str, Any]:
     with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+        payload = json.load(f)
+    if not isinstance(payload, dict):
+        raise ValueError("input must be an object containing buckets")
+    return payload
 
 
-def bucket_score(bucket: dict) -> float:
+def bucket_score(bucket: dict[str, Any]) -> float:
+    # Average confidence across supporting findings represents consensus confidence.
     findings = bucket.get("findings", [])
     if not findings:
         return 0.0
@@ -33,13 +38,22 @@ def main() -> int:
         "--high", type=float, default=0.60, help="Debate upper score bound"
     )
     args = parser.parse_args()
+    if not (0.0 <= args.low <= 1.0 and 0.0 <= args.high <= 1.0):
+        raise ValueError("low/high must be in [0,1]")
+    if args.low >= args.high:
+        raise ValueError("low must be smaller than high")
 
     data = load_json(args.input)
     buckets = data.get("buckets", [])
-    candidates = []
+    if not isinstance(buckets, list):
+        raise ValueError("buckets must be a list")
+    candidates: list[dict[str, Any]] = []
 
     for b in buckets:
+        if not isinstance(b, dict):
+            continue
         score = bucket_score(b)
+        score = max(0.0, min(1.0, score))
         conflict = bool(b.get("type_conflict", False))
         if conflict or (args.low <= score < args.high):
             candidates.append(
@@ -54,7 +68,7 @@ def main() -> int:
                 }
             )
 
-    payload = {"candidates": candidates}
+    payload = {"schema_version": str(data.get("schema_version", "1.0")), "candidates": candidates}
     text = json.dumps(payload, ensure_ascii=False, indent=2)
     if args.output:
         with open(args.output, "w", encoding="utf-8") as f:

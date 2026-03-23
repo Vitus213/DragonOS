@@ -45,8 +45,11 @@ def main() -> int:
     if not isinstance(decisions, list):
         raise ValueError("decisions file must be a JSON list")
 
-    history = load_json(args.output, {"updated_at": None, "persona": {}})
+    history = load_json(
+        args.output, {"schema_version": "1.0", "updated_at": None, "persona": {}}
+    )
     persona = history.setdefault("persona", {})
+    history.setdefault("schema_version", "1.0")
 
     for d in decisions:
         agent = str(d.get("agent", "Unknown"))
@@ -75,7 +78,12 @@ def main() -> int:
 
     os.makedirs(os.path.dirname(args.weights_output) or ".", exist_ok=True)
     with open(args.weights_output, "w", encoding="utf-8") as f:
-        json.dump({"suggested_weights": suggestions}, f, ensure_ascii=False, indent=2)
+        json.dump(
+            {"schema_version": "1.0", "suggested_weights": suggestions},
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
 
     sys.stdout.write(
         json.dumps(
