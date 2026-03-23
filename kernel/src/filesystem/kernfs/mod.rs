@@ -450,7 +450,7 @@ impl KernFSInode {
         let inode = Arc::new_cyclic(|self_ref| KernFSInode {
             name,
             inner: RwSem::new(InnerKernFSInode {
-                parent: parent.as_ref().map_or(Weak::new(), |p| Arc::downgrade(p)),
+                parent: parent.as_ref().map_or(Weak::new(), Arc::downgrade),
                 metadata,
                 symlink_target: None,
                 symlink_target_absolute_path: None,
@@ -605,7 +605,7 @@ impl KernFSInode {
             flags: InodeFlags::empty(),
         };
 
-        let new_inode: Arc<KernFSInode> = Self::new(
+        let new_inode: Arc<KernFSInode> = Self::new_with_parent(
             Some(self.self_ref.upgrade().unwrap()),
             name.clone(),
             metadata,

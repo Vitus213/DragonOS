@@ -239,6 +239,7 @@ impl CgroupRoot {
         Ok(cur)
     }
 
+    #[allow(dead_code)]
     pub fn find_path(&self, path: &str) -> Result<Arc<CgroupNode>, SystemError> {
         let rel = normalize_cgroup_abs_path(path)?;
         let mut cur = self.root();
@@ -406,6 +407,7 @@ pub fn find_or_create_node_by_abs_path(path: &str) -> Result<Arc<CgroupNode>, Sy
     cgroup_root().find_or_create_path(path)
 }
 
+#[allow(dead_code)]
 pub fn find_node_by_abs_path(path: &str) -> Result<Arc<CgroupNode>, SystemError> {
     cgroup_root().find_path(path)
 }

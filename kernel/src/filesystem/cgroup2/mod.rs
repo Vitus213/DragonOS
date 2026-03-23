@@ -344,16 +344,13 @@ impl Cgroup2Inode {
 
     fn validate_enable_controller(cgroup: &Arc<CgroupNode>, name: &str) -> Result<(), SystemError> {
         let available = Self::available_controllers_for(cgroup);
-        if !available.iter().any(|c| *c == name) {
+        if !available.contains(&name) {
             return Err(SystemError::EINVAL);
         }
 
         // no-internal-process 框架：仅对 domain controller 生效。
         // 当前阶段未启用 controller，DOMAIN_CONTROLLERS 为空，不会误拒绝。
-        if DOMAIN_CONTROLLERS.iter().any(|c| *c == name)
-            && cgroup.has_tasks()
-            && cgroup.has_children()
-        {
+        if DOMAIN_CONTROLLERS.contains(&name) && cgroup.has_tasks() && cgroup.has_children() {
             return Err(SystemError::EBUSY);
         }
         Ok(())
