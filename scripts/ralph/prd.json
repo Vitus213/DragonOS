@@ -1,0 +1,389 @@
+{
+  "project": "DragonOS",
+  "branchName": "ralph/cgroup-memory-controller",
+  "description": "Implement a Linux-compatible cgroup v2 memory controller for DragonOS that tracks anonymous user pages, supports memory.current/max/high/low, triggers reclaim before cgroup-scoped OOM, passes existing tests, and adds DragonOS-vs-Linux baseline benchmarks.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "注册 memory controller 并暴露 memory.* 文件节点",
+      "description": "As a kernel developer, I want the cgroup v2 memory controller to register its Linux-style files so that userspace tools and tests can discover the interface.",
+      "acceptanceCriteria": [
+        "在启用 memory controller 的 cgroup 目录下可见 memory.current、memory.max、memory.high、memory.low、memory.stat、memory.events",
+        "memory controller 能通过 cgroup.subtree_control 或等价机制启用",
+        "缺失的文件操作返回明确错误而不是文件不存在",
+        "make kernel passes",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 1,
+      "passes": true,
+      "notes": ""
+    },
+    {
+      "id": "US-002",
+      "title": "为 memory.max、memory.high、memory.low 增加每 cgroup 配置存储",
+      "description": "As a kernel developer, I want per-cgroup storage for memory thresholds so that the controller can keep stable configuration values for later enforcement.",
+      "acceptanceCriteria": [
+        "每个 cgroup 都有独立的 memory.max、memory.high、memory.low 配置字段",
+        "未配置时各阈值具有稳定默认值",
+        "controller 初始化和 cgroup 生命周期不会丢失这些配置",
+        "make kernel passes",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 2,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-003",
+      "title": "实现 memory.max、memory.high、memory.low 的文件读写语义",
+      "description": "As a kernel developer, I want threshold files to read and write stable values so that tests and userspace can configure the controller.",
+      "acceptanceCriteria": [
+        "向 memory.max、memory.high、memory.low 写入合法数值时会更新对应 cgroup 配置",
+        "读取 memory.max、memory.high、memory.low 返回当前生效值",
+        "memory.max 支持 Linux 风格的 max 关键字，或明确返回一致错误",
+        "非法写入返回稳定且可测试的错误",
+        "make kernel passes",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 3,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-004",
+      "title": "为匿名用户页分配路径增加 cgroup charge",
+      "description": "As a kernel developer, I want anonymous user page allocations to charge the owning cgroup so that memory usage increases at the correct time.",
+      "acceptanceCriteria": [
+        "匿名用户页首次计费分配时增加所属 cgroup 的内存计数",
+        "同一 cgroup 内多个任务的匿名页用量会正确累计",
+        "文件页缓存和非目标内存类型不会被计入本阶段的 memory controller 计数",
+        "make kernel passes",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 4,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-005",
+      "title": "为匿名用户页释放与退出路径增加 cgroup uncharge",
+      "description": "As a kernel developer, I want anonymous memory to be uncharged on free and task exit so that the controller reports decreasing usage correctly.",
+      "acceptanceCriteria": [
+        "释放匿名页时减少所属 cgroup 的内存计数",
+        "进程退出清理匿名页时减少所属 cgroup 的内存计数",
+        "计数不会因为重复释放或退出路径而变为负数",
+        "make kernel passes",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 5,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-006",
+      "title": "实现 memory.current 的读取语义",
+      "description": "As a test author, I want memory.current to report current charged anonymous memory in bytes so that I can verify controller behavior.",
+      "acceptanceCriteria": [
+        "读取 memory.current 返回当前 cgroup 已记账匿名内存的字节数",
+        "匿名内存增长后再次读取 memory.current 时数值增加",
+        "匿名内存释放后再次读取 memory.current 时数值减少",
+        "输出格式为 Linux 风格的纯数字文本",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 6,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-007",
+      "title": "建立 memory.events 的固定键集合与计数存储",
+      "description": "As a test author, I want stable event counters for low, high, max, oom, and oom_kill so that later controller paths can update observable state.",
+      "acceptanceCriteria": [
+        "每个 cgroup 都维护 low、high、max、oom、oom_kill 计数",
+        "未命中事件时计数默认值为 0",
+        "计数器支持单调递增更新",
+        "make kernel passes",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 7,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-008",
+      "title": "输出 memory.events 文件",
+      "description": "As a test author, I want memory.events to expose stable key-value text so that automated tests can assert limit and OOM behavior.",
+      "acceptanceCriteria": [
+        "memory.events 以 Linux 风格的 key value 文本输出",
+        "输出包含 low、high、max、oom、oom_kill 键",
+        "读取 memory.events 不会导致内核警告或崩溃",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 8,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-009",
+      "title": "在超过 memory.high 时进入目标 cgroup 回收路径",
+      "description": "As a kernel developer, I want exceeding memory.high to trigger reclaim pressure instead of immediate failure so that the controller matches Linux-style soft pressure semantics.",
+      "acceptanceCriteria": [
+        "当已记账用量超过 memory.high 时会进入目标 cgroup 的回收路径",
+        "命中 memory.high 会增加对应事件计数",
+        "超过 memory.high 不会直接触发 OOM kill",
+        "回收路径只作用于目标 cgroup 或清晰记录当前实现差异",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 9,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-010",
+      "title": "在分配前检查 memory.max 硬限制阈值",
+      "description": "As a runtime developer, I want allocations to detect when they would exceed memory.max so that hard-limit enforcement can start from a clear decision point.",
+      "acceptanceCriteria": [
+        "当新分配会超过 memory.max 时可识别出硬限制命中",
+        "若 memory.max 为 max 则硬限制检查关闭",
+        "命中 memory.max 会增加对应事件计数",
+        "未超限时分配路径保持原有前进语义",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 10,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-011",
+      "title": "在 memory.max 命中后先尝试目标 cgroup 回收",
+      "description": "As a runtime developer, I want memory.max enforcement to try reclaim before failing so that over-limit allocations follow reclaim-before-fail semantics.",
+      "acceptanceCriteria": [
+        "当分配命中 memory.max 时先尝试目标 cgroup 回收",
+        "若回收释放足够内存则本次分配继续前进",
+        "若回收失败则分配路径不会静默突破配置上限",
+        "分配路径可观察到先命中 max 后回收的顺序",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 11,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-012",
+      "title": "实现回收失败后的 cgroup 范围 OOM 处理",
+      "description": "As a system developer, I want reclaim failure under memory.max to trigger a cgroup-scoped OOM response so that over-limit workloads are contained locally.",
+      "acceptanceCriteria": [
+        "超过 memory.max 且回收失败时触发 cgroup 范围内的 OOM 处理逻辑",
+        "OOM 处理影响范围限制在目标 cgroup 或代码中明确记录最小可接受差异",
+        "oom 与 oom_kill 事件计数会在对应路径更新",
+        "分配路径体现先回收后 OOM 的顺序",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 12,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-013",
+      "title": "输出最小可用的 memory.stat 匿名页字段",
+      "description": "As a debugger, I want memory.stat to expose stable anonymous-memory statistics so that I can inspect basic controller state during debugging.",
+      "acceptanceCriteria": [
+        "memory.stat 以 Linux 风格的 key value 文本输出",
+        "输出包含本阶段已实现且可验证的匿名页相关字段",
+        "未实现的高级字段不会伪造非真实数据",
+        "读取 memory.stat 不会导致内核警告或崩溃",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 13,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-014",
+      "title": "在 memory.stat 中补充回收相关字段",
+      "description": "As a debugger, I want reclaim-related fields in memory.stat so that reclaim behavior can be inspected without reading internal kernel state.",
+      "acceptanceCriteria": [
+        "memory.stat 输出包含本阶段已实现且可验证的回收相关字段",
+        "字段值会随着回收路径执行发生可观测变化",
+        "字段命名与 Linux 风格一致或明确记录差异",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 14,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-015",
+      "title": "实现 memory.low 的最小保护回收规则",
+      "description": "As a kernel developer, I want memory.low to protect low-usage cgroups during reclaim so that reclaim prefers less protected candidates.",
+      "acceptanceCriteria": [
+        "回收选择时优先回收超过其 low 保护值的 cgroup",
+        "低于 memory.low 的 cgroup 相比未受保护候选对象更少被回收",
+        "当前阶段与 Linux 完整 memory.low 语义的差异被明确记录",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 15,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-016",
+      "title": "为 memory.low 增加所有候选都受保护时的前进规则",
+      "description": "As a kernel developer, I want reclaim to continue even when all candidates are protected by memory.low so that the system does not deadlock under pressure.",
+      "acceptanceCriteria": [
+        "当所有候选都受 low 保护时系统仍能继续前进而不是永久卡死",
+        "fallback 路径不会绕过必要的事件更新与限制语义",
+        "当前 fallback 规则在代码或文档中有清晰说明",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 16,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-017",
+      "title": "为匿名页记账与 memory.current 增加自动化测试",
+      "description": "As a maintainer, I want automated tests for accounting and memory.current so that future changes cannot silently break basic memory controller semantics.",
+      "acceptanceCriteria": [
+        "新增或扩展测试覆盖分配后 memory.current 增加",
+        "新增或扩展测试覆盖释放或退出后 memory.current 减少",
+        "新增或扩展测试覆盖同一 cgroup 内多个任务的匿名页累计",
+        "相关测试可稳定重复运行",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 17,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-018",
+      "title": "为 memory.high 软限制路径增加自动化测试",
+      "description": "As a maintainer, I want targeted tests for memory.high pressure so that the soft-limit reclaim behavior remains stable.",
+      "acceptanceCriteria": [
+        "新增或扩展测试覆盖超过 memory.high 时触发回收但不立即 OOM",
+        "测试可观察 high 事件计数变化",
+        "现有相关 cgroup 测试在该变更后保持通过",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 18,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-019",
+      "title": "为 memory.max 与 OOM 顺序增加自动化测试",
+      "description": "As a maintainer, I want automated tests for the memory.max fast path and OOM path so that reclaim-before-OOM behavior is enforced.",
+      "acceptanceCriteria": [
+        "新增或扩展测试覆盖超过 memory.max 时先尝试回收",
+        "新增或扩展测试覆盖回收失败后进入 OOM 路径",
+        "测试可观察 max、oom 或 oom_kill 事件的变化",
+        "现有相关 cgroup 测试在该变更后保持通过",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 19,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-020",
+      "title": "为 memory.low 保护与 fallback 增加自动化测试",
+      "description": "As a maintainer, I want automated tests for memory.low protection and fallback so that reclaim selection stays stable across refactors.",
+      "acceptanceCriteria": [
+        "新增或扩展测试覆盖 memory.low 对回收候选选择的影响",
+        "新增或扩展测试覆盖所有候选都受保护时的 fallback 行为",
+        "若存在与 Linux 语义的已知差异，测试或注释会清晰标记",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 20,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-021",
+      "title": "运行相关测试矩阵并记录结果摘要",
+      "description": "As a project maintainer, I want a repeatable test summary for the memory controller work so that the branch has a clear record of what passed and what still differs from Linux.",
+      "acceptanceCriteria": [
+        "运行现有 cgroup 相关测试与新增 memory controller 测试",
+        "如果存在 gVisor 或兼容性相关 memory controller 用例，则记录通过项与剩余差异",
+        "生成一份结果摘要，列出测试名称、结果、失败项与原因",
+        "结果摘要保存在仓库中的可追踪文件里",
+        "Tests pass",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 21,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-022",
+      "title": "扩展 cgroup benchmark 骨架并输出结构化 JSON",
+      "description": "As a performance engineer, I want the existing cgroup benchmark to gain memory-controller-aware scenarios and JSON output so that DragonOS and Linux can be compared in one format.",
+      "acceptanceCriteria": [
+        "复用或扩展现有 cgroup benchmark 程序而不是新建不兼容框架",
+        "benchmark 输出结构化 JSON，包含场景名称与关键统计指标",
+        "benchmark 代码可在 DragonOS 与 Linux 上编译运行",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 22,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-023",
+      "title": "为 benchmark 增加 baseline 与未命中限制场景",
+      "description": "As a performance engineer, I want benchmark coverage for baseline and below-limit controller overhead so that normal-path costs can be compared with Linux.",
+      "acceptanceCriteria": [
+        "benchmark 覆盖无 controller 的 baseline 场景",
+        "benchmark 覆盖启用 controller 但未命中限制的场景",
+        "输出结果可区分 baseline 与未命中限制场景",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 23,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-024",
+      "title": "为 benchmark 增加 memory.high 与 memory.max 场景",
+      "description": "As a performance engineer, I want benchmark coverage for pressure and hard-limit paths so that costly controller paths can be compared with Linux.",
+      "acceptanceCriteria": [
+        "benchmark 覆盖命中 memory.high 的回收路径场景",
+        "benchmark 覆盖命中 memory.max 的失败或治理路径场景",
+        "输出结果可区分 high 与 max 相关场景",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 24,
+      "passes": false,
+      "notes": ""
+    },
+    {
+      "id": "US-025",
+      "title": "补充 benchmark 用法文档与 DragonOS/Linux 对比流程",
+      "description": "As a performance engineer, I want benchmark documentation and a comparison workflow so that others can reproduce baseline and Linux-vs-DragonOS measurements.",
+      "acceptanceCriteria": [
+        "文档明确 benchmark 的运行环境、输入参数、采样次数与输出字段含义",
+        "文档说明如何在 DragonOS 和 Linux 上运行同一组 benchmark",
+        "文档包含一份 DragonOS 与 Linux 结果对比的样例格式或示例输出片段",
+        "文档引用或更新现有 cgroup benchmark 设计文档",
+        "nix develop -c make kernel passes"
+      ],
+      "priority": 25,
+      "passes": false,
+      "notes": ""
+    }
+  ]
+}

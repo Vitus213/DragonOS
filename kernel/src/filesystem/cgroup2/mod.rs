@@ -31,7 +31,7 @@ use linkme::distributed_slice;
 
 const CGROUP2_MAX_NAMELEN: usize = 255;
 const CGROUP2_BLOCK_SIZE: u64 = 512;
-const AVAILABLE_CONTROLLERS: [&str; 1] = ["pids"];
+const AVAILABLE_CONTROLLERS: [&str; 2] = ["pids", "memory"];
 const DOMAIN_CONTROLLERS: [&str; 0] = [];
 
 #[derive(Debug)]
@@ -90,6 +90,12 @@ enum CgroupCoreFile {
     PidsCurrent,
     PidsMax,
     PidsEvents,
+    MemoryCurrent,
+    MemoryMax,
+    MemoryHigh,
+    MemoryLow,
+    MemoryStat,
+    MemoryEvents,
 }
 
 impl Cgroup2Fs {
@@ -474,6 +480,69 @@ impl Cgroup2Inode {
         }
     }
 
+    fn has_child(parent: &Arc<Cgroup2Inode>, name: &str) -> Result<bool, SystemError> {
+        let inner = parent.inner.lock();
+        match &inner.kind {
+            Cgroup2InodeKind::Dir { children, .. } => Ok(children.contains_key(name)),
+            _ => Err(SystemError::ENOTDIR),
+        }
+    }
+
+    fn memory_enabled_for(cgroup: &Arc<CgroupNode>) -> bool {
+        cgroup
+            .parent()
+            .map(|parent| parent.subtree_control().iter().any(|ctrl| ctrl == "memory"))
+            .unwrap_or(false)
+    }
+
+    fn ensure_memory_files(
+        dir: &Arc<Cgroup2Inode>,
+        cgroup: &Arc<CgroupNode>,
+    ) -> Result<(), SystemError> {
+        if !Self::memory_enabled_for(cgroup) {
+            return Ok(());
+        }
+
+        let memory_files = [
+            (
+                "memory.current",
+                CgroupCoreFile::MemoryCurrent,
+                b"0\n".as_slice(),
+            ),
+            ("memory.max", CgroupCoreFile::MemoryMax, b"max\n".as_slice()),
+            ("memory.high", CgroupCoreFile::MemoryHigh, b"max\n".as_slice()),
+            ("memory.low", CgroupCoreFile::MemoryLow, b"0\n".as_slice()),
+            ("memory.stat", CgroupCoreFile::MemoryStat, b"anon 0\n".as_slice()),
+            (
+                "memory.events",
+                CgroupCoreFile::MemoryEvents,
+                b"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n".as_slice(),
+            ),
+        ];
+
+        for (name, ty, init) in memory_files {
+            if Self::has_child(dir, name)? {
+                continue;
+            }
+            let file = Cgroup2Inode::new_file(name.to_string(), cgroup.clone(), ty, init);
+            Self::add_child(dir, name, file)?;
+        }
+
+        Ok(())
+    }
+
+    fn refresh_dynamic_files(dir: &Arc<Cgroup2Inode>) -> Result<(), SystemError> {
+        let cgroup = {
+            let inner = dir.inner.lock();
+            match &inner.kind {
+                Cgroup2InodeKind::Dir { cgroup, .. } => cgroup.clone(),
+                _ => return Err(SystemError::ENOTDIR),
+            }
+        };
+
+        Self::ensure_memory_files(dir, &cgroup)
+    }
+
     fn lookup_child(
         parent: &Arc<Cgroup2Inode>,
         name: &str,
@@ -491,6 +560,7 @@ impl Cgroup2Inode {
         }
 
         Self::prune_stale_dir_cache(parent)?;
+        Self::refresh_dynamic_files(parent)?;
 
         {
             let inner = parent.inner.lock();
@@ -572,6 +642,8 @@ impl Cgroup2Inode {
                 let file = Cgroup2Inode::new_file(name.to_string(), cgroup.clone(), ty, init);
                 Self::add_child(dir, name, file)?;
             }
+
+            Self::ensure_memory_files(dir, &cgroup)?;
         }
 
         // Linux 语义：cgroup.type/cgroup.events 仅存在于 non-root cgroup。
@@ -628,11 +700,7 @@ impl Cgroup2Inode {
         buf: &mut [u8],
     ) -> Result<usize, SystemError> {
         let bytes = match &mut inner.kind {
-            Cgroup2InodeKind::File {
-                cgroup,
-                ty,
-                data: _,
-            } => match ty {
+            Cgroup2InodeKind::File { cgroup, ty, data } => match ty {
                 CgroupCoreFile::Procs => {
                     let mut lines = String::new();
                     for pid in cgroup.tasks() {
@@ -663,6 +731,12 @@ impl Cgroup2Inode {
                 CgroupCoreFile::PidsEvents => {
                     format!("max {}\n", cgroup.pids_events_max()).into_bytes()
                 }
+                CgroupCoreFile::MemoryCurrent
+                | CgroupCoreFile::MemoryMax
+                | CgroupCoreFile::MemoryHigh
+                | CgroupCoreFile::MemoryLow
+                | CgroupCoreFile::MemoryStat
+                | CgroupCoreFile::MemoryEvents => data.clone(),
             },
             _ => return Err(SystemError::EISDIR),
         };
@@ -801,7 +875,13 @@ impl Cgroup2Inode {
             | CgroupCoreFile::Events
             | CgroupCoreFile::Type
             | CgroupCoreFile::PidsCurrent
-            | CgroupCoreFile::PidsEvents => Err(SystemError::EINVAL),
+            | CgroupCoreFile::PidsEvents
+            | CgroupCoreFile::MemoryCurrent
+            | CgroupCoreFile::MemoryMax
+            | CgroupCoreFile::MemoryHigh
+            | CgroupCoreFile::MemoryLow
+            | CgroupCoreFile::MemoryStat
+            | CgroupCoreFile::MemoryEvents => Err(SystemError::EINVAL),
         }
     }
 }
@@ -1048,6 +1128,7 @@ impl IndexNode for Cgroup2Inode {
     fn list(&self) -> Result<Vec<String>, SystemError> {
         let this = self.self_ref.upgrade().unwrap();
         Cgroup2Inode::prune_stale_dir_cache(&this)?;
+        Cgroup2Inode::refresh_dynamic_files(&this)?;
         let inner = self.inner.lock();
         match &inner.kind {
             Cgroup2InodeKind::Dir { cgroup, children } => {

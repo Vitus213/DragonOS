@@ -16,7 +16,8 @@
  * 2) 通过写 cgroup.procs 可以迁移当前进程。
  * 3) /proc/self/cgroup 能反映迁移后的相对路径。
  * 4) subtree_control 支持空写入，并拒绝未支持的控制器。
- * 5) 多挂载场景下，创建/删除在不同挂载点之间可见一致。
+ * 5) 启用 memory controller 后，memory.* 文件节点可见。
+ * 6) 多挂载场景下，创建/删除在不同挂载点之间可见一致。
  */
 
 static void fail(const char *step) {
@@ -65,8 +66,45 @@ static int read_text(const char *path, char *buf, size_t len) {
     return 0;
 }
 
+static void expect_memory_files_exist(const char *dir) {
+    static const char *memory_files[] = {
+        "memory.current",
+        "memory.max",
+        "memory.high",
+        "memory.low",
+        "memory.stat",
+        "memory.events",
+    };
+    char path[256];
+    size_t i;
+
+    for (i = 0; i < sizeof(memory_files) / sizeof(memory_files[0]); i++) {
+        snprintf(path, sizeof(path), "%s/%s", dir, memory_files[i]);
+        if (access(path, F_OK) != 0) {
+            printf("[FAIL] missing memory controller file: %s\n", path);
+            exit(1);
+        }
+    }
+}
+
+static void expect_memory_write_rejected(const char *dir, const char *name, const char *value) {
+    char path[256];
+
+    snprintf(path, sizeof(path), "%s/%s", dir, name);
+    errno = 0;
+    if (write_text(path, value) == 0) {
+        printf("[FAIL] unexpected write success: %s\n", path);
+        exit(1);
+    }
+    if (errno != EINVAL) {
+        printf("[FAIL] unexpected errno for %s: %d\n", path, errno);
+        exit(1);
+    }
+}
+
 int main(void) {
     const char *root = "/sys/fs/cgroup";
+    const char *root_sub = "/sys/fs/cgroup/cgroup.subtree_control";
     const char *grp = "/sys/fs/cgroup/mvp_basic";
     const char *procs = "/sys/fs/cgroup/mvp_basic/cgroup.procs";
     const char *sub = "/sys/fs/cgroup/mvp_basic/cgroup.subtree_control";
@@ -82,9 +120,34 @@ int main(void) {
         fail("check /sys/fs/cgroup exists");
     }
 
+    /* MVP 阶段未支持的控制器应当返回失败。 */
+    errno = 0;
+    if (write_text(root_sub, "+cpu\n") == 0) {
+        printf("[FAIL] +cpu unexpectedly succeeded\n");
+        return 1;
+    }
+    if (errno != EINVAL && errno != EPERM) {
+        printf("[FAIL] +cpu unexpected errno: %d\n", errno);
+        return 1;
+    }
+
     if (ensure_dir(grp) != 0) {
         fail("mkdir /sys/fs/cgroup/mvp_basic");
     }
+
+    if (write_text(root_sub, "+memory\n") != 0) {
+        fail("enable memory controller from root");
+    }
+    if (read_text(root_sub, buf, sizeof(buf)) != 0) {
+        fail("read root subtree_control after enabling memory");
+    }
+    if (strcmp(buf, "memory\n") != 0) {
+        printf("[FAIL] unexpected root subtree_control after +memory: %s\n", buf);
+        return 1;
+    }
+
+    expect_memory_files_exist(grp);
+    expect_memory_write_rejected(grp, "memory.current", "1\n");
 
     if (write_text(procs, "0\n") != 0) {
         fail("migrate self by writing cgroup.procs");
@@ -107,17 +170,6 @@ int main(void) {
     }
     if (strcmp(buf, "\n") != 0) {
         printf("[FAIL] unexpected subtree_control content: %s\n", buf);
-        return 1;
-    }
-
-    /* MVP 阶段未支持的控制器应当返回失败。 */
-    errno = 0;
-    if (write_text(sub, "+cpu\n") == 0) {
-        printf("[FAIL] +cpu unexpectedly succeeded\n");
-        return 1;
-    }
-    if (errno != EINVAL && errno != EPERM) {
-        printf("[FAIL] +cpu unexpected errno: %d\n", errno);
         return 1;
     }
 

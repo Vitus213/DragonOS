@@ -1,0 +1,14 @@
+# Ralph Progress Log
+Started: 2026年 03月 29日 星期日 00:51:52 CST
+---
+## Codebase Patterns
+- In cgroup2, cached directory inodes must refresh controller-dependent core files during lookup/list, not only at inode creation time.
+
+## 2026-03-29 02:02:15 CST - US-001
+- Implemented cgroup v2 memory controller registration in cgroup.subtree_control, exposed memory.current/memory.max/memory.high/memory.low/memory.stat/memory.events for memory-enabled cgroups, and added dynamic refresh so pre-existing cached cgroup directories gain memory.* files after +memory.
+- Files changed: kernel/src/filesystem/cgroup2/mod.rs, user/apps/c_unitest/test_cgroup_mvp_basic.c, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- **Learnings for future iterations:**
+  - Patterns discovered: controller-dependent cgroup core files need a refresh path on cached directory inodes, because lookup/list may outlive subtree_control changes.
+  - Gotchas encountered: only adding memory.* enum variants is not enough; read_file/write_file exhaustive matches must be updated or the kernel build fails.
+  - Useful context: the MVP cgroup userspace test already covers subtree_control enablement, so extending test_cgroup_mvp_basic.c is the fastest way to lock down new file visibility semantics.
+---
