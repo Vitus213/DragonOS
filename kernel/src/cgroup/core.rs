@@ -23,6 +23,9 @@ pub struct CgroupNode {
     subtree_control: RwLock<HashSet<String>>,
     pids_max: RwLock<Option<usize>>,
     pids_events_max: AtomicU64,
+    memory_max: RwLock<Option<usize>>,
+    memory_high: RwLock<Option<usize>>,
+    memory_low: RwLock<usize>,
 }
 
 impl CgroupNode {
@@ -36,6 +39,9 @@ impl CgroupNode {
             subtree_control: RwLock::new(HashSet::new()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
+            memory_max: RwLock::new(None),
+            memory_high: RwLock::new(None),
+            memory_low: RwLock::new(0),
         })
     }
 
@@ -49,6 +55,9 @@ impl CgroupNode {
             subtree_control: RwLock::new(HashSet::new()),
             pids_max: RwLock::new(None),
             pids_events_max: AtomicU64::new(0),
+            memory_max: RwLock::new(None),
+            memory_high: RwLock::new(None),
+            memory_low: RwLock::new(0),
         })
     }
 
@@ -118,6 +127,30 @@ impl CgroupNode {
 
     pub fn inc_pids_events_max(&self) {
         self.pids_events_max.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn memory_max(&self) -> Option<usize> {
+        *self.memory_max.read()
+    }
+
+    pub fn set_memory_max(&self, max: Option<usize>) {
+        *self.memory_max.write() = max;
+    }
+
+    pub fn memory_high(&self) -> Option<usize> {
+        *self.memory_high.read()
+    }
+
+    pub fn set_memory_high(&self, high: Option<usize>) {
+        *self.memory_high.write() = high;
+    }
+
+    pub fn memory_low(&self) -> Option<usize> {
+        Some(*self.memory_low.read())
+    }
+
+    pub fn set_memory_low(&self, low: Option<usize>) {
+        *self.memory_low.write() = low.unwrap_or(0);
     }
 
     pub fn subtree_task_count(self: &Arc<Self>) -> usize {
@@ -491,5 +524,36 @@ mod tests {
         let right = root.create_child(&root.root(), "right").unwrap();
 
         assert_eq!(cgroup_path_from_view(&right, &left), "/../right");
+    }
+
+    #[test]
+    fn memory_thresholds_are_stored_per_cgroup_with_stable_defaults() {
+        let root = CgroupRoot::new();
+        let parent = root.create_child(&root.root(), "parent").unwrap();
+        let left = root.create_child(&parent, "left").unwrap();
+        let right = root.create_child(&parent, "right").unwrap();
+
+        assert_eq!(left.memory_max(), None);
+        assert_eq!(left.memory_high(), None);
+        assert_eq!(left.memory_low(), Some(0));
+        assert_eq!(right.memory_max(), None);
+        assert_eq!(right.memory_high(), None);
+        assert_eq!(right.memory_low(), Some(0));
+
+        left.set_memory_max(Some(4096));
+        left.set_memory_high(Some(2048));
+        left.set_memory_low(Some(1024));
+
+        assert_eq!(left.memory_max(), Some(4096));
+        assert_eq!(left.memory_high(), Some(2048));
+        assert_eq!(left.memory_low(), Some(1024));
+        assert_eq!(right.memory_max(), None);
+        assert_eq!(right.memory_high(), None);
+        assert_eq!(right.memory_low(), Some(0));
+
+        let left_again = parent.child("left").unwrap();
+        assert_eq!(left_again.memory_max(), Some(4096));
+        assert_eq!(left_again.memory_high(), Some(2048));
+        assert_eq!(left_again.memory_low(), Some(1024));
     }
 }

@@ -3,6 +3,7 @@ Started: 2026年 03月 29日 星期日 00:51:52 CST
 ---
 ## Codebase Patterns
 - In cgroup2, cached directory inodes must refresh controller-dependent core files during lookup/list, not only at inode creation time.
+- Per-cgroup controller thresholds belong on `CgroupNode`; file nodes in `cgroup2` should read stable values from the node instead of owning config state.
 
 ## 2026-03-29 02:02:15 CST - US-001
 - Implemented cgroup v2 memory controller registration in cgroup.subtree_control, exposed memory.current/memory.max/memory.high/memory.low/memory.stat/memory.events for memory-enabled cgroups, and added dynamic refresh so pre-existing cached cgroup directories gain memory.* files after +memory.
@@ -11,4 +12,12 @@ Started: 2026年 03月 29日 星期日 00:51:52 CST
   - Patterns discovered: controller-dependent cgroup core files need a refresh path on cached directory inodes, because lookup/list may outlive subtree_control changes.
   - Gotchas encountered: only adding memory.* enum variants is not enough; read_file/write_file exhaustive matches must be updated or the kernel build fails.
   - Useful context: the MVP cgroup userspace test already covers subtree_control enablement, so extending test_cgroup_mvp_basic.c is the fastest way to lock down new file visibility semantics.
+---
+## 2026-03-29 02:16:38 CST - US-002
+- Added per-cgroup storage for memory.max, memory.high, and memory.low on CgroupNode with stable defaults, plus a focused unit test that locks down per-cgroup isolation and persistence across node lookups.
+- Files changed: kernel/src/cgroup/core.rs, scripts/ralph/prd.json, scripts/ralph/progress.txt
+- **Learnings for future iterations:**
+  - Patterns discovered: memory controller threshold state should live on CgroupNode so future file read/write semantics can share one source of truth across the cgroup lifetime.
+  - Gotchas encountered: `cargo test` is currently blocked by unrelated repo-wide test-build issues, so use the project acceptance gates (`make kernel` and `nix develop -c make kernel`) for story verification and keep unit tests in place as regression anchors.
+  - Useful context: default values aligned with the existing exposed interface are `memory.max = max`, `memory.high = max`, and `memory.low = 0`, which map to `None`, `None`, and `Some(0)` in kernel storage.
 ---
