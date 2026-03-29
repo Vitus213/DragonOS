@@ -13,11 +13,11 @@ Started: 2026年 03月 29日 星期日 00:51:52 CST
   - Gotchas encountered: only adding memory.* enum variants is not enough; read_file/write_file exhaustive matches must be updated or the kernel build fails.
   - Useful context: the MVP cgroup userspace test already covers subtree_control enablement, so extending test_cgroup_mvp_basic.c is the fastest way to lock down new file visibility semantics.
 ---
-## 2026-03-29 02:16:38 CST - US-002
-- Added per-cgroup storage for memory.max, memory.high, and memory.low on CgroupNode with stable defaults, plus a focused unit test that locks down per-cgroup isolation and persistence across node lookups.
-- Files changed: kernel/src/cgroup/core.rs, scripts/ralph/prd.json, scripts/ralph/progress.txt
+## 2026-03-29 03:10:00 CST - US-003
+- Implemented Linux-style read/write semantics for memory.max, memory.high, and memory.low in the cgroup v2 filesystem, wiring them to per-cgroup thresholds on CgroupNode and adding unit tests to lock down max keyword handling and memory.low rejection of max.
+- Files changed: kernel/src/filesystem/cgroup2/mod.rs, scripts/ralph/prd.json, scripts/ralph/progress.txt
 - **Learnings for future iterations:**
-  - Patterns discovered: memory controller threshold state should live on CgroupNode so future file read/write semantics can share one source of truth across the cgroup lifetime.
-  - Gotchas encountered: `cargo test` is currently blocked by unrelated repo-wide test-build issues, so use the project acceptance gates (`make kernel` and `nix develop -c make kernel`) for story verification and keep unit tests in place as regression anchors.
-  - Useful context: default values aligned with the existing exposed interface are `memory.max = max`, `memory.high = max`, and `memory.low = 0`, which map to `None`, `None`, and `Some(0)` in kernel storage.
+  - Patterns discovered: cgroup2 core files should prefer reading threshold values from CgroupNode rather than embedding state in inode data, so controller semantics stay stable across multiple views and directory cache refreshes.
+  - Gotchas encountered: parsing logic for memory.max/memory.high can reuse the existing pids.max parser, but memory.low must reject the max keyword and treat missing values as 0 to match current defaults.
+  - Useful context: targeted Rust unit tests in kernel/src/filesystem/cgroup2/mod.rs are the fastest way to lock down file read/write semantics before relying on higher-level C tests.
 ---
