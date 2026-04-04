@@ -121,9 +121,11 @@ impl CgroupNode {
     }
 
     pub fn subtree_task_count(self: &Arc<Self>) -> usize {
-        let mut total = self.tasks.read().len();
-        for child in self.children() {
-            total = total.saturating_add(child.subtree_task_count());
+        let mut total: usize = 0;
+        let mut stack = vec![self.clone()];
+        while let Some(node) = stack.pop() {
+            total = total.saturating_add(node.tasks.read().len());
+            stack.extend(node.children());
         }
         total
     }
