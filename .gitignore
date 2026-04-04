@@ -23,6 +23,7 @@ compile_commands.json
 .nix-gc-root
 dadk-manifest.generated.toml
 config/rootfs.generated.toml
+/.worktrees/
 
 # initram
 *.cpio
