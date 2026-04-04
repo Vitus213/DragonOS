@@ -728,7 +728,11 @@ impl ProcessManager {
                 .inner_lock_write_irqsave()
                 .set_state(ProcessState::Exited(exit_code));
             // Linux 语义：zombie 不应出现在 cgroup.procs 中。
-            pcb.task_cgroup_node().remove_task(raw_pid);
+            // 必须持有 cgroup_accounting_lock 以避免与 cgroup.procs 写入死锁
+            {
+                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                pcb.task_cgroup_node().remove_task(raw_pid);
+            }
 
             let rq = cpu_rq(smp_get_processor_id().data() as usize);
             let (rq, guard) = rq.self_lock();
@@ -862,7 +866,11 @@ impl ProcessManager {
     pub(super) unsafe fn release(pid: RawPid) {
         let pcb = ProcessManager::find(pid);
         if let Some(ref pcb) = pcb {
-            pcb.task_cgroup_node().remove_task(pid);
+            // 必须持有 cgroup_accounting_lock 以避免与 cgroup.procs 写入死锁
+            {
+                let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
+                pcb.task_cgroup_node().remove_task(pid);
+            }
             // 从父进程的 children 列表中移除
             if let Some(parent) = pcb.real_parent_pcb() {
                 let parent_ns = parent.active_pid_ns();
@@ -2168,17 +2176,42 @@ impl ProcessControlBlock {
         self.task_cgroup.read().node()
     }
 
+    /// 设置任务所属的 cgroup 节点
+    ///
+    /// # 安全性
+    ///
+    /// 调用者必须持有 `cgroup_accounting_lock` 以避免死锁和竞态条件
     pub fn set_task_cgroup_node(&self, node: Arc<CgroupNode>) {
-        let mut task_cgroup = self.task_cgroup.write();
-        let old = task_cgroup.node();
-        if Arc::ptr_eq(&old, &node) {
-            return;
-        }
+        // 先使用读锁获取 old 节点
+        let old = {
+            let task_cgroup = self.task_cgroup.read();
+            let old = task_cgroup.node();
+            if Arc::ptr_eq(&old, &node) {
+                return;
+            }
+            old
+        }; // 释放读锁
+
+        // 在不持有 task_cgroup 锁的情况下执行迁移
+        // 调用者必须持有 cgroup_accounting_lock 以保证原子性
         old.remove_task(self.raw_pid());
         node.add_task(self.raw_pid());
+
+        // 使用写锁更新 task_cgroup
+        let mut task_cgroup = self.task_cgroup.write();
         *task_cgroup = TaskCgroupRef::new(node);
     }
 
+    /// 仅用于 fork 时设置任务的 cgroup 节点
+    ///
+    /// # 安全性
+    ///
+    /// 调用者必须持有 `cgroup_accounting_lock`
+    ///
+    /// # 注意
+    ///
+    /// 此函数只更新 task_cgroup 引用，不会调用 add_task()。
+    /// add_task() 会在后续的 ProcessManager::add_pcb() 中被调用。
     pub fn set_task_cgroup_node_for_fork(&self, node: Arc<CgroupNode>) {
         *self.task_cgroup.write() = TaskCgroupRef::new(node);
     }
