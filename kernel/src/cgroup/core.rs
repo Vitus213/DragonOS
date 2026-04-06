@@ -3,7 +3,7 @@ use alloc::{
     sync::{Arc, Weak},
     vec::Vec,
 };
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
 
@@ -11,6 +11,199 @@ use crate::{
     libs::{rwlock::RwLock, spinlock::SpinLock},
     process::RawPid,
 };
+
+/// Runtime memory controller state for a cgroup.
+///
+/// This tracks actual memory usage and events, separate from the configuration
+/// thresholds (memory_max, memory_high, memory_low) which are stored directly
+/// on CgroupNode.
+#[derive(Debug)]
+pub struct CgroupMemoryState {
+    /// Anonymous pages usage in bytes (local to this cgroup, not including children)
+    local_anon_bytes: AtomicUsize,
+    /// Anonymous pages count (local)
+    local_anon_pages: AtomicUsize,
+    /// Hierarchical anonymous bytes (this cgroup + all children)
+    anon_bytes: AtomicUsize,
+    /// Hierarchical anonymous page count
+    anon_pages: AtomicUsize,
+    /// Number of reclaim attempts triggered
+    reclaim_count: AtomicU64,
+    /// Event: memory.low was breached
+    events_low: AtomicU64,
+    /// Event: memory.high was breached
+    events_high: AtomicU64,
+    /// Event: memory.max was breached
+    events_max: AtomicU64,
+    /// Event: OOM was triggered
+    events_oom: AtomicU64,
+    /// Event: OOM kill occurred
+    events_oom_kill: AtomicU64,
+    /// Flag indicating if memory controller is enabled
+    enabled: AtomicBool,
+}
+
+impl CgroupMemoryState {
+    pub fn new() -> Self {
+        Self {
+            local_anon_bytes: AtomicUsize::new(0),
+            local_anon_pages: AtomicUsize::new(0),
+            anon_bytes: AtomicUsize::new(0),
+            anon_pages: AtomicUsize::new(0),
+            reclaim_count: AtomicU64::new(0),
+            events_low: AtomicU64::new(0),
+            events_high: AtomicU64::new(0),
+            events_max: AtomicU64::new(0),
+            events_oom: AtomicU64::new(0),
+            events_oom_kill: AtomicU64::new(0),
+            enabled: AtomicBool::new(true),
+        }
+    }
+
+    /// Get local anonymous bytes (this cgroup only)
+    #[inline]
+    pub fn local_anon_bytes(&self) -> usize {
+        self.local_anon_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Get local anonymous page count (this cgroup only)
+    #[inline]
+    pub fn local_anon_pages(&self) -> usize {
+        self.local_anon_pages.load(Ordering::Relaxed)
+    }
+
+    /// Get hierarchical anonymous bytes usage (includes children)
+    #[inline]
+    pub fn anon_bytes(&self) -> usize {
+        self.anon_bytes.load(Ordering::Relaxed)
+    }
+
+    /// Get hierarchical anonymous page count (includes children)
+    #[inline]
+    pub fn anon_pages(&self) -> usize {
+        self.anon_pages.load(Ordering::Relaxed)
+    }
+
+    /// Get reclaim count
+    #[inline]
+    pub fn reclaim_count(&self) -> u64 {
+        self.reclaim_count.load(Ordering::Relaxed)
+    }
+
+    /// Get events.low counter
+    #[inline]
+    pub fn events_low(&self) -> u64 {
+        self.events_low.load(Ordering::Relaxed)
+    }
+
+    /// Get events.high counter
+    #[inline]
+    pub fn events_high(&self) -> u64 {
+        self.events_high.load(Ordering::Relaxed)
+    }
+
+    /// Get events.max counter
+    #[inline]
+    pub fn events_max(&self) -> u64 {
+        self.events_max.load(Ordering::Relaxed)
+    }
+
+    /// Get events.oom counter
+    #[inline]
+    pub fn events_oom(&self) -> u64 {
+        self.events_oom.load(Ordering::Relaxed)
+    }
+
+    /// Get events.oom_kill counter
+    #[inline]
+    pub fn events_oom_kill(&self) -> u64 {
+        self.events_oom_kill.load(Ordering::Relaxed)
+    }
+
+    /// Increment events.low
+    #[inline]
+    pub fn inc_events_low(&self) {
+        self.events_low.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment events.high
+    #[inline]
+    pub fn inc_events_high(&self) {
+        self.events_high.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment events.max
+    #[inline]
+    pub fn inc_events_max(&self) {
+        self.events_max.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment events.oom
+    #[inline]
+    pub fn inc_events_oom(&self) {
+        self.events_oom.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment events.oom_kill
+    #[inline]
+    pub fn inc_events_oom_kill(&self) {
+        self.events_oom_kill.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Increment reclaim count
+    #[inline]
+    pub fn inc_reclaim_count(&self) {
+        self.reclaim_count.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Check if memory controller is enabled
+    #[inline]
+    pub fn is_enabled(&self) -> bool {
+        self.enabled.load(Ordering::Relaxed)
+    }
+
+    /// Enable or disable memory controller
+    #[inline]
+    pub fn set_enabled(&self, enabled: bool) {
+        self.enabled.store(enabled, Ordering::Relaxed);
+    }
+
+    /// Charge local usage (called on the leaf cgroup where page is allocated).
+    /// Updates both local and hierarchical counters.
+    pub fn charge_local(&self, bytes: usize, pages: usize) {
+        self.local_anon_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.local_anon_pages.fetch_add(pages, Ordering::Relaxed);
+        self.anon_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.anon_pages.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    /// Uncharge local usage (called when page is freed from this cgroup).
+    /// Uses saturating subtraction to prevent underflow.
+    pub fn uncharge_local(&self, bytes: usize, pages: usize) {
+        self.local_anon_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.local_anon_pages.fetch_sub(pages, Ordering::Relaxed);
+        self.anon_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.anon_pages.fetch_sub(pages, Ordering::Relaxed);
+    }
+
+    /// Charge hierarchical usage only (for ancestor cgroups during propagation).
+    pub fn charge_hierarchical(&self, bytes: usize, pages: usize) {
+        self.anon_bytes.fetch_add(bytes, Ordering::Relaxed);
+        self.anon_pages.fetch_add(pages, Ordering::Relaxed);
+    }
+
+    /// Uncharge hierarchical usage only (for ancestor cgroups during propagation).
+    pub fn uncharge_hierarchical(&self, bytes: usize, pages: usize) {
+        self.anon_bytes.fetch_sub(bytes, Ordering::Relaxed);
+        self.anon_pages.fetch_sub(pages, Ordering::Relaxed);
+    }
+}
+
+impl Default for CgroupMemoryState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Debug)]
 pub struct CgroupNode {
@@ -26,6 +219,8 @@ pub struct CgroupNode {
     memory_max: RwLock<Option<usize>>,
     memory_high: RwLock<Option<usize>>,
     memory_low: RwLock<usize>,
+    /// Runtime memory controller state (lazy-initialized when memory controller is enabled)
+    memory_state: RwLock<Option<Arc<CgroupMemoryState>>>,
 }
 
 impl CgroupNode {
@@ -42,6 +237,7 @@ impl CgroupNode {
             memory_max: RwLock::new(None),
             memory_high: RwLock::new(None),
             memory_low: RwLock::new(0),
+            memory_state: RwLock::new(None),
         })
     }
 
@@ -58,6 +254,7 @@ impl CgroupNode {
             memory_max: RwLock::new(None),
             memory_high: RwLock::new(None),
             memory_low: RwLock::new(0),
+            memory_state: RwLock::new(None),
         })
     }
 
@@ -151,6 +348,84 @@ impl CgroupNode {
 
     pub fn set_memory_low(&self, low: Option<usize>) {
         *self.memory_low.write() = low.unwrap_or(0);
+    }
+
+    /// Get or initialize the memory controller runtime state for this cgroup.
+    /// Returns the Arc to the memory state, initializing it if needed.
+    pub fn memory_state(self: &Arc<Self>) -> Arc<CgroupMemoryState> {
+        // First try to get existing state
+        {
+            let guard = self.memory_state.read();
+            if let Some(ref state) = *guard {
+                return state.clone();
+            }
+        }
+
+        // Need to initialize - double-checked locking pattern
+        let new_state = Arc::new(CgroupMemoryState::new());
+        let mut guard = self.memory_state.write();
+        match &*guard {
+            Some(existing) => existing.clone(),
+            None => {
+                *guard = Some(new_state.clone());
+                new_state
+            }
+        }
+    }
+
+    /// Try to get the memory controller state without initializing.
+    /// Returns None if the memory controller hasn't been enabled yet.
+    pub fn try_memory_state(&self) -> Option<Arc<CgroupMemoryState>> {
+        self.memory_state.read().clone()
+    }
+
+    /// Check if memory controller is enabled for this cgroup.
+    pub fn memory_enabled(&self) -> bool {
+        self.memory_state.read().is_some()
+    }
+
+    /// Get hierarchical anonymous bytes usage (includes this cgroup and all children)
+    pub fn memory_usage(&self) -> usize {
+        self.memory_state.read().as_ref().map(|s| s.anon_bytes()).unwrap_or(0)
+    }
+
+    /// Get hierarchical anonymous page count (includes this cgroup and all children)
+    pub fn memory_page_count(&self) -> usize {
+        self.memory_state.read().as_ref().map(|s| s.anon_pages()).unwrap_or(0)
+    }
+
+    /// Charge an anonymous page to this cgroup and propagates to ancestors.
+    /// Returns true on success.
+    pub fn memcg_charge(self: &Arc<Self>, bytes: usize, pages: usize) -> bool {
+        let state = self.memory_state();
+        state.charge_local(bytes, pages);
+
+        // Propagate to ancestors
+        let mut cur = self.parent();
+        while let Some(parent) = cur {
+            if let Some(parent_state) = parent.memory_state.read().as_ref() {
+                parent_state.charge_hierarchical(bytes, pages);
+            }
+            cur = parent.parent();
+        }
+
+        true
+    }
+
+    /// Uncharge an anonymous page from this cgroup and propagates to ancestors.
+    /// Uses saturating subtraction to prevent underflow.
+    pub fn memcg_uncharge(self: &Arc<Self>, bytes: usize, pages: usize) {
+        let state = self.memory_state();
+        state.uncharge_local(bytes, pages);
+
+        // Propagate to ancestors
+        let mut cur = self.parent();
+        while let Some(parent) = cur {
+            if let Some(parent_state) = parent.memory_state.read().as_ref() {
+                parent_state.uncharge_hierarchical(bytes, pages);
+            }
+            cur = parent.parent();
+        }
     }
 
     pub fn subtree_task_count(self: &Arc<Self>) -> usize {

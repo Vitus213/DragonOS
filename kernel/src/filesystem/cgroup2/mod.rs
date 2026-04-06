@@ -731,14 +731,46 @@ impl Cgroup2Inode {
             CgroupCoreFile::PidsEvents => {
                     format!("max {}\n", cgroup.pids_events_max()).into_bytes()
                 }
-                CgroupCoreFile::MemoryCurrent => data.clone(),
+                CgroupCoreFile::MemoryCurrent => {
+                    let usage = cgroup.memory_usage() as u64;
+                    format!("{}\n", usage).into_bytes()
+                }
                 CgroupCoreFile::MemoryMax => Self::encode_pids_max(cgroup.memory_max()),
                 CgroupCoreFile::MemoryHigh => Self::encode_pids_max(cgroup.memory_high()),
                 CgroupCoreFile::MemoryLow => {
                     let value = cgroup.memory_low().unwrap_or(0) as u64;
                     format!("{}\n", value).into_bytes()
                 }
-                CgroupCoreFile::MemoryStat | CgroupCoreFile::MemoryEvents => data.clone(),
+                CgroupCoreFile::MemoryStat => {
+                    // Generate dynamic memory.stat output
+                    if let Some(state) = cgroup.try_memory_state() {
+                        format!(
+                            "anon {}\nlocal_anon {}\nreclaim {}\n",
+                            state.anon_bytes(),
+                            state.local_anon_bytes(),
+                            state.reclaim_count()
+                        ).into_bytes()
+                    } else {
+                        // Memory controller not enabled
+                        b"anon 0\nlocal_anon 0\nreclaim 0\n".to_vec()
+                    }
+                }
+                CgroupCoreFile::MemoryEvents => {
+                    // Generate dynamic memory.events output
+                    if let Some(state) = cgroup.try_memory_state() {
+                        format!(
+                            "low {}\nhigh {}\nmax {}\noom {}\noom_kill {}\n",
+                            state.events_low(),
+                            state.events_high(),
+                            state.events_max(),
+                            state.events_oom(),
+                            state.events_oom_kill()
+                        ).into_bytes()
+                    } else {
+                        // Memory controller not enabled
+                        b"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\n".to_vec()
+                    }
+                }
             },
             _ => return Err(SystemError::EISDIR),
         };

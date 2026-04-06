@@ -16,6 +16,7 @@ use lru::LruCache;
 
 use crate::{
     arch::{interrupt::ipi::send_ipi, mm::LockedFrameAllocator, MMArch},
+    cgroup::CgroupNode,
     exception::ipi::{IpiKind, IpiTarget},
     filesystem::{
         page_cache::{list_page_caches, PageCache},
@@ -783,10 +784,28 @@ impl Drop for InnerPage {
 pub enum PageType {
     /// 普通页面，不含额外信息
     Normal,
+    /// 匿名页面，记录所属的cgroup（用于内存记账）
+    Anon(AnonPageInfo),
     /// 文件映射页，含文件映射相关信息
     File(FileMapInfo),
     /// 共享内存页，记录ShmId
     Shm,
+}
+
+/// 匿名页面信息，用于内存控制器记账
+#[derive(Debug, Clone)]
+pub struct AnonPageInfo {
+    /// 页面所属的cgroup（弱引用，避免循环引用）
+    /// 当页面被释放时，从这个cgroup uncharge
+    pub cgroup: Weak<CgroupNode>,
+    /// 页面大小（字节）
+    pub size: usize,
+}
+
+impl AnonPageInfo {
+    pub fn new(cgroup: Weak<CgroupNode>, size: usize) -> Self {
+        Self { cgroup, size }
+    }
 }
 
 #[derive(Debug, Clone)]
