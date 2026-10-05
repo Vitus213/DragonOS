@@ -18,7 +18,28 @@
 
 控制器文件仍由 `filesystem/cgroup2/files.rs` 管理；CSS 的 `dfl_cftypes` 是扩展接口，不是当前文件系统路由的唯一入口。
 
-本轮 `make kernel` 构建通过；最新 `nix run .#yolo-x86_64 -- -nographic` 已启动到 guest shell，日志确认 ProcFS、SysFS、cgroup2 挂载和六个控制器注册成功。基础 cgroup 文件、控制器启用、cpuset effective、io.weight 和任务迁移曾在 QEMU guest 中验证。
+本轮（分支 `fix/io-blkcg-close-loop`，提交 `ca4ba968` 起）`make kernel` 干净构建通过；此前 `nix run .#yolo-x86_64 -- -nographic` 已启动到 guest shell，日志确认 ProcFS、SysFS、cgroup2 挂载和六个控制器注册成功。基础 cgroup 文件、控制器启用、cpuset effective、io.weight 和任务迁移曾在 QEMU guest 中验证；cpu.max 节流、memory.current 变化、pids.max fork 拦截、freeze/thaw 往返的 guest 内观察因 Darwin TCG 环境启动耗时不可接受未在本轮执行，以代码路径审计与构建验证替代（见各控制器"语义落点"）。
+
+## 控制器×文件矩阵
+
+| 控制器 | 文件 | 实现状态 | 语义落点 |
+|---|---|---|---|
+| core | `cgroup.controllers` / `cgroup.subtree_control` / `cgroup.type` | real | `files.rs` 路由；启用位掩码 + domain/threaded 状态机 |
+| core | `cgroup.procs` | real | 迁移走 CSS-set token 生命周期（fork/exit/迁移维护） |
+| core | `cgroup.freeze` / `cgroup.events` | real | freezer 状态机消费；frozen 计数上抛 events |
+| cpu | `cpu.max` | real | `CpuCss::refresh_period/try_consume_runtime` 接入 fair `update_current`（tick/pick_next 共同路径），实体级节流期限 + 周期边界自动恢复 |
+| cpu | `cpu.weight` | real | `set_shares` → `reweight_task_cpu_weight`，对已入队实体实时生效 |
+| cpu | `cpu.stat` | real | `throttled_usec/nr_throttled/nr_periods` 在节流/恢复路径累计 |
+| memory | `memory.current/peak` | real | `MemoryCss::try_charge/uncharge` + 每帧归属（PAGE_OWNERS） |
+| memory | `memory.min/low/high/max` | real | min/low 存储 + 回收权重占位；high 缺页路径有界节流；max 事务式祖先链检查，拒绝走 `oom::scoped_out_of_memory` |
+| memory | `memory.events` / `memory.stat` | real | high/max 事件计数；RSS 分项统计 |
+| memory | `memory.swap.*` | stub | swap 未实现，接口占位（与边界声明一致） |
+| io | `io.max` | real | 100ms slice 周期结算 token 桶；GenDisk/ext4 适配器/MBR 扫描全部分发路径前置限速 |
+| io | `io.stat` | real | 完成时按提交任务捕获的 cgroup 记账 |
+| io | `io.weight` | real | 权重存储（比例仲裁未接入派发排序） |
+| pids | `pids.max` / `pids.current` / `pids.events` | real | fork can_fork 拦截 + 层级计数 + max 事件 |
+| cpuset | `cpuset.cpus[.effective]` / `cpuset.mems` | real | 继承 + online-aware effective mask；affinity 空交集报错 |
+| freezer | `cgroup.freeze`（经 core） | real | queued/current/sleeping 三态冻结标志 + 幂等解冻唤醒 |
 
 ## 与 Linux 6.6 的明确边界
 
