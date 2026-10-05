@@ -38,9 +38,10 @@
         inputs.treefmt-nix.flakeModule
       ];
 
-      systems = [
-        "x86_64-linux"
-      ];
+  systems = [
+    "x86_64-linux"
+    "aarch64-darwin"
+  ];
       perSystem =
         {
           self',
@@ -133,60 +134,37 @@
                 deviceModel = "vhost-vsock-pci-non-transitional";
               };
               qemuScripts = import ./tools/qemu/default.nix {
-                inherit
-                  lib
-                  pkgs
-                  testOpt
-                  diskPath
-                  ;
-                # QEMU 相关参数：
-                # 内核位置
-                kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
-                # 不开 GDB stub，普通启动
+                inherit lib pkgs testOpt diskPath;
+                kernel = "${buildDir}/kernel/kernel.elf";
                 debug = false;
-                enableVsock = vsockConfig.enable;
+                enableVsock = vsockConfig.enable && system != "aarch64-darwin";
                 vsockGuestCid = vsockConfig.guestCid;
                 vsockDeviceModel = vsockConfig.deviceModel;
-                # 启用 VM 状态管理，与 make qemu 行为保持一致
                 vmstateDir = "${buildDir}/vmstate";
+                preferSystemQemu = system == "aarch64-darwin";
+                isDarwin = system == "aarch64-darwin";
               };
               qemuScriptsSystem = import ./tools/qemu/default.nix {
-                inherit
-                  lib
-                  pkgs
-                  testOpt
-                  diskPath
-                  ;
-                # QEMU 相关参数：
-                # 内核位置
-                kernel = "${buildDir}/kernel/kernel.elf"; # TODO: make it a drv 用nix构建内核，避免指定相对目录
-                # -s -S
+                inherit lib pkgs testOpt diskPath;
+                kernel = "${buildDir}/kernel/kernel.elf";
                 debug = false;
-                enableVsock = vsockConfig.enable;
+                enableVsock = false;
                 vsockGuestCid = vsockConfig.guestCid;
                 vsockDeviceModel = vsockConfig.deviceModel;
-                # 启用 VM 状态管理，与 make qemu 行为保持一致
                 vmstateDir = "${buildDir}/vmstate";
-                # 优先使用系统 QEMU，避免 Nix 下载 QEMU 依赖
                 preferSystemQemu = true;
+                isDarwin = system == "aarch64-darwin";
               };
               qemuScriptsDebug = import ./tools/qemu/default.nix {
-                inherit
-                  lib
-                  pkgs
-                  testOpt
-                  diskPath
-                  ;
-                # QEMU 相关参数：
-                # 内核位置
+                inherit lib pkgs testOpt diskPath;
                 kernel = "${buildDir}/kernel/kernel.elf";
-                # 开启 GDB stub，用于调试
                 debug = true;
-                enableVsock = vsockConfig.enable;
+                enableVsock = vsockConfig.enable && system != "aarch64-darwin";
                 vsockGuestCid = vsockConfig.guestCid;
                 vsockDeviceModel = vsockConfig.deviceModel;
-                # 启用 VM 状态管理，与 make qemu 行为保持一致
                 vmstateDir = "${buildDir}/vmstate";
+                preferSystemQemu = system == "aarch64-darwin";
+                isDarwin = system == "aarch64-darwin";
               };
 
               startPkg = qemuScripts.${target};
@@ -229,10 +207,10 @@
                 #!${pkgs.runtimeShell}
                 set -e
                 export USING_DRAGONOS_NIX_ENV=1
-                export PATH=${rust-toolchain}/bin:$PATH
+                export PATH=${lib.optionalString (system == "aarch64-darwin") "${pkgs.pkgsCross.gnu64.stdenv.cc}/bin:"}${rust-toolchain}/bin:$PATH
 
                 echo "==> Step 1: Building kernel with make kernel..."
-                ${pkgs.gnumake}/bin/make kernel
+                ${if system == "aarch64-darwin" then "${pkgs.nix}/bin/nix develop -c ${pkgs.gnumake}/bin/make kernel" else "${pkgs.gnumake}/bin/make kernel"}
 
                 echo "==> Step 2: Building rootfs (re-evaluating userland packages)..."
                 ${pkgs.nix}/bin/nix run .#rootfs-${target}
@@ -290,10 +268,9 @@
               };
             };
 
-          allOutputs = map mkOutputs [
-            "x86_64"
-            "riscv64"
-          ];
+          allOutputs = map mkOutputs (
+            if system == "aarch64-darwin" then [ "x86_64" ] else [ "x86_64" "riscv64" ]
+          );
           merged =
             lib.foldl'
               (acc: elem: {
@@ -308,7 +285,8 @@
 
         in
         {
-          inherit (merged) apps packages;
+          apps = merged.apps // { default = merged.apps."yolo-x86_64"; };
+          packages = merged.packages // { default = merged.packages."yolo-x86_64"; };
 
           # treefmt formatter配置 (使用nixfmt)
           treefmt = {
@@ -326,18 +304,26 @@
 
           devShells.default = pkgs.mkShell {
             # 基础工具链
-            buildInputs = with pkgs; [
-              git
-              llvm
-              libclang
-              gcc
-              rust-toolchain
-              zlib
-              gnumake
-              qemu_kvm
-              meson
-              ninja
-            ];
+            buildInputs =
+              with pkgs;
+              [
+                git
+                llvm
+                libclang
+                rust-toolchain
+                zlib
+                gnumake
+                meson
+                ninja
+              ]
+              ++ lib.optionals (system != "aarch64-darwin") [ gcc qemu_kvm ]
+              ++ lib.optionals (system == "aarch64-darwin") [
+                qemu
+                pkgs.stdenv.cc
+                libiconv
+                pkgs.pkgsCross.gnu64.stdenv.cc.bintools
+                pkgs.pkgsCross.gnu64.stdenv.cc
+              ];
 
             env = {
               LIBCLANG_PATH = "${pkgs.libclang.lib}/lib";

@@ -79,6 +79,9 @@ const PAGE_MANAGER_BULK_BATCH: usize = 64;
 /// The range may be a non-power-of-two suffix of a larger allocation. Splitting
 /// it into the largest aligned blocks avoids both invalid buddy frees and an
 /// O(n) one-frame-at-a-time teardown.
+///
+/// memcg uncharging happens inside `LockedFrameAllocator::free`, per buddy
+/// block, against each frame's recorded owner.
 unsafe fn free_aligned_frame_range(mut start: PhysAddr, mut pages: usize) {
     while pages != 0 {
         let pfn = start.data() / MMArch::PAGE_SIZE;
@@ -790,9 +793,15 @@ impl PageReclaimer {
     }
 
     /// 唤醒页面回收线程
+    ///
+    /// Safe to call before the reclaim thread is spawned (e.g. from early
+    /// memcg charge paths): the wakeup is simply dropped in that case.
     pub fn wakeup_claim_thread() {
         // log::info!("wakeup_claim_thread");
-        let _ = ProcessManager::wakeup(unsafe { PAGE_RECLAIMER_THREAD.as_ref().unwrap() });
+        let Some(thread) = (unsafe { PAGE_RECLAIMER_THREAD.as_ref() }) else {
+            return;
+        };
+        let _ = ProcessManager::wakeup(thread);
     }
 
     /// 脏页回写函数

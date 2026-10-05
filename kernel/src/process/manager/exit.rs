@@ -493,7 +493,13 @@ impl ProcessManager {
             // Hold cgroup_accounting_lock to avoid deadlock with cgroup.procs writes.
             {
                 let _cgroup_guard = crate::cgroup::cgroup_accounting_lock().lock();
-                pcb.task_cgroup_node().remove_task(raw_pid);
+                let cgroup = pcb.task_cgroup_node();
+                cgroup.remove_task(raw_pid);
+                for id in crate::cgroup::subsys::CgroupSubsysId::all() {
+                    if let Some(css) = cgroup.css(*id) {
+                        css.exit(&pcb);
+                    }
+                }
             }
             if pcb.is_kthread() {
                 let exited_completion = {

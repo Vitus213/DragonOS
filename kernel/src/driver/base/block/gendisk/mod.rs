@@ -24,7 +24,7 @@ use crate::{
     libs::{mutex::MutexGuard, rwlock::RwLock},
 };
 
-const MINORS_PER_DISK: u32 = 256;
+pub(crate) const MINORS_PER_DISK: u32 = 256;
 
 #[derive(Debug)]
 pub struct GenDisk {
@@ -132,8 +132,12 @@ impl GenDisk {
 
         let blocks = buf.len() / (1 << self.block_size_log2 as usize);
         let lba = self.block_offset_2_disk_blkid(start_block_offset);
-
-        return self.block_device()?.read_at(lba, blocks, buf);
+        super::blkcg::throttle_current_io(self.device_num, false, buf.len())?;
+        let result = self.block_device()?.read_at(lba, blocks, buf);
+        if let Ok(bytes) = result {
+            super::blkcg::account_current_io(self.device_num, false, bytes);
+        }
+        result
     }
 
     /// # read_at_bytes
@@ -147,9 +151,14 @@ impl GenDisk {
     pub fn read_at_bytes(&self, buf: &mut [u8], bytes_offset: usize) -> Result<usize, SystemError> {
         let start_lba = self.range.lba_start;
         let bytes_offset = self.disk_blkid_2_bytes(start_lba) + bytes_offset;
-        return self
+        super::blkcg::throttle_current_io(self.device_num, false, buf.len())?;
+        let result = self
             .block_device()?
             .read_at_bytes(bytes_offset, buf.len(), buf);
+        if let Ok(bytes) = result {
+            super::blkcg::account_current_io(self.device_num, false, bytes);
+        }
+        result
     }
 
     /// # 分区内的字节偏移量转换为磁盘上的字节偏移量
@@ -169,9 +178,14 @@ impl GenDisk {
     pub fn write_at_bytes(&self, buf: &[u8], bytes_offset: usize) -> Result<usize, SystemError> {
         let start_lba = self.range.lba_start;
         let bytes_offset = self.disk_blkid_2_bytes(start_lba) + bytes_offset;
-        return self
+        super::blkcg::throttle_current_io(self.device_num, true, buf.len())?;
+        let result = self
             .block_device()?
             .write_at_bytes(bytes_offset, buf.len(), buf);
+        if let Ok(bytes) = result {
+            super::blkcg::account_current_io(self.device_num, true, bytes);
+        }
+        result
     }
 
     /// # write_at
@@ -186,10 +200,14 @@ impl GenDisk {
         if (buf.len() & (LBA_SIZE - 1)) > 0 {
             return Err(SystemError::EINVAL);
         }
-
         let blocks = buf.len() / (1 << self.block_size_log2 as usize);
         let lba = self.block_offset_2_disk_blkid(start_block_offset);
-        return self.block_device()?.write_at(lba, blocks, buf);
+        super::blkcg::throttle_current_io(self.device_num, true, buf.len())?;
+        let result = self.block_device()?.write_at(lba, blocks, buf);
+        if let Ok(bytes) = result {
+            super::blkcg::account_current_io(self.device_num, true, bytes);
+        }
+        result
     }
 
     #[inline]
@@ -324,8 +342,14 @@ impl IndexNode for GenDisk {
             .disk_blkid_2_bytes(self.range().lba_start)
             .checked_add(offset)
             .ok_or(SystemError::EOVERFLOW)?;
-        self.block_device()?
-            .write_at_bytes_with_sync(disk_offset, len, &buf[..len], sync_intent)
+        super::blkcg::throttle_current_io(self.device_num, true, len)?;
+        let result = self
+            .block_device()?
+            .write_at_bytes_with_sync(disk_offset, len, &buf[..len], sync_intent)?;
+        if result.written_len != 0 {
+            super::blkcg::account_current_io(self.device_num, true, result.written_len);
+        }
+        Ok(result)
     }
 
     fn list(&self) -> Result<alloc::vec::Vec<alloc::string::String>, system_error::SystemError> {

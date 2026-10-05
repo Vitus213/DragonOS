@@ -166,6 +166,9 @@ pub struct ProcessControlBlock {
     /// Whether the current task has been counted in the global visible thread
     /// count.
     pub(super) visible_thread_accounted: AtomicBool,
+    /// Task is frozen by cgroup freezer. Set by cgroup_enter_frozen(), cleared
+    /// by cgroup_leave_frozen().
+    pub(super) frozen: AtomicBool,
     /// Serializes task-local pointer publication for RCU-protected metadata
     /// such as `cred`, `nsproxy`, and `sighand`.
     pub(super) task_lock: SpinLock<()>,
@@ -557,6 +560,7 @@ impl ProcessControlBlock {
                 srcu_callback_domain: AtomicU64::new(0),
                 flags,
                 visible_thread_accounted: AtomicBool::new(false),
+                frozen: AtomicBool::new(false),
                 task_lock: SpinLock::new(()),
                 kernel_stack: RwLock::new(kstack),
                 syscall_stack: RwLock::new(syscall_stack),
@@ -1995,6 +1999,16 @@ impl ProcessControlBlock {
     #[inline(always)]
     pub fn identity_unhash_complete(&self) -> bool {
         self.identity_unhash_complete.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub fn frozen(&self) -> bool {
+        self.frozen.load(Ordering::Acquire)
+    }
+
+    #[inline(always)]
+    pub fn set_frozen(&self, frozen: bool) {
+        self.frozen.store(frozen, Ordering::Release);
     }
 
     /// Assign this task to a group-exec transaction. The caller serializes

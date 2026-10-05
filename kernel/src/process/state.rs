@@ -225,6 +225,10 @@ bitflags! {
         /// x86 #DB work is recorded and must be committed/restored at the
         /// return-to-user boundary, never in exception context.
         const PENDING_DEBUG = 1 << 25;
+        /// Task is frozen by cgroup freezer.
+        const FROZEN = 1 << 26;
+        /// Task is being frozen (transition state).
+        const FREEZING = 1 << 27;
     }
 }
 

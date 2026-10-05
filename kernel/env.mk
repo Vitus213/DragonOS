@@ -2,7 +2,11 @@ include ../env.mk
 
 # 设置编译器
 ifeq ($(USING_DRAGONOS_NIX_ENV),1) # Nix toolchain doesn't need to specify the prefix
+ifeq ($(shell uname -s),Darwin)
+CCPREFIX=x86_64-unknown-linux-gnu-
+else
 CCPREFIX=
+endif
 else ifeq ($(ARCH), x86_64)
 CCPREFIX=x86_64-linux-gnu-
 else ifeq ($(ARCH), riscv64)

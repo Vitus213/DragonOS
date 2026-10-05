@@ -6,21 +6,21 @@ use x86::{bits64::rflags::RFlags, controlregs::Cr4};
 
 use crate::{
     arch::{
-        interrupt::{trap::X86PfErrorCode, TrapFrame},
+        CurrentIrqArch, MMArch,
+        interrupt::{TrapFrame, trap::X86PfErrorCode},
         ipc::signal::Signal,
         mm::{MemoryManagementArch, X86_64MMArch},
-        CurrentIrqArch, MMArch,
     },
-    exception::{extable::ExceptionTableManager, InterruptArch},
+    exception::{InterruptArch, extable::ExceptionTableManager},
     ipc::{
         signal::force_sig_fault_to_current,
-        signal_types::{SignalArch, BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR},
+        signal_types::{BUS_ADRERR, SEGV_ACCERR, SEGV_MAPERR, SignalArch},
     },
     mm::{
+        VirtAddr, VirtRegion, VmFaultReason, VmFlags,
         fault::{FaultFlags, PageFaultHandler, PageFaultMessage},
         oom::{OomContext, OomOutcome},
         ucontext::{AddressSpace, LockedVMA},
-        VirtAddr, VirtRegion, VmFaultReason, VmFlags,
     },
     process::ProcessManager,
 };
@@ -365,6 +365,11 @@ impl X86_64MMArch {
         );
         let current_address_space: Arc<AddressSpace> = AddressSpace::current().unwrap();
 
+        // memcg memory.high throttle (Linux runs mem_cgroup_handle_over_high()
+        // on the fault path as well): bounded synchronous reclaim outside every
+        // allocator/page-manager lock.
+        crate::mm::memcg::memcg_handle_over_high();
+
         let mut tried_direct_reclaim = false;
 
         'fault_retry: loop {
@@ -458,11 +463,11 @@ impl X86_64MMArch {
                         if !space_guard.can_extend_stack(extension_size) {
                             // 栈扩展超过限制
                             log::warn!(
-                            "pid {} user stack limit exceeded, error_code: {:?}, address: {:#x}",
-                            ProcessManager::current_pid().data(),
-                            error_code,
-                            address.data(),
-                        );
+                                "pid {} user stack limit exceeded, error_code: {:?}, address: {:#x}",
+                                ProcessManager::current_pid().data(),
+                                error_code,
+                                address.data(),
+                            );
 
                             // 栈溢出，检查是否需要异常表修复
                             if handle_kernel_access_failed(regs) {

@@ -7,7 +7,9 @@ use alloc::{
 use system_error::SystemError;
 
 use crate::{
-    driver::base::block::{block_device::BlockDevice, disk_info::Partition, SeekFrom},
+    driver::base::block::{
+        blkcg, block_device::BlockDevice, disk_info::Partition, gendisk, SeekFrom,
+    },
     libs::vec_cursor::VecCursor,
 };
 
@@ -89,8 +91,17 @@ impl MbrDiskPartionTable {
         let mut buf: Vec<u8> = vec![0; size_of::<MbrDiskPartionTable>()];
         buf.resize(size_of::<MbrDiskPartionTable>(), 0);
 
-        disk.read_at_sync(0, 1, &mut buf)?;
-
+        // The scan reads through the raw device before any partition gendisk
+        // exists; key the io throttle/stat by the whole-disk number that
+        // GenDisk will publish (base_minor * MINORS_PER_DISK).
+        let meta = disk.blkdev_meta();
+        let device = crate::driver::base::device::device_number::DeviceNumber::new(
+            meta.major,
+            meta.base_minor * gendisk::MINORS_PER_DISK,
+        );
+        blkcg::throttle_current_io(device, false, buf.len())?;
+        let completed = disk.read_at_sync(0, 1, &mut buf)?;
+        blkcg::account_current_io(device, false, completed);
         // 创建 Cursor 用于按字节读取
         let mut cursor = VecCursor::new(buf);
         cursor.seek(SeekFrom::SeekCurrent(446))?;

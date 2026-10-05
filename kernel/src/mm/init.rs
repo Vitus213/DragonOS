@@ -60,6 +60,9 @@ pub unsafe fn mm_init() {
     page_manager_init();
     // enable PAGE_RECLAIMER
     page_reclaimer_init();
+    // size the memcg per-frame ownership map (after the frame allocator
+    // and the kernel heap exist)
+    crate::mm::memcg::memcg_page_owners_init();
     // init per-CPU TLB state / CSD slots
     crate::mm::tlb::tlb_init();
 

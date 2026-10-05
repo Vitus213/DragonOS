@@ -4,7 +4,7 @@ use core::{
 };
 
 use crate::{
-    arch::{mm::LockedFrameAllocator, MMArch},
+    arch::{MMArch, mm::LockedFrameAllocator},
     mm::{MemoryManagementArch, PhysAddr, VirtAddr},
 };
 
@@ -363,11 +363,18 @@ impl<T: FrameAllocator> FrameAllocator for &mut T {
 
 /// @brief 从全局的页帧分配器中分配连续count个页帧
 ///
+/// memcg 计费在 `LockedFrameAllocator::allocate` 内部统一执行（先分配
+/// 后计费，计费失败原地归还且不留归属记录，因此不会产生未配对的
+/// uncharge）。
+///
 /// @param count 请求分配的页帧数量
 pub unsafe fn allocate_page_frames(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
     unsafe { LockedFrameAllocator.allocate(count) }
 }
 
+/// @brief 在指定的物理地址上限之内分配连续页帧
+///
+/// 与 `allocate_page_frames` 相同的 memcg 计费路径。
 pub unsafe fn allocate_page_frames_below(
     count: PageFrameCount,
     max_phys_addr: PhysAddr,
@@ -394,10 +401,13 @@ where
 
 /// @brief 向全局页帧分配器释放连续count个页帧
 ///
+/// memcg uncharge 在 `LockedFrameAllocator::free` 内部按每帧归属记录
+/// 执行，释放方与计费方不必是同一个任务/cgroup。
+///
 /// @param frame 要释放的第一个页帧
 /// @param count 要释放的页帧数量 (必须是2的n次幂)
 pub unsafe fn deallocate_page_frames(frame: PhysPageFrame, count: PageFrameCount) {
     unsafe {
         LockedFrameAllocator.free(frame.phys_address(), count);
-    };
+    }
 }

@@ -82,6 +82,8 @@ fn do_start_kernel() {
 
     acpi_init().expect("acpi init failed");
     crate::sched::sched_init();
+    // 注册 cgroup 控制器，必须早于创建 init/idle 任务，使根 cgroup 的 CSS 完整初始化。
+    crate::cgroup::init::init_cgroup_controllers();
     process_init();
     rcu::init();
     if let Err(e) = cgroup2_init() {

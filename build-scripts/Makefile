@@ -7,7 +7,7 @@ TOOLCHAIN ?= +nightly-2026-02-24
 endif
 
 all:
-	@cargo $(TOOLCHAIN) build --release -p gen_kallsyms
+	@RUSTFLAGS="" RUSTDOCFLAGS="" cargo $(TOOLCHAIN) build --release -p gen_kallsyms
 fmt:
 	cargo fmt --all $(FMT_CHECK)
 clean:

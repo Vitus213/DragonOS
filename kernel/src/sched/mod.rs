@@ -194,6 +194,31 @@ fn select_least_loaded_cpu(allowed: &CpuMask, fallback_cpu: ProcessorId) -> Proc
     best_cpu
 }
 
+/// 将任务 affinity 与 cpuset 有效 CPU 集合求交集。
+///
+/// 空交集必须保持为空，由 syscall 返回 `EINVAL`；调度唤醒路径另行选择
+/// 合法 fallback，不能把用户显式的非法 affinity 请求放宽为原始 mask。
+pub fn cpuset_cpus_allowed(
+    pcb: &Arc<ProcessControlBlock>,
+    allowed: &CpuMask,
+) -> CpuMask {
+    let Some(css) = pcb
+        .task_cgroup_node()
+        .css(crate::cgroup::subsys::CgroupSubsysId::Cpuset)
+    else {
+        return allowed.clone();
+    };
+    let Some(cpuset) = css
+        .as_any()
+        .downcast_ref::<crate::cgroup::controllers::cpuset::CpusetCss>()
+    else {
+        return allowed.clone();
+    };
+    let mut effective = allowed.clone();
+    effective.bitand_assign(&cpuset.effective_cpus());
+    effective
+}
+
 /// 选择目标 CPU。调用者必须在 pi_lock 保护下读取 cpus_allowed 并传入，
 pub fn select_task_rq(
     pcb: &Arc<ProcessControlBlock>,
@@ -201,13 +226,14 @@ pub fn select_task_rq(
     wake_flags: WakeupFlags,
     allowed: &CpuMask,
 ) -> ProcessorId {
+    let allowed = cpuset_cpus_allowed(pcb, allowed);
     let current_cpu = smp_get_processor_id();
-    let fallback_cpu = if cpu_allowed_and_online(allowed, prev_cpu) {
+    let fallback_cpu = if cpu_allowed_and_online(&allowed, prev_cpu) {
         prev_cpu
-    } else if cpu_allowed_and_online(allowed, current_cpu) {
+    } else if cpu_allowed_and_online(&allowed, current_cpu) {
         current_cpu
     } else {
-        first_allowed_online_cpu(allowed)
+        first_allowed_online_cpu(&allowed)
             .or_else(|| allowed.iter_cpu().next())
             .unwrap_or(prev_cpu)
     };
@@ -219,16 +245,16 @@ pub fn select_task_rq(
     }
 
     if wake_flags.contains(WakeupFlags::WF_FORK) {
-        return select_fork_idle_cpu(allowed, fallback_cpu)
-            .unwrap_or_else(|| select_least_loaded_cpu(allowed, fallback_cpu));
+        return select_fork_idle_cpu(&allowed, fallback_cpu)
+            .unwrap_or_else(|| select_least_loaded_cpu(&allowed, fallback_cpu));
     }
 
     if wake_flags.contains(WakeupFlags::WF_TTWU) {
-        if let Some(idle_cpu) = pick_idle_cpu(allowed) {
+        if let Some(idle_cpu) = pick_idle_cpu(&allowed) {
             return idle_cpu;
         }
 
-        return select_least_loaded_cpu(allowed, fallback_cpu);
+        return select_least_loaded_cpu(&allowed, fallback_cpu);
     }
 
     fallback_cpu
@@ -365,6 +391,19 @@ impl LoadWeight {
         let index = (prio - MAX_RT_PRIO) as usize;
         Self::scale_load(Self::SCHED_PRIO_TO_WEIGHT[index])
     }
+    /// Convert cgroup v2 `cpu.weight` (1..=10000) to the scaled fair
+    /// load used by CFS. Linux defines weight 100 as the normal share;
+    /// the controller value is not itself a scheduler load.
+    pub const fn weight_from_cpu_weight(shares: u64) -> u64 {
+        let shares = if shares < 1 {
+            1
+        } else if shares > 10000 {
+            10000
+        } else {
+            shares
+        };
+        shares.saturating_mul(Self::NICE_0_LOAD) / 100
+    }
 
     /// Loads the fair class weight for a fair class priority.
     pub fn set_load_weight_from_prio(&mut self, prio: i32) {
@@ -486,6 +525,9 @@ pub struct CpuRunQueue {
     lock: SpinLock<()>,
 
     cpu: ProcessorId,
+    /// Earliest CPU-cgroup period deadline that needs a scheduler wakeup.
+    cgroup_throttle_deadline: u64,
+    /// CPU task clock excluding IRQ time.
     clock_task: u64,
     clock: u64,
     prev_irq_time: u64,
@@ -539,6 +581,7 @@ impl CpuRunQueue {
         Self {
             lock: SpinLock::new(()),
             cpu,
+            cgroup_throttle_deadline: 0,
             clock_task: 0,
             clock: 0,
             prev_irq_time: 0,
@@ -971,6 +1014,26 @@ impl CpuRunQueue {
     pub fn clock_task(&self) -> u64 {
         self.clock_task
     }
+    /// Arm a single wakeup for the earliest cgroup period deadline on this rq.
+    /// The caller holds this rq's lock.
+    pub(crate) fn arm_cgroup_throttle_deadline(&mut self, deadline: u64) {
+        if self.cgroup_throttle_deadline == 0
+            || (deadline.wrapping_sub(self.cgroup_throttle_deadline) as i64) < 0
+        {
+            self.cgroup_throttle_deadline = deadline;
+        }
+    }
+
+    /// Consume the deadline wakeup when the period boundary is reached.
+    pub(crate) fn cgroup_throttle_deadline_due(&mut self) -> bool {
+        if self.cgroup_throttle_deadline != 0
+            && (self.clock_task.wrapping_sub(self.cgroup_throttle_deadline) as i64) >= 0
+        {
+            self.cgroup_throttle_deadline = 0;
+            return true;
+        }
+        false
+    }
 
     /// 重新调度当前进程
     pub fn resched_current(&self) {
@@ -1017,6 +1080,10 @@ impl CpuRunQueue {
             && prev.sched_info().state().is_runnable()
             && *prev.sched_info().on_rq.lock_irqsave() == OnRq::Queued
             && !(prev.sched_info().sched_class() == SchedClass::Realtime && self.rt.is_throttled())
+            && !prev
+                .sched_info()
+                .sched_entity()
+                .bandwidth_throttled(self.clock_task)
         {
             next = Some(prev.clone());
         }
@@ -1151,7 +1218,83 @@ impl ProcessManager {
     }
 }
 
-/// ## 时钟tick时调用此函数
+/// Charge actual execution time to the current task's CPU cgroup.
+///
+/// Fair scheduling calls this exactly once from `CfsRunQueue::update_current`,
+/// after advancing the entity's `exec_start`. A throttle decision carries the
+/// period deadline back to the entity; the entity remains accounted on the
+/// rq, but fair pick paths exclude it until that deadline.
+pub(crate) fn account_cgroup_runtime(
+    current: &Arc<ProcessControlBlock>,
+    clock_ns: u64,
+    delta_ns: u64,
+) -> Option<u64> {
+    use crate::cgroup::controllers::cpu::{CpuCss, CpuRuntimeDecision};
+    use crate::cgroup::subsys::CgroupSubsysId;
+
+    let css_state = current
+        .task_cgroup_node()
+        .css(CgroupSubsysId::Cpu)?;
+    let css = css_state.as_any().downcast_ref::<CpuCss>()?;
+
+    match css.account_runtime_checked(clock_ns, delta_ns, false) {
+        CpuRuntimeDecision::Throttle {
+            period_deadline_ns,
+            ..
+        } => Some(period_deadline_ns),
+        CpuRuntimeDecision::Unlimited
+        | CpuRuntimeDecision::Allow { .. } => None,
+    }
+}
+
+/// Check a waking task's cgroup quota without charging runtime.
+///
+/// Mirror of the `account_cfs_rq_runtime(cfs_rq, 0)` half of Linux
+/// `check_enqueue_throttle()`: a task that wakes inside a cgroup whose
+/// `cpu.max` quota is already exhausted must be held back until the period
+/// boundary, because `update_current` can only throttle it once running time
+/// has been charged. Returns the active period deadline while the group is
+/// throttled.
+pub(crate) fn cgroup_check_enqueue_throttle(
+    current: &Arc<ProcessControlBlock>,
+    clock_ns: u64,
+) -> Option<u64> {
+    use crate::cgroup::controllers::cpu::CpuCss;
+    use crate::cgroup::subsys::CgroupSubsysId;
+
+    let css_state = current.task_cgroup_node().css(CgroupSubsysId::Cpu)?;
+    let css = css_state.as_any().downcast_ref::<CpuCss>()?;
+
+    css.check_bandwidth_throttle(clock_ns)
+}
+
+/// Re-check a fair task's `cpu.max` throttle state after it changed cgroups.
+///
+/// Linux `task_change_group_fair()` re-attaches the entity to the new cfs_rq
+/// and allocates bandwidth there. A deadline carried over from the previous
+/// cgroup must not keep throttling the task under its new group, and a new
+/// group that is already throttled must hold the task back immediately.
+pub fn task_change_group_cpu_bandwidth(pcb: &Arc<ProcessControlBlock>) {
+    if pcb.sched_info().sched_class() != SchedClass::Fair {
+        return;
+    }
+
+    let se = pcb.sched_info().sched_entity();
+    if *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Migrating {
+        return;
+    }
+
+    let rq_arc = se.cfs_rq().rq();
+    let (rq, _guard) = rq_arc.self_lock();
+    rq.update_rq_clock();
+
+    let deadline = cgroup_check_enqueue_throttle(pcb, rq.clock_task());
+    se.force_mut().set_bandwidth_throttled_until(deadline.unwrap_or(0));
+    if let Some(deadline) = deadline {
+        rq.arm_cgroup_throttle_deadline(deadline);
+    }
+}
+
 pub fn scheduler_tick() {
     fence(Ordering::SeqCst);
     // 获取当前CPU索引
@@ -1167,6 +1310,14 @@ pub fn scheduler_tick() {
 
     // 更新请求队列时钟
     rq.update_rq_clock();
+    if rq.cgroup_throttle_deadline_due() {
+        // A throttled task may have left the CPU; wake the scheduler at the
+        // period boundary rather than waiting for that task to run its own
+        // check.
+        rq.resched_current();
+    }
+    
+    
     let current_class = current.sched_info().sched_class();
     RealtimeScheduler::update_bandwidth(rq, current_class);
     match current_class {
@@ -1270,8 +1421,14 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
     //
     // on_rq == Queued 守卫保证 deactivate 幂等：
     //   若 stop_task 已出队（!is_current 分支），此处 on_rq != Queued，跳过。
-    //   若 stop_task 未出队（远端 current 分支），此处 on_rq == Queued，执行出队。
+    // 冻结检查必须先于 deactivate 分支：__refrigerator() 把 Runnable 任务
+    // 转为 Blocked 后，下方 !is_runnable() 分支才能在本轮完成出队；
+    // 否则冻结任务会残留在 runqueue 上多跑一拍。
     let mut prev_state = prev.sched_info().state();
+    if crate::cgroup::controllers::freezer::__refrigerator(&prev) {
+        prev_state = prev.sched_info().state();
+    }
+
     if !prev_state.is_runnable() {
         let interruptible = prev_state.is_blocked_interruptable();
         let wake_kill = prev_state.is_stopped();
@@ -1313,6 +1470,7 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
             }
         }
     }
+
 
     let mut migrate_prev_to = None;
     if prev_state.is_runnable() {
@@ -1470,6 +1628,25 @@ pub fn sched_fork(pcb: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
 
 pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
     let fork_cpu = smp_get_processor_id();
+    // Apply the cgroup ratio before task_fork places the entity. This keeps
+    // the initial fair deadline consistent with the inherited cpu.weight.
+    use crate::cgroup::subsys::CgroupSubsysId;
+    let cgroup_node = pcb.task_cgroup_node();
+    if let Some(cpu_css) = cgroup_node.css(CgroupSubsysId::Cpu) {
+        if let Some(cpu_css) =
+            cpu_css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::cpu::CpuCss>()
+        {
+            let weight = LoadWeight::weight_from_cpu_weight(cpu_css.shares());
+            pcb.sched_info()
+                .sched_entity()
+                .force_mut()
+                .load
+                .update_load_set(weight);
+        }
+    }
+
 
     __set_task_cpu(pcb, fork_cpu);
     match pcb.sched_info().sched_class() {
@@ -1483,6 +1660,58 @@ pub fn sched_cgroup_fork(pcb: &Arc<ProcessControlBlock>) {
         fork_cpu,
         "fork-time task_fork must only charge the local rq clock"
     );
+
+}
+/// Reweight one fair task for a cgroup `cpu.weight` update.
+///
+/// The caller may invoke this for a queued or running task. All runqueue
+/// bookkeeping stays under the task's own CFS rq lock; off-rq/new tasks only
+/// need the entity-local assignment.
+pub fn reweight_task_cpu_weight(
+    pcb: &Arc<ProcessControlBlock>,
+    shares: u64,
+) -> Result<(), SystemError> {
+    if pcb.sched_info().sched_class() != SchedClass::Fair {
+        return Ok(());
+    }
+
+    let weight = LoadWeight::weight_from_cpu_weight(shares);
+    let se = pcb.sched_info().sched_entity();
+    let on_rq = *pcb.sched_info().on_rq.lock_irqsave();
+    if on_rq == OnRq::Migrating {
+        return Ok(());
+    }
+    if on_rq == OnRq::None {
+        se.force_mut().load.update_load_set(weight);
+        return Ok(());
+    }
+
+    let rq_arc = se.cfs_rq().rq();
+    let (rq, _guard) = rq_arc.self_lock();
+    let queued = *pcb.sched_info().on_rq.lock_irqsave() == OnRq::Queued;
+    let running = Arc::ptr_eq(&rq.current(), pcb);
+    if queued {
+        rq.dequeue_task(
+            pcb.clone(),
+            DequeueFlag::DEQUEUE_SAVE | DequeueFlag::DEQUEUE_NOCLOCK,
+        );
+    }
+    if running {
+        rq.put_prev_task_for_class(SchedClass::Fair, pcb.clone());
+    }
+
+    se.cfs_rq().force_mut().reweight_entity(se.clone(), weight);
+
+    if queued {
+        rq.enqueue_task(
+            pcb.clone(),
+            EnqueueFlag::ENQUEUE_RESTORE | EnqueueFlag::ENQUEUE_NOCLOCK,
+        );
+    }
+    if running {
+        rq.set_next_task_for_class(SchedClass::Fair, pcb.clone());
+    }
+    Ok(())
 }
 
 fn __set_task_cpu(pcb: &Arc<ProcessControlBlock>, cpu: ProcessorId) {

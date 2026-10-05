@@ -9,19 +9,19 @@ use crate::{
     driver::open_firmware::fdt::open_firmware_fdt_driver,
     libs::spinlock::SpinLock,
     mm::{
+        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags,
         allocator::{
             buddy::BuddyAllocator,
             page_frame::{FrameAllocator, PageFrameCount, PageFrameUsage, PhysPageFrame},
         },
         kernel_mapper::KernelMapper,
-        page::{EntryFlags, PageEntry, PAGE_1G_SHIFT},
+        page::{EntryFlags, PAGE_1G_SHIFT, PageEntry},
         ucontext::UserMapper,
-        MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags,
     },
     smp::cpu::ProcessorId,
 };
 
-use self::init::{riscv_mm_init, INITIAL_PGTABLE_VALUE};
+use self::init::{INITIAL_PGTABLE_VALUE, riscv_mm_init};
 
 pub mod bump;
 pub(super) mod init;
@@ -56,11 +56,7 @@ impl RiscV64MMArch {
     pub fn remote_flush_icache(cpu: ProcessorId) -> Result<(), SbiRet> {
         let mask = <ProcessorId as Into<HartMask>>::into(cpu);
         let result = sbi_rt::remote_fence_i(mask);
-        if result.is_ok() {
-            Ok(())
-        } else {
-            Err(result)
-        }
+        if result.is_ok() { Ok(()) } else { Err(result) }
     }
 
     /// 使远程cpu的TLB中，指定地址范围的页失效
@@ -245,11 +241,7 @@ impl MemoryManagementArch for RiscV64MMArch {
             options(nostack)
         );
 
-        if fault == 0 {
-            0
-        } else {
-            remaining
-        }
+        if fault == 0 { 0 } else { remaining }
     }
 
     unsafe fn memset_with_exception_table(dst: *mut u8, value: u8, len: usize) -> usize {
@@ -282,11 +274,7 @@ impl MemoryManagementArch for RiscV64MMArch {
             options(nostack)
         );
 
-        if fault == 0 {
-            0
-        } else {
-            remaining
-        }
+        if fault == 0 { 0 } else { remaining }
     }
 
     fn virt_is_valid(virt: VirtAddr) -> bool {
@@ -486,11 +474,25 @@ pub struct LockedFrameAllocator;
 
 impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.allocate(count);
+        let allocation = if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+            allocator.allocate(count)
         } else {
+            None
+        };
+        let (addr, actual) = allocation?;
+        // memcg charge after the raw allocation, outside the inner
+        // allocator lock. On refusal the frames are returned below
+        // without recorded ownership, so the free path performs no
+        // uncharge — refused charges never touch any CSS counter.
+        if crate::mm::memcg::memcg_alloc_charge(addr, actual.data() as u64).is_err() {
+            unsafe {
+                if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+                    allocator.free(addr, actual);
+                }
+            }
             return None;
         }
+        Some((addr, actual))
     }
 
     unsafe fn allocate_below(
@@ -498,15 +500,28 @@ impl FrameAllocator for LockedFrameAllocator {
         count: PageFrameCount,
         max_phys_addr: PhysAddr,
     ) -> Option<(PhysAddr, PageFrameCount)> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
+        let allocation = if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
             allocator.buddy_alloc_below(count.next_power_of_two(), max_phys_addr)
         } else {
             None
+        };
+        let (addr, actual) = allocation?;
+        if crate::mm::memcg::memcg_alloc_charge(addr, actual.data() as u64).is_err() {
+            unsafe {
+                if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+                    allocator.free(addr, actual);
+                }
+            }
+            return None;
         }
+        Some((addr, actual))
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {
         assert!(count.data().is_power_of_two());
+        // Uncharge the CSS that owns these frames (if any) before they
+        // return to the buddy allocator.
+        crate::mm::memcg::memcg_free_uncharge(address, count.data() as u64);
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.free(address, count);
         }

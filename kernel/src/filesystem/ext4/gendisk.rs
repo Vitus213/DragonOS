@@ -3,6 +3,7 @@ use alloc::sync::Arc;
 use kdepends::another_ext4;
 use system_error::SystemError;
 
+use crate::driver::base::block::blkcg;
 use crate::driver::base::block::gendisk::GenDisk;
 use crate::driver::base::block::{bio::BioRequest, block_device::LBA_SIZE};
 
@@ -13,6 +14,11 @@ pub(super) const EXT4_BLOCKS_PER_BULK_IO: usize = 16;
 pub(super) struct SubmittedExt4Read {
     bio: Arc<BioRequest>,
     expected_bytes: usize,
+    /// Cgroup captured at submit time; the workqueue worker that waits for
+    /// completion belongs to a different task, so io.stat must be charged
+    /// against the submitter.
+    io_cgroup: Arc<crate::cgroup::CgroupNode>,
+    device: crate::driver::base::device::device_number::DeviceNumber,
 }
 
 impl SubmittedExt4Read {
@@ -21,6 +27,12 @@ impl SubmittedExt4Read {
             return Err(SystemError::EINVAL);
         }
         self.bio.wait_read_into(dst)?;
+        blkcg::account_io_for(
+            &self.io_cgroup,
+            self.device,
+            false,
+            self.expected_bytes,
+        );
         Ok(())
     }
 }
@@ -38,10 +50,16 @@ impl GenDisk {
             .checked_mul(another_ext4::BLOCK_SIZE)
             .ok_or(SystemError::EOVERFLOW)?;
         let (lba_start, lba_count) = self.checked_ext4_range(start, ext4_block_count)?;
+        // Enforce io.max before the request reaches the device; the wait
+        // runs in the submitting task's context, exactly where the cgroup
+        // attribution lives.
+        blkcg::throttle_current_io(self.device_num(), false, expected_bytes)?;
         let bio = self.block_device()?.submit_bio_read(lba_start, lba_count)?;
         Ok(SubmittedExt4Read {
             bio,
             expected_bytes,
+            io_cgroup: blkcg::current_io_cgroup(),
+            device: self.device_num(),
         })
     }
 
@@ -122,12 +140,18 @@ impl another_ext4::BlockDevice for GenDisk {
             .expect("Failed to convert boxed slice to boxed array");
 
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block_id);
-        self.block_device()
+        blkcg::throttle_current_io(self.device_num(), false, buf.len()).map_err(|e| {
+            log::error!("Ext4BlkDevice '{:?}' read_block failed: {:?}", block_id, e);
+            another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&e))
+        })?;
+        let completed = self
+            .block_device()
             .and_then(|bdev| bdev.read_at(lba_id_start, block_count, &mut *buf))
             .map_err(|e| {
                 log::error!("Ext4BlkDevice '{:?}' read_block failed: {:?}", block_id, e);
                 another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&e))
             })?;
+        blkcg::account_current_io(self.device_num(), false, completed);
         Ok(another_ext4::Block::new(block_id, buf))
     }
 
@@ -156,6 +180,9 @@ impl another_ext4::BlockDevice for GenDisk {
                 .map_err(|error| {
                     another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
                 })?;
+            blkcg::throttle_current_io(self.device_num(), false, chunk.len()).map_err(|error| {
+                another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+            })?;
             let completed = self
                 .block_device()
                 .and_then(|bdev| bdev.read_at(lba_start, lba_count, chunk))
@@ -165,6 +192,7 @@ impl another_ext4::BlockDevice for GenDisk {
             if completed != chunk.len() {
                 return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
             }
+            blkcg::account_current_io(self.device_num(), false, completed);
         }
         Ok(())
     }
@@ -174,7 +202,12 @@ impl another_ext4::BlockDevice for GenDisk {
         block: &another_ext4::Block,
     ) -> core::result::Result<(), another_ext4::Ext4Error> {
         let (_, lba_id_start, block_count) = self.convert_from_ext4_blkid(block.id);
-        self.block_device()
+        blkcg::throttle_current_io(self.device_num(), true, block.data.len()).map_err(|e| {
+            log::error!("Ext4BlkDevice '{:?}' write_block failed: {:?}", block.id, e);
+            another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&e))
+        })?;
+        let completed = self
+            .block_device()
             .and_then(|bdev| bdev.write_at(lba_id_start, block_count, &*block.data))
             .map_err(|e| {
                 let code = Self::map_system_error_to_ext4(&e);
@@ -189,6 +222,7 @@ impl another_ext4::BlockDevice for GenDisk {
                 }
                 another_ext4::Ext4Error::new(code)
             })?;
+        blkcg::account_current_io(self.device_num(), true, completed);
         Ok(())
     }
 
@@ -217,6 +251,9 @@ impl another_ext4::BlockDevice for GenDisk {
                 .map_err(|error| {
                     another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
                 })?;
+            blkcg::throttle_current_io(self.device_num(), true, chunk.len()).map_err(|error| {
+                another_ext4::Ext4Error::new(Self::map_system_error_to_ext4(&error))
+            })?;
             let completed = self
                 .block_device()
                 .and_then(|bdev| bdev.write_at(lba_start, lba_count, chunk))
@@ -226,6 +263,7 @@ impl another_ext4::BlockDevice for GenDisk {
             if completed != chunk.len() {
                 return Err(another_ext4::Ext4Error::new(another_ext4::ErrCode::EIO));
             }
+            blkcg::account_current_io(self.device_num(), true, completed);
         }
         Ok(())
     }

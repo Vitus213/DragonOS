@@ -18,7 +18,7 @@ use crate::libs::lib_ui::screen_manager::scm_disable_put_to_window;
 use crate::libs::spinlock::SpinLock;
 
 use crate::mm::allocator::page_frame::{
-    retry_oom_victim_page_frame_alloc, FrameAllocator, PageFrameCount, PageFrameUsage,
+    FrameAllocator, PageFrameCount, PageFrameUsage, retry_oom_victim_page_frame_alloc,
 };
 use crate::mm::memblock::mem_block_manager;
 use crate::mm::ucontext::LockedVMA;
@@ -28,7 +28,7 @@ use crate::{
 };
 
 use crate::mm::kernel_mapper::KernelMapper;
-use crate::mm::page::{EntryFlags, PageEntry, PAGE_1G_SHIFT};
+use crate::mm::page::{EntryFlags, PAGE_1G_SHIFT, PageEntry};
 use crate::mm::{MemoryManagementArch, PageTableKind, PhysAddr, VirtAddr, VmFlags};
 
 use system_error::SystemError;
@@ -36,7 +36,7 @@ use system_error::SystemError;
 use core::arch::asm;
 use core::fmt::Debug;
 
-use core::sync::atomic::{compiler_fence, AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, Ordering, compiler_fence};
 
 pub type PageMapper =
     crate::mm::page::PageMapper<crate::arch::x86_64::mm::X86_64MMArch, LockedFrameAllocator>;
@@ -391,7 +391,7 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 防止内核错误地写入只读页面
     fn enable_kernel_wp() {
         unsafe {
-            use x86::controlregs::{cr0, cr0_write, Cr0};
+            use x86::controlregs::{Cr0, cr0, cr0_write};
             let mut cr0_val = cr0();
             cr0_val.insert(Cr0::CR0_WRITE_PROTECT);
             cr0_write(cr0_val);
@@ -402,7 +402,7 @@ impl MemoryManagementArch for X86_64MMArch {
     /// 禁用 内核态的 Write Protect
     fn disable_kernel_wp() {
         unsafe {
-            use x86::controlregs::{cr0, cr0_write, Cr0};
+            use x86::controlregs::{Cr0, cr0, cr0_write};
             let mut cr0_val = cr0();
             cr0_val.remove(Cr0::CR0_WRITE_PROTECT);
             cr0_write(cr0_val);
@@ -723,10 +723,12 @@ pub fn test_buddy() {
             assert!(allocated_frame_count.data().is_power_of_two());
             assert!(paddr.data() % MMArch::PAGE_SIZE == 0);
             unsafe {
-                assert!(MMArch::phys_2_virt(paddr)
-                    .as_ref()
-                    .unwrap()
-                    .check_aligned(allocated_frame_count.data() * MMArch::PAGE_SIZE));
+                assert!(
+                    MMArch::phys_2_virt(paddr)
+                        .as_ref()
+                        .unwrap()
+                        .check_aligned(allocated_frame_count.data() * MMArch::PAGE_SIZE)
+                );
             }
             allocated += allocated_frame_count.data() * MMArch::PAGE_SIZE;
             v.push((paddr, allocated_frame_count));
@@ -797,8 +799,19 @@ impl LockedFrameAllocator {
 impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         count = count.next_power_of_two();
-        if let Some(frame) = unsafe { Self::allocate_inner(count) } {
-            return Some(frame);
+        if let Some((addr, actual)) = unsafe { Self::allocate_inner(count) } {
+            // memcg charge after the raw allocation, outside the inner
+            // allocator lock. On refusal the frames are returned below
+            // without recorded ownership, so the free path performs no
+            // uncharge — refused charges never touch any CSS counter.
+            if crate::mm::memcg::memcg_alloc_charge(addr, actual.data() as u64).is_ok() {
+                return Some((addr, actual));
+            }
+            unsafe {
+                if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+                    allocator.free(addr, actual);
+                }
+            }
         }
 
         retry_oom_victim_page_frame_alloc(|| unsafe { Self::allocate_inner(count) })
@@ -810,15 +823,28 @@ impl FrameAllocator for LockedFrameAllocator {
         max_phys_addr: PhysAddr,
     ) -> Option<(PhysAddr, PageFrameCount)> {
         count = count.next_power_of_two();
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
+        let allocation = if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
             allocator.buddy_alloc_below(count, max_phys_addr)
         } else {
             None
+        };
+        let (addr, actual) = allocation?;
+        if crate::mm::memcg::memcg_alloc_charge(addr, actual.data() as u64).is_err() {
+            unsafe {
+                if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+                    allocator.free(addr, actual);
+                }
+            }
+            return None;
         }
+        Some((addr, actual))
     }
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {
         assert!(count.data().is_power_of_two());
+        // Uncharge the CSS that owns these frames (if any) before they
+        // return to the buddy allocator.
+        crate::mm::memcg::memcg_free_uncharge(address, count.data() as u64);
         if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
             return allocator.free(address, count);
         }

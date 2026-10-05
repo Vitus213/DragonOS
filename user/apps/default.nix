@@ -45,23 +45,33 @@ let
         crossSystem = lib.systems.examples.riscv64-musl;
         isStatic = true;
       }
+    else if target == "x86_64" then
+      import nixpkgs {
+        localSystem = system;
+        crossSystem = "x86_64-unknown-linux-musl";
+        isStatic = true;
+      }
     else
       abort "Unsupported static target: ${target}";
 
-  gvisor-syscall-tests = (
-    pkgs.callPackage ./tests/syscall/gvisor {
-      inherit fenix system;
-      installDir = testOpt.syscall.testDir;
-      version = testOpt.syscall.version;
-    }
-  );
+  gvisor-syscall-tests =
+    if system == "aarch64-darwin" then
+      null
+    else
+      pkgs.callPackage ./tests/syscall/gvisor {
+        inherit fenix system;
+        installDir = testOpt.syscall.testDir;
+        version = testOpt.syscall.version;
+      };
 
-  dunitest = (
-    pkgs.callPackage ./tests/dunitest {
-      inherit fenix system;
-      installDir = testOpt.dunitest.testDir;
-    }
-  );
+  dunitest =
+    if system == "aarch64-darwin" then
+      null
+    else
+      pkgs.callPackage ./tests/dunitest {
+        inherit fenix system;
+        installDir = testOpt.dunitest.testDir;
+      };
 in
 [
 	  (static.busybox.override {
@@ -81,11 +91,9 @@ in
   (static.callPackage ./c_unitest { inherit target; })
 
 ]
-++ lib.optionals (target == "x86_64" && testOpt.syscall.enable) [
-  # gvisor test case only included on x86_64
-  gvisor-syscall-tests
-  # TODO: Add debian libcxx deps or FHS
-]
-++ lib.optionals (target == "x86_64" && testOpt.dunitest.enable) [
-  dunitest
-]
+ ++ lib.optionals (system != "aarch64-darwin" && target == "x86_64" && testOpt.syscall.enable) [
+   gvisor-syscall-tests
+ ]
+ ++ lib.optionals (system != "aarch64-darwin" && target == "x86_64" && testOpt.dunitest.enable) [
+   dunitest
+ ]

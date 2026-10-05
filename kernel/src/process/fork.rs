@@ -902,12 +902,17 @@ impl ProcessManager {
             let src_node = pcb.task_cgroup_node();
             let guard = cgroup_accounting_lock().lock();
             cgroup_can_fork_in(&charge_node, 1)?;
+            for id in crate::cgroup::subsys::CgroupSubsysId::all() {
+                if let Some(css) = charge_node.css(*id) {
+                    css.can_fork(&pcb)?;
+                }
+            }
             if let Some(target_node) = clone_into_cgroup_target {
                 cgroup_migrate_vet_dst_with_src(&src_node, &target_node, 1)?;
                 pcb.set_task_cgroup_node_for_fork(target_node);
             }
             let cgroup = pcb.task_cgroup_node();
-            cgroup.charge_pids(1);
+            cgroup.charge_pids(1)?;
             drop(guard);
             Some(cgroup)
         } else {
@@ -1213,6 +1218,11 @@ impl ProcessManager {
 
         if let Some(cgroup) = published_cgroup {
             cgroup.add_task(pcb.raw_pid());
+            for id in crate::cgroup::subsys::CgroupSubsysId::all() {
+                if let Some(css) = cgroup.css(*id) {
+                    css.fork(&pcb);
+                }
+            }
             pcb.mark_visible_thread_accounted();
             inc_visible_thread_count();
             account_successful_fork();

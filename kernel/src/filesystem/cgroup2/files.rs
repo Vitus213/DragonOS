@@ -40,6 +40,12 @@ pub(super) enum CgroupCoreFile {
     PidsCurrent,
     PidsMax,
     PidsEvents,
+    CpusetCpus,
+    CpusetCpusEffective,
+    CpusetMems,
+    IoMax,
+    IoWeight,
+    IoStat,
 }
 
 #[derive(Clone, Copy)]
@@ -109,7 +115,7 @@ const NON_ROOT_CORE_FILE_SPECS: [CgroupFileSpec; 3] = [
         name: "cgroup.type",
         ty: CgroupCoreFile::Type,
         init: b"domain\n",
-        mode: 0o444,
+        mode: 0o644,
         visibility: CgroupFileVisibility::NotOnRoot,
     },
     CgroupFileSpec {
@@ -255,6 +261,53 @@ const PIDS_FILE_SPECS: [CgroupFileSpec; 3] = [
         visibility: CgroupFileVisibility::NotOnRoot,
     },
 ];
+const CPUSET_FILE_SPECS: [CgroupFileSpec; 3] = [
+    CgroupFileSpec {
+        name: "cpuset.cpus",
+        ty: CgroupCoreFile::CpusetCpus,
+        init: b"",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "cpuset.cpus.effective",
+        ty: CgroupCoreFile::CpusetCpusEffective,
+        init: b"",
+        mode: 0o444,
+        visibility: CgroupFileVisibility::All,
+    },
+    CgroupFileSpec {
+        name: "cpuset.mems",
+        ty: CgroupCoreFile::CpusetMems,
+        init: b"",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+];
+const IO_FILE_SPECS: [CgroupFileSpec; 3] = [
+    CgroupFileSpec {
+        name: "io.max",
+        ty: CgroupCoreFile::IoMax,
+        init: b"",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "io.weight",
+        ty: CgroupCoreFile::IoWeight,
+        init: b"default 100\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
+    },
+    CgroupFileSpec {
+        name: "io.stat",
+        ty: CgroupCoreFile::IoStat,
+        init: b"",
+        mode: 0o444,
+        visibility: CgroupFileVisibility::All,
+    },
+];
+
 
 pub(super) fn desired_file_specs(cgroup: &Arc<CgroupNode>) -> Vec<CgroupFileSpec> {
     let mut specs = Vec::new();
@@ -286,6 +339,8 @@ fn controller_specs(name: &str) -> &'static [CgroupFileSpec] {
         "cpu" => &CPU_FILE_SPECS,
         "memory" => &MEMORY_FILE_SPECS,
         "pids" => &PIDS_FILE_SPECS,
+        "cpuset" => &CPUSET_FILE_SPECS,
+        "io" => &IO_FILE_SPECS,
         _ => &[],
     }
 }
@@ -328,33 +383,91 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         }
         CgroupCoreFile::Events => {
             let populated = if is_populated(cgroup) { 1 } else { 0 };
-            format!("populated {}\nfrozen 0\n", populated).into_bytes()
+            let frozen = if cgroup.is_frozen() { 1 } else { 0 };
+            format!("populated {}\nfrozen {}\n", populated, frozen).into_bytes()
         }
-        CgroupCoreFile::Type => b"domain\n".to_vec(),
+        CgroupCoreFile::Type => format!("{}\n", cgroup.cgroup_type_name()).into_bytes(),
         CgroupCoreFile::Freeze => {
             format!("{}\n", if cgroup.freeze_requested() { 1 } else { 0 }).into_bytes()
         }
-        CgroupCoreFile::CpuStat => cpu_stat(),
-        CgroupCoreFile::CpuWeight => format!("{}\n", cgroup.cpu_state().weight()).into_bytes(),
-        CgroupCoreFile::CpuMax => {
-            let (quota, period) = cgroup.cpu_state().max();
+        CgroupCoreFile::CpuStat => cpu_stat_for(cgroup),
+        CgroupCoreFile::CpuWeight => cpu_bytes(cgroup, |cpu| {
+            format!("{}\n", cpu.shares()).into_bytes()
+        }),
+        CgroupCoreFile::CpuMax => cpu_bytes(cgroup, |cpu| {
+            let (quota, period) = cpu.bandwidth();
             encode_cpu_max(quota, period)
+        }),
+        CgroupCoreFile::MemoryCurrent => memory_bytes(cgroup, |memory| {
+            format!("{}\n", memory.current()).into_bytes()
+        }),
+        CgroupCoreFile::MemoryPeak => memory_bytes(cgroup, |memory| {
+            format!("{}\n", memory.peak()).into_bytes()
+        }),
+        CgroupCoreFile::MemoryMin => memory_bytes(cgroup, |memory| encode_max_u64(memory.min())),
+        CgroupCoreFile::MemoryLow => memory_bytes(cgroup, |memory| encode_max_u64(memory.low())),
+        CgroupCoreFile::MemoryHigh => memory_bytes(cgroup, |memory| encode_max_u64(memory.high())),
+        CgroupCoreFile::MemoryMax => memory_bytes(cgroup, |memory| encode_max_u64(memory.max())),
+        CgroupCoreFile::MemoryEvents => memory_bytes(cgroup, |memory| memory.events().into_bytes()),
+        CgroupCoreFile::MemoryStat => memory_bytes(cgroup, |memory| memory.stat().into_bytes()),
+        CgroupCoreFile::MemorySwapCurrent => memory_bytes(cgroup, |memory| {
+            format!("{}\n", memory.swap_current()).into_bytes()
+        }),
+        CgroupCoreFile::MemorySwapPeak => memory_bytes(cgroup, |memory| {
+            format!("{}\n", memory.swap_peak()).into_bytes()
+        }),
+        CgroupCoreFile::MemorySwapHigh => {
+            memory_bytes(cgroup, |memory| encode_max_u64(memory.swap_high()))
         }
-        CgroupCoreFile::MemoryCurrent | CgroupCoreFile::MemoryPeak => b"0\n".to_vec(),
-        CgroupCoreFile::MemoryMin => encode_max_u64(cgroup.memory_state().min()),
-        CgroupCoreFile::MemoryLow => encode_max_u64(cgroup.memory_state().low()),
-        CgroupCoreFile::MemoryHigh => encode_max_u64(cgroup.memory_state().high()),
-        CgroupCoreFile::MemoryMax => encode_max_u64(cgroup.memory_state().max()),
-        CgroupCoreFile::MemoryEvents => memory_events(),
-        CgroupCoreFile::MemoryStat => memory_stat(),
-        CgroupCoreFile::MemorySwapCurrent | CgroupCoreFile::MemorySwapPeak => b"0\n".to_vec(),
-        CgroupCoreFile::MemorySwapHigh => encode_max_u64(cgroup.memory_state().swap_high()),
-        CgroupCoreFile::MemorySwapMax => encode_max_u64(cgroup.memory_state().swap_max()),
+        CgroupCoreFile::MemorySwapMax => {
+            memory_bytes(cgroup, |memory| encode_max_u64(memory.swap_max()))
+        }
         CgroupCoreFile::MemorySwapEvents => memory_swap_events(),
         CgroupCoreFile::PidsCurrent => format!("{}\n", cgroup.pids_current_count()).into_bytes(),
         CgroupCoreFile::PidsMax => encode_pids_max(cgroup.pids_max()),
         CgroupCoreFile::PidsEvents => format!("max {}\n", cgroup.pids_events_max()).into_bytes(),
+        CgroupCoreFile::CpusetCpus | CgroupCoreFile::CpusetCpusEffective | CgroupCoreFile::CpusetMems => {
+            let css = cgroup.css(crate::cgroup::subsys::CgroupSubsysId::Cpuset);
+            let Some(css) = css else { return b"\n".to_vec(); };
+            let Some(cpuset) = css.as_any().downcast_ref::<crate::cgroup::controllers::cpuset::CpusetCss>() else {
+                return b"\n".to_vec();
+            };
+            match ty {
+                CgroupCoreFile::CpusetCpus => {
+                    format!("{}\n", cpuset.configured_cpus_string()).into_bytes()
+                }
+                CgroupCoreFile::CpusetCpusEffective => {
+                    format!("{}\n", cpuset.cpus_string()).into_bytes()
+                }
+                CgroupCoreFile::CpusetMems => format!("{}\n", cpuset.mems_string()).into_bytes(),
+                _ => unreachable!(),
+            }
+        }
+        CgroupCoreFile::IoMax | CgroupCoreFile::IoWeight | CgroupCoreFile::IoStat => {
+            let Some(css) = cgroup.css(crate::cgroup::subsys::CgroupSubsysId::Io) else {
+                return b"\n".to_vec();
+            };
+            let Some(io) = css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::io::IoCss>()
+            else {
+                return b"\n".to_vec();
+            };
+            match ty {
+                CgroupCoreFile::IoMax => io.max_string().into_bytes(),
+                CgroupCoreFile::IoWeight => io.weight_string().into_bytes(),
+                CgroupCoreFile::IoStat => io.stat_string().into_bytes(),
+                _ => unreachable!(),
+            }
+        }
     }
+}
+pub(super) fn write_type_file(
+    cgroup: &Arc<CgroupNode>,
+    input: &str,
+) -> Result<Vec<u8>, SystemError> {
+    cgroup.set_cgroup_type(input)?;
+    Ok(format!("{}\n", cgroup.cgroup_type_name()).into_bytes())
 }
 
 pub(super) fn write_controller_file(
@@ -382,13 +495,13 @@ pub(super) fn write_controller_file(
             if !(1..=10_000).contains(&weight) {
                 return Err(SystemError::ERANGE);
             }
-            cgroup.set_cpu_weight(weight);
+            cgroup.set_cpu_weight(weight)?;
             Ok(format!("{}\n", weight).into_bytes())
         }
         CgroupCoreFile::CpuMax => {
-            let (_, current_period) = cgroup.cpu_state().max();
+            let (_, current_period) = cgroup.cpu_bandwidth();
             let (quota, period) = parse_cpu_max(input, current_period)?;
-            cgroup.set_cpu_max(quota, period);
+            cgroup.set_cpu_max(quota, period)?;
             Ok(encode_cpu_max(quota, period))
         }
         CgroupCoreFile::MemoryMin
@@ -399,20 +512,50 @@ pub(super) fn write_controller_file(
         | CgroupCoreFile::MemorySwapMax => {
             let value = parse_max_u64(input)?;
             match ty {
-                CgroupCoreFile::MemoryMin => cgroup.set_memory_min(value),
-                CgroupCoreFile::MemoryLow => cgroup.set_memory_low(value),
-                CgroupCoreFile::MemoryHigh => cgroup.set_memory_high(value),
-                CgroupCoreFile::MemoryMax => cgroup.set_memory_max(value),
-                CgroupCoreFile::MemorySwapHigh => cgroup.set_memory_swap_high(value),
-                CgroupCoreFile::MemorySwapMax => cgroup.set_memory_swap_max(value),
+                CgroupCoreFile::MemoryMin => cgroup.set_memory_min(value)?,
+                CgroupCoreFile::MemoryLow => cgroup.set_memory_low(value)?,
+                CgroupCoreFile::MemoryHigh => cgroup.set_memory_high(value)?,
+                CgroupCoreFile::MemoryMax => cgroup.set_memory_max(value)?,
+                CgroupCoreFile::MemorySwapHigh => cgroup.set_memory_swap_high(value)?,
+                CgroupCoreFile::MemorySwapMax => cgroup.set_memory_swap_max(value)?,
                 _ => unreachable!(),
             }
             Ok(encode_max_u64(value))
         }
         CgroupCoreFile::PidsMax => {
             let new_limit = parse_pids_max(input)?;
-            cgroup.set_pids_max(new_limit);
+            cgroup.set_pids_max(new_limit)?;
             Ok(encode_pids_max(new_limit))
+        }
+        CgroupCoreFile::IoMax | CgroupCoreFile::IoWeight => {
+            let css = cgroup
+                .css(crate::cgroup::subsys::CgroupSubsysId::Io)
+                .ok_or(SystemError::ENOENT)?;
+            let io = css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::io::IoCss>()
+                .ok_or(SystemError::EINVAL)?;
+            match ty {
+                CgroupCoreFile::IoMax => io.write_max(input)?,
+                CgroupCoreFile::IoWeight => io.write_weight(input)?,
+                _ => unreachable!(),
+            }
+            let output = match ty {
+                CgroupCoreFile::IoMax => io.max_string(),
+                CgroupCoreFile::IoWeight => io.weight_string(),
+                _ => unreachable!(),
+            };
+            Ok(output.into_bytes())
+        }
+        CgroupCoreFile::CpusetCpus | CgroupCoreFile::CpusetMems => {
+            let css = cgroup.css(crate::cgroup::subsys::CgroupSubsysId::Cpuset).ok_or(SystemError::ENOENT)?;
+            let cpuset = css.as_any().downcast_ref::<crate::cgroup::controllers::cpuset::CpusetCss>().ok_or(SystemError::EINVAL)?;
+            match ty {
+                CgroupCoreFile::CpusetCpus => cpuset.set_cpus(input)?,
+                CgroupCoreFile::CpusetMems => cpuset.set_mems(input)?,
+                _ => unreachable!(),
+            }
+            Ok(input.trim().as_bytes().to_vec())
         }
         CgroupCoreFile::Controllers
         | CgroupCoreFile::Events
@@ -426,7 +569,9 @@ pub(super) fn write_controller_file(
         | CgroupCoreFile::MemorySwapPeak
         | CgroupCoreFile::MemorySwapEvents
         | CgroupCoreFile::PidsCurrent
-        | CgroupCoreFile::PidsEvents => Err(SystemError::EPERM),
+        | CgroupCoreFile::PidsEvents
+        | CgroupCoreFile::CpusetCpusEffective
+        | CgroupCoreFile::IoStat => Err(SystemError::EPERM),
         CgroupCoreFile::Procs | CgroupCoreFile::SubtreeControl => Err(SystemError::EINVAL),
     }
 }
@@ -466,7 +611,17 @@ fn validate_enable_controller(cgroup: &Arc<CgroupNode>, name: &str) -> Result<()
     if !available.contains(&name) {
         return Err(SystemError::ENOENT);
     }
-
+    if DOMAIN_CONTROLLERS.contains(&name)
+        && (cgroup.in_threaded_subtree()
+            || matches!(
+                cgroup.cgroup_type(),
+                crate::cgroup::core::CgroupType::Threaded | crate::cgroup::core::CgroupType::DomainThreaded
+            ))
+    {
+        // Linux cgroup_vet_subtree_control_enable()：thread root
+        // （DomainThreaded）同样禁止启用域控制器。
+        return Err(SystemError::EBUSY);
+    }
     if DOMAIN_CONTROLLERS.contains(&name) && cgroup.parent().is_some() && cgroup.has_tasks() {
         return Err(SystemError::EBUSY);
     }
@@ -577,22 +732,54 @@ fn parse_cpu_max(input: &str, current_period_us: u64) -> Result<(Option<u64>, u6
     Ok((quota, period))
 }
 
-fn cpu_stat() -> Vec<u8> {
-    // P1 exposes Linux-compatible cgroup v2 files, but CPU accounting
-    // and bandwidth enforcement are not wired to the scheduler yet.
-    b"usage_usec 0\nuser_usec 0\nsystem_usec 0\nnr_periods 0\nnr_throttled 0\nthrottled_usec 0\n"
-        .to_vec()
+fn cpu_bytes(
+    cgroup: &Arc<CgroupNode>,
+    f: impl FnOnce(&crate::cgroup::controllers::cpu::CpuCss) -> Vec<u8>,
+) -> Vec<u8> {
+    let Some(css) = cgroup.css(crate::cgroup::subsys::CgroupSubsysId::Cpu) else {
+        return b"0\n".to_vec();
+    };
+    let Some(cpu) = css
+        .as_any()
+        .downcast_ref::<crate::cgroup::controllers::cpu::CpuCss>()
+    else {
+        return b"0\n".to_vec();
+    };
+    f(cpu)
 }
 
-fn memory_events() -> Vec<u8> {
-    b"low 0\nhigh 0\nmax 0\noom 0\noom_kill 0\noom_group_kill 0\n".to_vec()
+fn cpu_stat_for(cgroup: &Arc<CgroupNode>) -> Vec<u8> {
+    cpu_bytes(cgroup, |cpu| {
+        let stats = cpu.stats();
+        let user = stats.utime / 1000;
+        let system = stats.stime / 1000;
+        format!(
+            "usage_usec {}\nuser_usec {}\nsystem_usec {}\nnr_periods {}\nnr_throttled {}\nthrottled_usec {}\n",
+            user + system,
+            user,
+            system,
+            stats.nr_periods,
+            stats.nr_throttled,
+            stats.throttled_time / 1000,
+        )
+        .into_bytes()
+    })
 }
 
-fn memory_stat() -> Vec<u8> {
-    // P1 keeps memory controller knobs as compat state only. The keys
-    // mirror common Linux v2 memory.stat names while all counters stay 0.
-    b"anon 0\nfile 0\nkernel_stack 0\npagetables 0\npercpu 0\nsock 0\nshmem 0\nfile_mapped 0\nfile_dirty 0\nfile_writeback 0\nswapcached 0\nanon_thp 0\nfile_thp 0\nshmem_thp 0\ninactive_anon 0\nactive_anon 0\ninactive_file 0\nactive_file 0\nunevictable 0\nslab_reclaimable 0\nslab_unreclaimable 0\nslab 0\nworkingset_refault_anon 0\nworkingset_refault_file 0\nworkingset_activate_anon 0\nworkingset_activate_file 0\nworkingset_restore_anon 0\nworkingset_restore_file 0\nworkingset_nodereclaim 0\npgfault 0\npgmajfault 0\npgrefill 0\npgscan 0\npgsteal 0\npgactivate 0\npgdeactivate 0\npglazyfree 0\npglazyfreed 0\nthp_fault_alloc 0\nthp_collapse_alloc 0\n"
-        .to_vec()
+fn memory_bytes(
+    cgroup: &Arc<CgroupNode>,
+    f: impl FnOnce(&crate::cgroup::controllers::memory::MemoryCss) -> Vec<u8>,
+) -> Vec<u8> {
+    let Some(css) = cgroup.css(crate::cgroup::subsys::CgroupSubsysId::Memory) else {
+        return b"0\n".to_vec();
+    };
+    let Some(memory) = css
+        .as_any()
+        .downcast_ref::<crate::cgroup::controllers::memory::MemoryCss>()
+    else {
+        return b"0\n".to_vec();
+    };
+    f(memory)
 }
 
 fn memory_swap_events() -> Vec<u8> {

@@ -4,11 +4,11 @@ use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
-    arch::{ipc::signal::Signal, mm::LockedFrameAllocator, MMArch},
+    arch::{MMArch, ipc::signal::Signal, mm::LockedFrameAllocator},
     ipc::signal_types::{SigCode, SigInfo, SigType},
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
-    mm::{allocator::page_frame::FrameAllocator, MemoryManagementArch},
-    process::{pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
+    mm::{MemoryManagementArch, allocator::page_frame::FrameAllocator},
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager, RawPid, pid::PidType},
 };
 
 use super::ucontext::AddressSpace;
@@ -229,7 +229,13 @@ fn kill_targets_for_mm(mm: &Arc<AddressSpace>) -> Vec<Arc<ProcessControlBlock>> 
 }
 
 fn select_victim() -> Option<OomCandidate> {
-    let pids = ProcessManager::get_all_processes();
+    select_victim_from(ProcessManager::get_all_processes())
+}
+
+/// Select the highest-scored candidate among `pids`.  Used both for the
+/// global OOM (all processes) and for cgroup-scoped OOM
+/// (`memory.max`), whose victims must come from the offending subtree.
+fn select_victim_from(pids: Vec<RawPid>) -> Option<OomCandidate> {
     let total_pages = total_system_pages();
     let mut seen_tgids = Vec::new();
     let mut best: Option<OomCandidate> = None;
@@ -420,7 +426,13 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
     )
 }
 
-pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
+/// Shared body of the OOM state machine: single-flight victim selection,
+/// SIGKILL delivery (including group members sharing the victim mm),
+/// inflight-victim tracking and killable recovery waits.
+fn out_of_memory_loop(
+    ctx: OomContext,
+    select: &mut dyn FnMut() -> Option<OomCandidate>,
+) -> OomOutcome {
     loop {
         if current_is_killed_or_exiting() {
             return OomOutcome::CurrentTaskKilled;
@@ -434,7 +446,7 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
             }
         };
 
-        let Some(candidate) = select_victim() else {
+        let Some(candidate) = select() else {
             finish_selection_none();
             error!(
                 "oom: no victim for trigger pid={} tgid={} addr={:#x} ip={:#x}",
@@ -478,11 +490,11 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
                 }
                 match wait_until_recoverable(generation) {
                     Ok(()) if current_is_killed_or_exiting() => {
-                        return OomOutcome::CurrentTaskKilled
+                        return OomOutcome::CurrentTaskKilled;
                     }
                     Ok(()) => return OomOutcome::Retry,
                     Err(_) if current_is_killed_or_exiting() => {
-                        return OomOutcome::CurrentTaskKilled
+                        return OomOutcome::CurrentTaskKilled;
                     }
                     Err(_) => return OomOutcome::Retry,
                 }
@@ -499,6 +511,26 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
             }
         }
     }
+}
+
+/// Global (system-wide) OOM entry from the page-fault path.
+pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
+    // A pending cgroup-scoped refusal (memory.max) takes precedence over a
+    // global kill: victims inside the offending cgroup relieve the charge
+    // without touching unrelated tasks.
+    if let Some(outcome) = super::memcg::drain_pending_memcg_oom(ctx) {
+        return outcome;
+    }
+    out_of_memory_loop(ctx, &mut select_victim)
+}
+
+/// Cgroup-scoped OOM (`memory.max`): victim selection is restricted to
+/// `candidate_pids` (the subtree of the CSS whose limit was exceeded);
+/// selection, kill and recovery still run through the shared state
+/// machine, so memcg and global OOM exclude each other and share the
+/// inflight-victim bookkeeping.
+pub fn scoped_out_of_memory(ctx: OomContext, candidate_pids: Vec<RawPid>) -> OomOutcome {
+    out_of_memory_loop(ctx, &mut || select_victim_from(candidate_pids.clone()))
 }
 
 pub fn notify_mm_drop(mm_id: u64) {

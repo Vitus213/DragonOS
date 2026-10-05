@@ -46,22 +46,26 @@ check_dependencies()
       fi
     fi
 
-    # Check if brctl is installed
-    if [ -z "$(which brctl)" ]; then
-        echo "Please install bridge-utils first!"
-        exit 1
-    fi
+    # tap/bridge 网络相关依赖仅在 Linux 上需要；nographic/user-netty 路径在 macOS
+    # （Darwin）上不会用到 brctl/dnsmasq/iptables。
+    if [ "$(uname)" != "Darwin" ]; then
+        # Check if brctl is installed
+        if [ -z "$(which brctl)" ]; then
+            echo "Please install bridge-utils first!"
+            exit 1
+        fi
 
-    # Check if dnsmasq is installed
-    if [ -z "$(which dnsmasq)" ]; then
-        echo "Please install dnsmasq first!"
-        exit 1
-    fi
+        # Check if dnsmasq is installed
+        if [ -z "$(which dnsmasq)" ]; then
+            echo "Please install dnsmasq first!"
+            exit 1
+        fi
 
-    # Check if iptable is installed
-    if [ -z "$(which iptables)" ]; then
-        echo "Please install iptables first!"
-        exit 1
+        # Check if iptable is installed
+        if [ -z "$(which iptables)" ]; then
+            echo "Please install iptables first!"
+            exit 1
+        fi
     fi
 
 }
@@ -91,7 +95,13 @@ qemu_trace_usb=trace:usb_xhci_reset,trace:usb_xhci_run,trace:usb_xhci_stop,trace
 if [ ${ARCH} == "i386" ] || [ ${ARCH} == "x86_64" ]; then
   qemu_accel="kvm"
   if [ $(uname) == Darwin ]; then
-    qemu_accel=hvf
+    # Apple Silicon 的 hvf 只能虚拟化 arm64 guest，无法运行 x86_64；
+    # 只有 Intel Mac 才能用 hvf，其余一律回退 TCG。
+    if [ $(uname -m) == arm64 ]; then
+      qemu_accel=tcg
+    else
+      qemu_accel=hvf
+    fi
   else
     # 判断系统kvm模块是否加载
     if [ ! -e /dev/kvm ]; then
@@ -956,10 +966,17 @@ PY
         return 1
       fi
     fi
-    printf '[QEMU] 执行: sudo ' >&2
-    printf '%q ' "${cmd[@]}" >&2
-    printf '\n' >&2
-    sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "${VMSTATE_DIR}/pid" "${cmd[@]}"
+    # QEMU 在 Linux 上沿用 sudo（vhost/kvm 等设备需要 root）；macOS（Darwin）上
+    # brew 安装的 QEMU 以用户权限运行即可，nographic 路径无需提权，避免卡在密码提示。
+    if [ "$(uname)" == "Darwin" ]; then
+      printf '[QEMU] 执行: ' >&2
+      bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "${VMSTATE_DIR}/pid" "${cmd[@]}"
+    else
+      printf '[QEMU] 执行: sudo ' >&2
+      printf '%q ' "${cmd[@]}" >&2
+      printf '\n' >&2
+      sudo bash -c 'pidfile="$1"; shift; echo $$ > "$pidfile"; exec "$@"' bash "${VMSTATE_DIR}/pid" "${cmd[@]}"
+    fi
   }
 
   if [ ${BIOS_TYPE} == uefi ] ;then

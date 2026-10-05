@@ -161,20 +161,63 @@ let
     # 重置 trap
     trap 'chmod +w -R "$TEMP_DIR" 2>/dev/null && rm -rf "$TEMP_DIR"; [ -n "$EXTRACT_DIR" ] && chmod +w -R "$EXTRACT_DIR" 2>/dev/null && rm -rf "$EXTRACT_DIR"' EXIT
   '';
+  # Darwin 没有 Linux loop/parted/guestfish；使用原生 e2fsprogs + Python 写入 MBR。
+  darwinWrite = ''
+    echo "  Using native Darwin ext4 image writer..."
+    EXTRACT_DIR=$(mktemp -d)
+    PART_IMG="${diskPath}.partition.tmp"
+    trap 'chmod -R u+rwX "$TEMP_DIR" "$EXTRACT_DIR" 2>/dev/null || true; rm -rf "$TEMP_DIR" "$EXTRACT_DIR" "$PART_IMG" "$TEMP_IMG"' EXIT
+    tar --delay-directory-restore --no-same-owner --no-same-permissions -xf "$FINAL_TAR" -C "$EXTRACT_DIR"
 
-  # 构建脚本 - 在bin/目录下构建
-  buildScript = pkgs.writeShellApplication {
-    name = "dragonos-rootfs";
-    runtimeInputs = [
+    TAR_SIZE_BYTES=$(wc -c < "$FINAL_TAR")
+    PART_START_SECTORS=2048
+    PART_SIZE_SECTORS=$(( (TAR_SIZE_BYTES + 1024 * 1024 * 1024 + 511) / 512 ))
+    DISK_SIZE_SECTORS=$(( PART_START_SECTORS + PART_SIZE_SECTORS ))
+    truncate -s "$((PART_SIZE_SECTORS * 512))" "$PART_IMG"
+    mke2fs -q -t ext4 -F -d "$EXTRACT_DIR" "$PART_IMG"
+    truncate -s "$((DISK_SIZE_SECTORS * 512))" "$TEMP_IMG"
+
+    python3 - "$TEMP_IMG" "$PART_START_SECTORS" "$PART_SIZE_SECTORS" <<'PY'
+import struct
+import sys
+
+image, start, size = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+mbr = bytearray(512)
+entry = 446
+mbr[entry] = 0x80
+mbr[entry + 1:entry + 4] = b"\xfe\xff\xff"
+mbr[entry + 4] = 0x83
+mbr[entry + 5:entry + 8] = b"\xfe\xff\xff"
+mbr[entry + 8:entry + 12] = struct.pack("<I", start)
+mbr[entry + 12:entry + 16] = struct.pack("<I", size)
+mbr[510:512] = b"\x55\xaa"
+with open(image, "r+b") as f:
+    f.write(mbr)
+PY
+    dd if="$PART_IMG" of="$TEMP_IMG" bs=512 seek="$PART_START_SECTORS" conv=notrunc
+    rm -f "$PART_IMG"
+  '';
+
+  runtimeInputs =
+    [
       pkgs.coreutils
       pkgs.gnutar
-      pkgs.libguestfs-with-appliance
       pkgs.findutils
+      pkgs.e2fsprogs
+    ]
+    ++ lib.optionals (system != "aarch64-darwin") [
+      pkgs.libguestfs-with-appliance
       pkgs.parted
       pkgs.dosfstools
-      pkgs.e2fsprogs
       pkgs.util-linux
+    ]
+    ++ lib.optionals (system == "aarch64-darwin") [
+      pkgs.python3
     ];
+
+  buildScript = pkgs.writeShellApplication {
+    name = "dragonos-rootfs";
+    inherit runtimeInputs;
     text = ''
       set -euo pipefail
 
@@ -218,17 +261,17 @@ let
       echo "  Creating disk image..."
       TEMP_IMG="${diskPath}.tmp"
 
-      # 计算所需磁盘大小：tar包大小 + 1G 缓冲空间
-      TAR_SIZE_KB=$(du -k "$FINAL_TAR" | cut -f1)
-      DISK_SIZE_KB=$(( TAR_SIZE_KB + 1024 * 1024 ))
-      truncate -s "''${DISK_SIZE_KB}K" "$TEMP_IMG"
-
-      # 检查是否使用非特权构建模式（guestfish）
-      if [ "''${DRAGONOS_UNPRIVILEGED_BUILD:-0}" = "1" ]; then
-        ${guestfishWrite}
-      else
-        ${loopWrite}
-      fi
+      ${lib.optionalString (system == "aarch64-darwin") darwinWrite}
+      ${lib.optionalString (system != "aarch64-darwin") ''
+        TAR_SIZE_KB=$(du -k "$FINAL_TAR" | cut -f1)
+        DISK_SIZE_KB=$(( TAR_SIZE_KB + 1024 * 1024 ))
+        truncate -s "''${DISK_SIZE_KB}K" "$TEMP_IMG"
+        if [ "''${DRAGONOS_UNPRIVILEGED_BUILD:-0}" = "1" ]; then
+          ${guestfishWrite}
+        else
+          ${loopWrite}
+        fi
+      ''}
 
       mv -f "$TEMP_IMG" "${diskPath}"
 

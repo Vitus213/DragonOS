@@ -62,6 +62,11 @@ impl Syscall for SysSchedSetaffinity {
         }
 
         mask.bitand_assign(&smp_cpu_manager().online_cpus());
+        let cpuset_mask = crate::sched::cpuset_cpus_allowed(&target_pcb, &mask);
+        if cpuset_mask.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+        mask = cpuset_mask;
 
         if mask.is_empty() {
             return Err(SystemError::EINVAL);

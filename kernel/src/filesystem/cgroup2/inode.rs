@@ -458,6 +458,12 @@ impl Cgroup2Inode {
         match ty {
             CgroupCoreFile::Procs => Self::write_procs(this, &cgroup, buf),
             CgroupCoreFile::SubtreeControl => Self::write_subtree_control(this, &cgroup, buf),
+            CgroupCoreFile::Type => {
+                let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
+                let new_data = files::write_type_file(&cgroup, input)?;
+                Self::replace_file_data(this, &new_data)?;
+                Ok(buf.len())
+            }
             _ => {
                 let input = core::str::from_utf8(buf).map_err(|_| SystemError::EINVAL)?;
                 let new_data = files::write_controller_file(&cgroup, ty, input)?;
@@ -530,9 +536,19 @@ impl Cgroup2Inode {
 
         let _cgroup_guard = cgroup_accounting_lock().lock();
         cgroup_migrate_vet_dst_with_src(&src, cgroup, moved_tasks)?;
+        for id in crate::cgroup::subsys::CgroupSubsysId::all() {
+            if let Some(css) = cgroup.css(*id) {
+                css.can_attach(&to_move)?;
+            }
+        }
 
-        for t in to_move {
-            t.set_task_cgroup_node(cgroup.clone());
+        for task in &to_move {
+            task.set_task_cgroup_node(cgroup.clone());
+        }
+        for id in crate::cgroup::subsys::CgroupSubsysId::all() {
+            if let Some(css) = cgroup.css(*id) {
+                css.attach(&to_move);
+            }
         }
         Ok(buf.len())
     }

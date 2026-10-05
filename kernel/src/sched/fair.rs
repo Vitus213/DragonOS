@@ -76,6 +76,10 @@ pub struct FairSchedEntity {
     my_cfs_rq: Option<Arc<CfsRunQueue>>,
 
     runnable_weight: u64,
+    /// Deadline until which this task is excluded after exhausting its CPU
+    /// cgroup quota. The entity stays accounted on the CFS rq, but pick paths
+    /// must not select it while this is in the future.
+    bandwidth_throttled_until: u64,
 
     pcb: Weak<ProcessControlBlock>,
 }
@@ -101,6 +105,7 @@ impl FairSchedEntity {
             vruntime: Default::default(),
             vlag: Default::default(),
             prev_sum_exec_runtime: Default::default(),
+            bandwidth_throttled_until: 0,
             avg: Default::default(),
             depth: Default::default(),
             runnable_weight: Default::default(),
@@ -120,6 +125,16 @@ impl FairSchedEntity {
     #[inline]
     pub fn on_rq(&self) -> bool {
         self.on_rq != OnRq::None
+    }
+    #[inline]
+    pub fn bandwidth_throttled(&self, now: u64) -> bool {
+        self.bandwidth_throttled_until != 0
+            && (self.bandwidth_throttled_until.wrapping_sub(now) as i64) > 0
+    }
+
+    #[inline]
+    pub fn set_bandwidth_throttled_until(&mut self, deadline: u64) {
+        self.bandwidth_throttled_until = deadline;
     }
 
     pub fn pcb(&self) -> Arc<ProcessControlBlock> {
@@ -203,13 +218,12 @@ impl FairSchedEntity {
 
         let group_cfs = self.my_cfs_rq.clone().unwrap();
 
-        let shares = group_cfs.task_group().shares;
+        let weight = LoadWeight::weight_from_cpu_weight(group_cfs.task_group().shares);
 
-        if unlikely(self.load.weight != shares) {
-            // TODO: reweight
+        if unlikely(self.load.weight != weight) {
             self.cfs_rq()
                 .force_mut()
-                .reweight_entity(self.self_arc(), shares);
+                .reweight_entity(self.self_arc(), weight);
         }
     }
 
@@ -370,6 +384,24 @@ pub struct CfsRemoved {
     pub load_avg: usize,
     pub util_avg: usize,
     pub runnable_avg: usize,
+}
+
+/// Mirror of Linux `cfs_rq_throttled()`: whether this cfs_rq itself is inside
+/// a throttled interval.
+///
+/// The per-cpu root cfs_rq is shared by every cgroup and is therefore never
+/// throttled as a whole; this state applies to the per-task-group queues that
+/// group scheduling will attach (see `CfsRunQueue::throttled`).
+#[inline]
+fn cfs_rq_throttled(cfs_rq: &CfsRunQueue) -> bool {
+    cfs_rq.throttled
+}
+
+/// Mirror of Linux `throttled_hierarchy()`: whether this cfs_rq or any parent
+/// is throttled.
+#[inline]
+fn throttled_hierarchy(cfs_rq: &CfsRunQueue) -> bool {
+    cfs_rq.throttled_count > 0
 }
 
 impl CfsRunQueue {
@@ -564,6 +596,24 @@ impl CfsRunQueue {
         }
     }
 
+    /// Mirror of Linux `set_next_buddy()`: bias the next pick toward the
+    /// given entity's chain. Used when a task goes to sleep within its
+    /// slice so the group it came from is preferred for the next pick.
+    fn set_next_buddy(&mut self, se: &Arc<FairSchedEntity>) {
+        let mut se = se.clone();
+        loop {
+            if se.on_rq() {
+                se.cfs_rq().force_mut().next = Arc::downgrade(&se);
+                break;
+            }
+
+            match se.parent() {
+                Some(parent) => se = parent,
+                None => break,
+            }
+        }
+    }
+
     /// 处理调度实体的时间片到期事件
     pub fn entity_tick(&mut self, curr: Arc<FairSchedEntity>, queued: bool) {
         // 更新当前调度实体的运行时间统计信息
@@ -609,6 +659,19 @@ impl CfsRunQueue {
         curr.exec_start = now;
 
         curr.sum_exec_runtime += delta_exec;
+
+        // Charge the exact exec delta once, at the same boundary that advances
+        // the fair entity. A throttle decision is represented on this entity,
+        // not by merely requesting a schedule while leaving it selectable.
+        if let Some(deadline) =
+            super::account_cgroup_runtime(&curr.pcb(), now, delta_exec)
+        {
+            curr.set_bandwidth_throttled_until(deadline);
+            let rq = self.rq();
+            rq.force_mut_locked()
+                .arm_cgroup_throttle_deadline(deadline);
+            rq.resched_current();
+        }
 
         // 根据实际运行时长加权增加虚拟运行时长
         curr.vruntime += curr.calculate_delta_fair(delta_exec);
@@ -1006,6 +1069,29 @@ impl CfsRunQueue {
         self.prop_runnable_sum += runnable_sum;
     }
 
+    /// Mirror of Linux `check_enqueue_throttle()`: a wakeup inside a cgroup
+    /// whose `cpu.max` quota is already exhausted must not run until the next
+    /// period boundary, because `update_current` can only throttle an entity
+    /// once running time has been charged.
+    ///
+    /// Linux only performs this check when a per-group cfs_rq transitions to
+    /// non-empty (`nr_running == 1`). DragonOS charges bandwidth per task
+    /// entity on the flat per-CPU cfs_rq, so every task enqueue is checked;
+    /// the current entity keeps charging through `update_current` instead.
+    fn check_enqueue_throttle(&mut self, se: &Arc<FairSchedEntity>) {
+        if !se.is_task() || self.is_curr(se) {
+            return;
+        }
+
+        let now = self.rq().clock_task();
+        if let Some(deadline) = super::cgroup_check_enqueue_throttle(&se.pcb(), now) {
+            se.force_mut().set_bandwidth_throttled_until(deadline);
+            self.rq()
+                .force_mut_locked()
+                .arm_cgroup_throttle_deadline(deadline);
+        }
+    }
+
     /// 将实体加入队列
     pub fn enqueue_entity(&mut self, se: &Arc<FairSchedEntity>, flags: EnqueueFlag) {
         #[cfg(any(debug_assertions, feature = "fifo_demo"))]
@@ -1046,10 +1132,9 @@ impl CfsRunQueue {
 
         se.force_mut().on_rq = OnRq::Queued;
 
-        if self.nr_running == 1 {
-            // 只有上面加入的
-            // TODO: throttle
-        }
+        // Linux checks a throttled group here when its cfs_rq transitions to
+        // non-empty; see check_enqueue_throttle for the flat-model mapping.
+        self.check_enqueue_throttle(se);
     }
 
     pub fn dequeue_entity(&mut self, se: &Arc<FairSchedEntity>, flags: DequeueFlag) {
@@ -1345,6 +1430,18 @@ impl CfsRunQueue {
             .pick_eevdf(curr.filter(|se| se.on_rq()), |se| self.entity_eligible(se))
     }
 
+    /// FairTimeline's pruning assumes every node is eligible. A throttled
+    /// entity can invalidate that assumption, so use the rq's maintained task
+    /// list only as a rare fallback when the tree found no candidate.
+    fn pick_eligible_task_fallback(&self) -> Option<Arc<FairSchedEntity>> {
+        let rq = self.rq();
+        let rq = rq.force_mut_locked();
+        rq.cfs_tasks
+            .iter()
+            .find(|se| self.entity_eligible(se))
+            .cloned()
+    }
+
     pub fn pick_next_entity_with_curr(
         &self,
         curr: Option<&Arc<FairSchedEntity>>,
@@ -1356,11 +1453,15 @@ impl CfsRunQueue {
                 }
             }
         }
-
         let picked = self
             .pick_eevdf_entity(curr)
-            .or_else(|| self.entities.leftmost())
-            .or_else(|| curr.cloned().filter(|se| se.on_rq()));
+            .or_else(|| {
+                self.entities
+                    .leftmost()
+                    .filter(|se| self.entity_eligible(se))
+            })
+            .or_else(|| self.pick_eligible_task_fallback())
+            .or_else(|| curr.cloned().filter(|se| self.entity_eligible(se)));
         picked
     }
 
@@ -1371,6 +1472,10 @@ impl CfsRunQueue {
     }
 
     pub fn entity_eligible(&self, se: &Arc<FairSchedEntity>) -> bool {
+        if se.bandwidth_throttled(self.rq().clock_task()) {
+            return false;
+        }
+
         let curr = self.current();
         let mut avg = self.avg_vruntime;
         let mut load = self.avg_load;
@@ -1384,7 +1489,7 @@ impl CfsRunQueue {
             }
         }
 
-        return avg >= self.entity_key(se) * load;
+        avg >= self.entity_key(se) * load
     }
 }
 
@@ -1502,15 +1607,24 @@ impl Scheduler for CompletelyFairScheduler {
         pcb: Arc<crate::process::ProcessControlBlock>,
         mut flags: EnqueueFlag,
     ) {
-        let mut se = pcb.sched_info().sched_entity();
+        let se = pcb.sched_info().sched_entity();
         debug_assert!(
             Arc::ptr_eq(&se.cfs_rq(), &rq.cfs_rq()),
             "enqueue: SE's cfs_rq must match target rq's cfs_rq"
         );
         let mut idle_h_nr_running = false;
-        let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
+        let mut throttled = false;
+        let mut cursor = Some(se);
+
+        // Linux enqueue_task_fair() first loop: enqueue each entity up the
+        // chain until an ancestor that is already queued (for_each_sched_entity).
+        while let Some(se) = cursor.take() {
             if se.on_rq() {
-                return (false, false);
+                // The second loop below continues from this entity: it is
+                // already queued, so only the hierarchy counters above it
+                // still need updating.
+                cursor = Some(se);
+                break;
             }
 
             let binding = se.cfs_rq();
@@ -1524,43 +1638,50 @@ impl Scheduler for CompletelyFairScheduler {
                 idle_h_nr_running = true;
             }
 
-            // TODO: cfs_rq_throttled
+            // End the evaluation on encountering a throttled cfs_rq: the
+            // branch below a throttled group is invisible to the ancestors,
+            // which already folded its h_nr_running into rq.nr_running when
+            // the group was throttled (Linux: goto enqueue_throttle).
+            if cfs_rq_throttled(cfs_rq) {
+                throttled = true;
+                break;
+            }
 
             flags = EnqueueFlag::ENQUEUE_WAKEUP;
 
-            return (true, true);
-        });
-
-        if !should_continue {
-            return;
+            cursor = se.parent();
         }
 
-        if let Some(mut se) = se {
-            FairSchedEntity::for_each_in_group(&mut se, |se| {
-                let binding = se.cfs_rq();
-                let cfs_rq = binding.force_mut();
+        // Second loop: refresh load and propagate h_nr_running through the
+        // remaining, already queued ancestors.
+        while let Some(se) = cursor.take() {
+            let binding = se.cfs_rq();
+            let cfs_rq = binding.force_mut();
 
-                cfs_rq.update_load_avg(&se, UpdateAvgFlags::UPDATE_TG);
+            cfs_rq.update_load_avg(&se, UpdateAvgFlags::UPDATE_TG);
 
-                let se = se.force_mut();
-                se.update_runnable();
+            se.force_mut().update_runnable();
 
-                se.update_cfs_group();
+            se.update_cfs_group();
 
-                cfs_rq.h_nr_running += 1;
-                cfs_rq.idle_h_nr_running += idle_h_nr_running as u64;
+            cfs_rq.h_nr_running += 1;
+            cfs_rq.idle_h_nr_running += idle_h_nr_running as u64;
 
-                if cfs_rq.is_idle() {
-                    idle_h_nr_running = true;
-                }
+            if cfs_rq.is_idle() {
+                idle_h_nr_running = true;
+            }
 
-                // TODO: cfs_rq_throttled
+            if cfs_rq_throttled(cfs_rq) {
+                throttled = true;
+                break;
+            }
 
-                return (true, true);
-            });
+            cursor = se.parent();
         }
 
-        rq.add_nr_running(1);
+        if !throttled {
+            rq.add_nr_running(1);
+        }
     }
 
     fn dequeue(
@@ -1568,12 +1689,16 @@ impl Scheduler for CompletelyFairScheduler {
         pcb: Arc<crate::process::ProcessControlBlock>,
         mut flags: DequeueFlag,
     ) {
-        let mut se = pcb.sched_info().sched_entity();
+        let se = pcb.sched_info().sched_entity();
         let mut idle_h_nr_running = false;
         let task_sleep = flags.contains(DequeueFlag::DEQUEUE_SLEEP);
         let was_sched_idle = rq.sched_idle_rq();
+        let mut throttled = false;
+        let mut cursor = Some(se);
 
-        let (should_continue, se) = FairSchedEntity::for_each_in_group(&mut se, |se| {
+        // Linux dequeue_task_fair() first loop: dequeue each entity up the
+        // chain until the parent queue keeps other entities besides us.
+        while let Some(se) = cursor.take() {
             let binding = se.cfs_rq();
             let cfs_rq = binding.force_mut();
             cfs_rq.dequeue_entity(&se, flags);
@@ -1585,54 +1710,69 @@ impl Scheduler for CompletelyFairScheduler {
                 idle_h_nr_running = true;
             }
 
-            // TODO: cfs_rq_throttled
+            // End the evaluation on encountering a throttled cfs_rq: that
+            // branch was already removed from rq.nr_running when the group
+            // was throttled (Linux: goto dequeue_throttle).
+            if cfs_rq_throttled(cfs_rq) {
+                throttled = true;
+                break;
+            }
 
+            // Don't dequeue the parent if it has other entities besides us.
             if cfs_rq.load.weight > 0 {
+                // Avoid re-evaluating load for this entity: continue the
+                // second loop from its parent.
                 let sep = se.parent();
 
-                if task_sleep && sep.is_some() {
-                    todo!()
+                // Bias pick_next to pick a task from this cfs_rq, as p is
+                // sleeping when it is within its sched_slice.
+                if task_sleep && sep.is_some() && !throttled_hierarchy(cfs_rq) {
+                    cfs_rq.set_next_buddy(sep.as_ref().unwrap());
                 }
+
+                cursor = sep;
+                break;
             }
 
             flags |= DequeueFlag::DEQUEUE_SLEEP;
 
-            return (true, true);
-        });
-
-        if !should_continue {
-            return;
+            cursor = se.parent();
         }
 
-        if let Some(mut se) = se {
-            FairSchedEntity::for_each_in_group(&mut se, |se| {
-                let binding = se.cfs_rq();
-                let cfs_rq = binding.force_mut();
+        // Second loop: refresh load and propagate h_nr_running through the
+        // ancestors that stay queued.
+        while let Some(se) = cursor.take() {
+            let binding = se.cfs_rq();
+            let cfs_rq = binding.force_mut();
 
-                cfs_rq.update_load_avg(&se, UpdateAvgFlags::UPDATE_TG);
+            cfs_rq.update_load_avg(&se, UpdateAvgFlags::UPDATE_TG);
 
-                let se = se.force_mut();
-                se.update_runnable();
+            se.force_mut().update_runnable();
 
-                se.update_cfs_group();
+            se.update_cfs_group();
 
-                cfs_rq.h_nr_running -= 1;
-                cfs_rq.idle_h_nr_running -= idle_h_nr_running as u64;
+            cfs_rq.h_nr_running -= 1;
+            cfs_rq.idle_h_nr_running -= idle_h_nr_running as u64;
 
-                if cfs_rq.is_idle() {
-                    idle_h_nr_running = true;
-                }
+            if cfs_rq.is_idle() {
+                idle_h_nr_running = true;
+            }
 
-                // TODO: cfs_rq_throttled
+            if cfs_rq_throttled(cfs_rq) {
+                throttled = true;
+                break;
+            }
 
-                return (true, true);
-            });
+            cursor = se.parent();
         }
 
-        rq.sub_nr_running(1);
+        if !throttled {
+            rq.sub_nr_running(1);
 
-        if unlikely(!was_sched_idle && rq.sched_idle_rq()) {
-            rq.next_balance = clock();
+            // balance early to pull high priority tasks
+            if unlikely(!was_sched_idle && rq.sched_idle_rq()) {
+                rq.next_balance = clock();
+            }
         }
     }
 

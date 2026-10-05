@@ -45,6 +45,7 @@ pub mod syscall;
 pub mod sysfs;
 pub mod tlb;
 pub mod truncate;
+pub mod memcg;
 pub mod ucontext;
 
 /// 内核INIT进程的用户地址空间结构体（仅在process_init中初始化）

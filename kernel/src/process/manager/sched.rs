@@ -78,7 +78,15 @@ impl ProcessManager {
             }
             return Ok(());
         }
+        // 冻结任务吞掉唤醒请求：对应 Linux refrigerator 的 while(frozen) 回睡
+        // 循环——冻结期间任何事件唤醒（包括 spurious wakeup）都不允许把任务
+        // 带回 RUNNING；解冻路径（freezer::unfreeze_task）是唯一恢复出口。
+        // 与 freeze_task()/__refrigerator() 的 FROZEN 置位同在 pi_lock 下串行。
+        if pcb.flags().contains(ProcessFlags::FROZEN) {
+            return Ok(());
+        }
         let was_uninterruptible = matches!(state, ProcessState::Blocked(false));
+
 
         pcb.sched_info().set_state(ProcessState::Runnable);
         fence(Ordering::SeqCst);

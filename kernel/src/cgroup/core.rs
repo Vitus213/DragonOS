@@ -4,13 +4,13 @@ use alloc::{
     vec::Vec,
 };
 use core::cmp::Reverse;
-use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicUsize, Ordering};
 use hashbrown::{HashMap, HashSet};
 use system_error::SystemError;
 
 use crate::{
     bpf::prog::{device::DeviceAccess, BpfProg},
-    cgroup::{CgroupCpuState, CgroupFreezerState, CgroupMemoryState},
+    cgroup::subsys::{all_subsys, CgroupSubsysId, CgroupSubsysState},
     include::bindings::linux_bpf::{
         bpf_prog_type, BPF_F_ALLOW_MULTI, BPF_F_ALLOW_OVERRIDE, BPF_F_REPLACE,
     },
@@ -47,6 +47,79 @@ impl DeviceBpfState {
     }
 }
 
+/// The cgroup v2 hierarchy mode of a node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CgroupType {
+    Domain,
+    Threaded,
+    DomainThreaded,
+    DomainInvalid,
+}
+
+impl CgroupType {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Domain => "domain",
+            Self::Threaded => "threaded",
+            Self::DomainThreaded => "domain threaded",
+            Self::DomainInvalid => "domain invalid",
+        }
+    }
+}
+
+/// A deduplicated task CSS-set identity shared by all tasks in one cgroup.
+#[derive(Debug)]
+pub struct CssSetToken {
+    id: usize,
+    users: AtomicUsize,
+}
+
+impl CssSetToken {
+    fn new(id: usize) -> Arc<Self> {
+        Arc::new(Self {
+            id,
+            users: AtomicUsize::new(0),
+        })
+    }
+
+    fn acquire(&self) {
+        self.users.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn release(&self) {
+        self.users.fetch_sub(1, Ordering::Release);
+    }
+
+    pub fn id(&self) -> usize {
+        self.id
+    }
+
+    pub fn users(&self) -> usize {
+        self.users.load(Ordering::Acquire)
+    }
+}
+
+fn is_threaded_type(ty: CgroupType) -> bool {
+    matches!(ty, CgroupType::Threaded)
+}
+
+fn has_threaded_descendant(node: &CgroupNode) -> bool {
+    node.children().into_iter().any(|child| {
+        is_threaded_type(child.cgroup_type())
+            || child.cgroup_type() == CgroupType::DomainThreaded
+            || has_threaded_descendant(&child)
+    })
+}
+
+fn refresh_domain_state(node: &CgroupNode) {
+    if node.cgroup_type() == CgroupType::DomainInvalid && !node.has_tasks() {
+        *node.type_state.write() = CgroupType::DomainThreaded;
+    }
+    if node.cgroup_type() == CgroupType::DomainThreaded && !has_threaded_descendant(node) {
+        *node.type_state.write() = CgroupType::Domain;
+    }
+}
+
 #[derive(Debug)]
 pub struct CgroupNode {
     id: usize,
@@ -55,18 +128,33 @@ pub struct CgroupNode {
     children: RwLock<HashMap<String, Arc<CgroupNode>>>,
     tasks: RwLock<HashSet<RawPid>>,
     subtree_control: RwLock<HashSet<String>>,
-    cpu: RwLock<CgroupCpuState>,
-    memory: RwLock<CgroupMemoryState>,
-    freezer: RwLock<CgroupFreezerState>,
-    pids_max: RwLock<Option<usize>>,
-    pids_events_max: AtomicU64,
-    local_pids_counter: AtomicUsize,
-    subtree_pids_counter: AtomicUsize,
+    /// 控制器状态数组（对应 Linux 的 cgroup_subsys_state *subsys[]）
+    subsys: [RwLock<Option<Arc<dyn CgroupSubsysState>>>; CgroupSubsysId::COUNT],
+    /// The hierarchy state exposed through cgroup.type.
+    type_state: RwLock<CgroupType>,
+    /// Shared identity for this node's complete CSS array.
+    css_set: Arc<CssSetToken>,
+    /// 全局任务计数（pids 控制器用）
     subtree_task_counter: AtomicUsize,
     device_bpf: RwLock<DeviceBpfState>,
 }
 
 impl CgroupNode {
+    /// 创建空的控制器状态数组
+    fn empty_subsys_array() -> [RwLock<Option<Arc<dyn CgroupSubsysState>>>; CgroupSubsysId::COUNT] {
+        [
+            RwLock::new(None), // Cpu
+            RwLock::new(None), // Memory
+            RwLock::new(None), // Pids
+            RwLock::new(None), // Io
+            RwLock::new(None), // Cpuset
+            RwLock::new(None), // Freezer
+            RwLock::new(None), // Hugetlb
+            RwLock::new(None), // Rdma
+            RwLock::new(None), // Misc
+        ]
+    }
+
     fn new_root() -> Arc<Self> {
         Arc::new(Self {
             id: 1,
@@ -75,19 +163,23 @@ impl CgroupNode {
             children: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
-            cpu: RwLock::new(CgroupCpuState::default()),
-            memory: RwLock::new(CgroupMemoryState::default()),
-            freezer: RwLock::new(CgroupFreezerState::default()),
-            pids_max: RwLock::new(None),
-            pids_events_max: AtomicU64::new(0),
-            local_pids_counter: AtomicUsize::new(0),
-            subtree_pids_counter: AtomicUsize::new(0),
+            subsys: Self::empty_subsys_array(),
+            type_state: RwLock::new(CgroupType::Domain),
+            css_set: CssSetToken::new(1),
             subtree_task_counter: AtomicUsize::new(0),
             device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
     }
 
     fn new_child(id: usize, name: String, parent: &Arc<CgroupNode>) -> Arc<Self> {
+        let type_state = if matches!(
+            parent.cgroup_type(),
+            CgroupType::Threaded | CgroupType::DomainThreaded
+        ) {
+            CgroupType::Threaded
+        } else {
+            CgroupType::Domain
+        };
         Arc::new(Self {
             id,
             name,
@@ -95,16 +187,27 @@ impl CgroupNode {
             children: RwLock::new(HashMap::new()),
             tasks: RwLock::new(HashSet::new()),
             subtree_control: RwLock::new(HashSet::new()),
-            cpu: RwLock::new(CgroupCpuState::default()),
-            memory: RwLock::new(CgroupMemoryState::default()),
-            freezer: RwLock::new(CgroupFreezerState::default()),
-            pids_max: RwLock::new(None),
-            pids_events_max: AtomicU64::new(0),
-            local_pids_counter: AtomicUsize::new(0),
-            subtree_pids_counter: AtomicUsize::new(0),
+            subsys: Self::empty_subsys_array(),
+            type_state: RwLock::new(type_state),
+            css_set: CssSetToken::new(id),
             subtree_task_counter: AtomicUsize::new(0),
             device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
+    }
+
+    /// 获取指定控制器的状态（对应 Linux 的 cgroup_subsys_state *cgroup_css(cgroup, subsys)）
+    pub fn css(&self, id: CgroupSubsysId) -> Option<Arc<dyn CgroupSubsysState>> {
+        self.subsys[id as usize].read().clone()
+    }
+
+    /// 设置控制器状态（在控制器 online 时调用）
+    pub fn set_css(&self, id: CgroupSubsysId, css: Arc<dyn CgroupSubsysState>) {
+        *self.subsys[id as usize].write() = Some(css);
+    }
+
+    /// 清除控制器状态（在控制器 offline 时调用）
+    pub fn clear_css(&self, id: CgroupSubsysId) {
+        *self.subsys[id as usize].write() = None;
     }
 
     pub fn id(&self) -> usize {
@@ -117,6 +220,103 @@ impl CgroupNode {
 
     pub fn parent(&self) -> Option<Arc<CgroupNode>> {
         self.parent.as_ref().and_then(|p| p.upgrade())
+    }
+
+    pub fn cgroup_type(&self) -> CgroupType {
+        *self.type_state.read()
+    }
+
+    pub fn cgroup_type_name(&self) -> &'static str {
+        self.cgroup_type().name()
+    }
+
+    pub fn css_set(&self) -> Arc<CssSetToken> {
+        self.css_set.clone()
+    }
+
+    pub fn css_set_id(&self) -> usize {
+        self.css_set.id()
+    }
+
+    pub fn has_domain_controllers(&self) -> bool {
+        self.subtree_control()
+            .iter()
+            .any(|name| matches!(name.as_str(), "memory" | "io"))
+    }
+
+    /// Whether this node is a member of a threaded subtree.
+    pub fn in_threaded_subtree(&self) -> bool {
+        if self.cgroup_type() == CgroupType::Threaded {
+            return true;
+        }
+        let mut cur = self.parent();
+        while let Some(node) = cur {
+            if node.cgroup_type() == CgroupType::Threaded {
+                return true;
+            }
+            cur = node.parent();
+        }
+        false
+    }
+
+    /// Apply a cgroup.type write. The parent is promoted to the appropriate
+    /// domain state when a new threaded subtree is established.
+    pub fn set_cgroup_type(&self, requested: &str) -> Result<(), SystemError> {
+        match requested.trim() {
+            "threaded" => {
+                if self.parent().is_none() || self.cgroup_type() != CgroupType::Domain {
+                    return Err(SystemError::EINVAL);
+                }
+                // Linux cgroup_enable_threaded()：
+                //   - cgroup_is_populated(cgrp)（本组或后代仍有任务）→ EOPNOTSUPP
+                //   - 父组的 subtree_control 已启用域控制器（memory/io）→ EOPNOTSUPP
+                if self.subtree_task_count() != 0 {
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+                let parent = self.parent().unwrap();
+                if parent.has_domain_controllers() {
+                    return Err(SystemError::EOPNOTSUPP_OR_ENOTSUP);
+                }
+                if self.has_domain_controllers() {
+                    return Err(SystemError::EBUSY);
+                }
+                if self.children().into_iter().any(|child| {
+                    !matches!(
+                        child.cgroup_type(),
+                        CgroupType::Threaded | CgroupType::DomainThreaded
+                    )
+                }) {
+                    return Err(SystemError::EBUSY);
+                }
+                match parent.cgroup_type() {
+                    CgroupType::Threaded | CgroupType::DomainThreaded => {}
+                    CgroupType::Domain if parent.has_tasks() => {
+                        *parent.type_state.write() = CgroupType::DomainInvalid;
+                    }
+                    CgroupType::Domain => {
+                        *parent.type_state.write() = CgroupType::DomainThreaded;
+                    }
+                    CgroupType::DomainInvalid => return Err(SystemError::EBUSY),
+                }
+                *self.type_state.write() = CgroupType::Threaded;
+                Ok(())
+            }
+            "domain" => {
+                if self.cgroup_type() != CgroupType::Threaded {
+                    return Err(SystemError::EINVAL);
+                }
+                if !self.children().is_empty() {
+                    return Err(SystemError::EBUSY);
+                }
+                *self.type_state.write() = CgroupType::Domain;
+                if let Some(parent) = self.parent() {
+                    refresh_domain_state(&parent);
+                }
+                Ok(())
+            }
+            "domain threaded" | "domain invalid" => Err(SystemError::EINVAL),
+            _ => Err(SystemError::EINVAL),
+        }
     }
 
     pub fn add_task(&self, pid: RawPid) {
@@ -139,8 +339,10 @@ impl CgroupNode {
         let mut cur = self.parent();
         while let Some(node) = cur {
             node.subtree_task_counter.fetch_sub(1, Ordering::Release);
+            refresh_domain_state(&node);
             cur = node.parent();
         }
+        refresh_domain_state(self);
     }
 
     pub fn rename_task(&self, old_pid: RawPid, new_pid: RawPid) {
@@ -189,69 +391,6 @@ impl CgroupNode {
         *self.subtree_control.write() = controllers;
     }
 
-    pub fn cpu_state(&self) -> CgroupCpuState {
-        *self.cpu.read()
-    }
-
-    pub fn set_cpu_weight(&self, weight: u64) {
-        self.cpu.write().set_weight(weight);
-    }
-
-    pub fn set_cpu_max(&self, quota: Option<u64>, period_us: u64) {
-        self.cpu.write().set_max(quota, period_us);
-    }
-
-    pub fn memory_state(&self) -> CgroupMemoryState {
-        *self.memory.read()
-    }
-
-    pub fn set_memory_min(&self, value: Option<u64>) {
-        self.memory.write().set_min(value);
-    }
-
-    pub fn set_memory_low(&self, value: Option<u64>) {
-        self.memory.write().set_low(value);
-    }
-
-    pub fn set_memory_high(&self, value: Option<u64>) {
-        self.memory.write().set_high(value);
-    }
-
-    pub fn set_memory_max(&self, value: Option<u64>) {
-        self.memory.write().set_max(value);
-    }
-
-    pub fn set_memory_swap_high(&self, value: Option<u64>) {
-        self.memory.write().set_swap_high(value);
-    }
-
-    pub fn set_memory_swap_max(&self, value: Option<u64>) {
-        self.memory.write().set_swap_max(value);
-    }
-
-    pub fn freeze_requested(&self) -> bool {
-        self.freezer.read().freeze_requested()
-    }
-
-    pub fn set_freeze_requested(&self, value: bool) {
-        self.freezer.write().set_freeze_requested(value);
-    }
-
-    pub fn pids_max(&self) -> Option<usize> {
-        *self.pids_max.read()
-    }
-
-    pub fn set_pids_max(&self, max: Option<usize>) {
-        *self.pids_max.write() = max;
-    }
-
-    pub fn pids_events_max(&self) -> u64 {
-        self.pids_events_max.load(Ordering::Relaxed)
-    }
-
-    pub fn inc_pids_events_max(&self) {
-        self.pids_events_max.fetch_add(1, Ordering::Relaxed);
-    }
 
     pub fn subtree_task_counter(&self) -> &AtomicUsize {
         &self.subtree_task_counter
@@ -264,61 +403,6 @@ impl CgroupNode {
             .saturating_add(self.subtree_task_counter.load(Ordering::Acquire))
     }
 
-    pub fn charge_pids(&self, count: usize) {
-        if count == 0 {
-            return;
-        }
-
-        self.local_pids_counter.fetch_add(count, Ordering::Release);
-        let mut cur = self.parent();
-        while let Some(node) = cur {
-            node.subtree_pids_counter
-                .fetch_add(count, Ordering::Release);
-            cur = node.parent();
-        }
-    }
-
-    pub fn uncharge_pids(&self, count: usize) {
-        if count == 0 {
-            return;
-        }
-
-        let old = self.local_pids_counter.fetch_sub(count, Ordering::Release);
-        debug_assert!(
-            old >= count,
-            "cgroup pids counter underflow: old={}, count={}",
-            old,
-            count
-        );
-        let mut cur = self.parent();
-        while let Some(node) = cur {
-            let old = node
-                .subtree_pids_counter
-                .fetch_sub(count, Ordering::Release);
-            debug_assert!(
-                old >= count,
-                "cgroup subtree pids counter underflow: old={}, count={}",
-                old,
-                count
-            );
-            cur = node.parent();
-        }
-    }
-
-    pub fn transfer_pids_charge(src: &Arc<Self>, dst: &Arc<Self>, count: usize) {
-        if count == 0 || Arc::ptr_eq(src, dst) {
-            return;
-        }
-
-        src.uncharge_pids(count);
-        dst.charge_pids(count);
-    }
-
-    pub fn pids_current_count(&self) -> usize {
-        self.local_pids_counter
-            .load(Ordering::Acquire)
-            .saturating_add(self.subtree_pids_counter.load(Ordering::Acquire))
-    }
 
     pub fn is_ancestor_of(self: &Arc<Self>, other: &Arc<Self>) -> bool {
         if Arc::ptr_eq(self, other) {
@@ -336,6 +420,186 @@ impl CgroupNode {
         false
     }
 
+    // ==================== Pids 控制器辅助方法 ====================
+    
+    /// 获取 pids.max（通过 css 访问）
+    pub fn pids_max(&self) -> Option<usize> {
+        self.css(CgroupSubsysId::Pids).and_then(|css| {
+            css.as_any()
+                .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
+                .and_then(|state| state.get_max())
+        })
+    }
+
+    /// 获取 pids.current（当前 cgroup 及其子树的层级计数）
+    pub fn pids_current_count(&self) -> usize {
+        self.css(CgroupSubsysId::Pids)
+            .and_then(|css| {
+                css.as_any()
+                    .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
+                    .map(|state| state.subtree_current())
+            })
+            .unwrap_or(0)
+    }
+
+    /// 获取 pids.events max 计数
+    pub fn pids_events_max(&self) -> u64 {
+        self.css(CgroupSubsysId::Pids)
+            .and_then(|css| {
+                css.as_any()
+                    .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
+                    .map(|state| state.events_max())
+            })
+            .unwrap_or(0)
+    }
+
+    /// 增加 pids.events max（fork 失败时调用）
+    pub fn inc_pids_events_max(&self) {
+        if let Some(css) = self.css(CgroupSubsysId::Pids) {
+            if let Some(state) = css.as_any()
+                .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>() {
+                state.inc_events_max();
+            }
+        }
+    }
+    /// 为 fork 预留 pids 计数。
+    pub fn charge_pids(&self, count: usize) -> Result<(), SystemError> {
+        let css = self.css(CgroupSubsysId::Pids).ok_or(SystemError::ENOENT)?;
+        let state = css
+            .as_any()
+            .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
+            .ok_or(SystemError::EINVAL)?;
+        let mut charged = 0;
+        while charged < count {
+            if let Err(error) = state.try_charge() {
+                for _ in 0..charged {
+                    state.uncharge();
+                }
+                return Err(error);
+            }
+            charged += 1;
+        }
+        Ok(())
+    }
+
+    /// 释放任务的 pids 计数。
+    pub fn uncharge_pids(&self, count: usize) {
+        let Some(css) = self.css(CgroupSubsysId::Pids) else {
+            return;
+        };
+        let Some(state) = css
+            .as_any()
+            .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
+        else {
+            return;
+        };
+        for _ in 0..count {
+            state.uncharge();
+        }
+    }
+
+    /// 在 cgroup 迁移时转移层级 pids 计数。
+    ///
+    /// Linux 将迁移视为组织操作，不受 `pids.max` 阻塞；因此目标计数
+    /// 必须无条件增加，不能在更新任务归属后再执行可能失败的 charge。
+    pub fn transfer_pids_charge(
+        src: &Arc<CgroupNode>,
+        dst: &Arc<CgroupNode>,
+        count: usize,
+    ) {
+        src.uncharge_pids(count);
+        if let Some(css) = dst.css(CgroupSubsysId::Pids) {
+            if let Some(state) = css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
+            {
+                for _ in 0..count {
+                    state.charge_unchecked();
+                }
+            }
+        }
+    }
+    pub fn set_pids_max(
+        &self,
+        max: Option<usize>,
+    ) -> Result<(), SystemError> {
+        let css = self.css(CgroupSubsysId::Pids).ok_or(SystemError::ENOENT)?;
+        let state = css
+            .as_any()
+            .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
+            .ok_or(SystemError::EINVAL)?;
+        state.set_max(max);
+        Ok(())
+    }
+
+    pub fn set_cpu_weight(&self, weight: u64) -> Result<(), SystemError> {
+        let css = self.css(CgroupSubsysId::Cpu).ok_or(SystemError::ENOENT)?;
+        let state = css
+            .as_any()
+            .downcast_ref::<crate::cgroup::controllers::cpu::CpuCss>()
+            .ok_or(SystemError::EINVAL)?;
+        state.set_shares(weight)
+    }
+
+    pub fn set_cpu_max(
+        &self,
+        quota: Option<u64>,
+        period_us: u64,
+    ) -> Result<(), SystemError> {
+        let css = self.css(CgroupSubsysId::Cpu).ok_or(SystemError::ENOENT)?;
+        let state = css
+            .as_any()
+            .downcast_ref::<crate::cgroup::controllers::cpu::CpuCss>()
+            .ok_or(SystemError::EINVAL)?;
+        state.set_bandwidth(quota, period_us)
+    }
+
+    fn with_memory_css<R>(
+        &self,
+        f: impl FnOnce(&crate::cgroup::controllers::memory::MemoryCss) -> Result<R, SystemError>,
+    ) -> Result<R, SystemError> {
+        let css = self.css(CgroupSubsysId::Memory).ok_or(SystemError::ENOENT)?;
+        let state = css
+            .as_any()
+            .downcast_ref::<crate::cgroup::controllers::memory::MemoryCss>()
+            .ok_or(SystemError::EINVAL)?;
+        f(state)
+    }
+
+    pub fn set_memory_min(&self, value: Option<u64>) -> Result<(), SystemError> {
+        self.with_memory_css(|state| state.set_min(value))
+    }
+
+    pub fn set_memory_low(&self, value: Option<u64>) -> Result<(), SystemError> {
+        self.with_memory_css(|state| state.set_low(value))
+    }
+
+    pub fn set_memory_high(&self, value: Option<u64>) -> Result<(), SystemError> {
+        self.with_memory_css(|state| state.set_high(value))
+    }
+
+    pub fn set_memory_max(&self, value: Option<u64>) -> Result<(), SystemError> {
+        self.with_memory_css(|state| state.set_max(value))
+    }
+
+    pub fn set_memory_swap_high(&self, value: Option<u64>) -> Result<(), SystemError> {
+        self.with_memory_css(|state| state.set_swap_high(value))
+    }
+
+    pub fn set_memory_swap_max(&self, value: Option<u64>) -> Result<(), SystemError> {
+        self.with_memory_css(|state| state.set_swap_max(value))
+    }
+    pub fn cpu_bandwidth(&self) -> (Option<u64>, u64) {
+        self.css(CgroupSubsysId::Cpu)
+            .and_then(|css| {
+                css.as_any()
+                    .downcast_ref::<crate::cgroup::controllers::cpu::CpuCss>()
+                    .map(|cpu| cpu.bandwidth())
+            })
+            .unwrap_or((None, 100_000))
+    }
+
+
     /// Apply the complete effective chain to one device operation. Linux does
     /// not short-circuit this chain when a program denies access.
     pub fn allows_device_access(&self, access: DeviceAccess) -> bool {
@@ -347,6 +611,36 @@ impl CgroupNode {
             }
         }
         allowed
+    }
+
+
+    /// 获取 freeze 请求状态
+    pub fn freeze_requested(&self) -> bool {
+        if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
+            if let Some(freezer) = freezer_css.as_any().downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>() {
+                return freezer.freeze_requested();
+            }
+        }
+        false
+    }
+
+    /// 设置 freeze 请求
+    pub fn set_freeze_requested(&self, freeze: bool) {
+        if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
+            if let Some(freezer) = freezer_css.as_any().downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>() {
+                let _ = freezer.set_freeze_requested(freeze);
+            }
+        }
+    }
+
+    /// 检查 cgroup 是否已冻结
+    pub fn is_frozen(&self) -> bool {
+        if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
+            if let Some(freezer) = freezer_css.as_any().downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>() {
+                return freezer.is_frozen();
+            }
+        }
+        false
     }
 }
 
@@ -361,8 +655,22 @@ pub struct CgroupRoot {
 }
 
 impl CgroupRoot {
+    fn initialize_css(
+        node: &Arc<CgroupNode>,
+        parent: Option<&Arc<CgroupNode>>,
+    ) -> Result<(), SystemError> {
+        for subsys in all_subsys() {
+            let parent_css = parent.and_then(|parent| parent.css(subsys.id()));
+            let css = subsys.css_alloc(parent_css.as_ref(), node)?;
+            css.css_online()?;
+            node.set_css(subsys.id(), css);
+        }
+        Ok(())
+    }
+
     fn new() -> Arc<Self> {
         let root = CgroupNode::new_root();
+        Self::initialize_css(&root, None).expect("cgroup root CSS initialization failed");
         let mut all_nodes = HashMap::new();
         all_nodes.insert(root.id(), root.clone());
 
@@ -408,6 +716,7 @@ impl CgroupRoot {
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let child = CgroupNode::new_child(id, name.to_string(), parent);
+        Self::initialize_css(&child, Some(parent))?;
         child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
         parent
             .children
@@ -448,14 +757,34 @@ impl CgroupRoot {
         if child.has_tasks() || child.pids_current_count() != 0 {
             return Err(SystemError::EBUSY);
         }
+
+        // Take stable references to every CSS before beginning teardown.  A
+        // controller's offline callback may inspect the still-online cgroup.
+        let mut css_states = Vec::new();
+        for subsys in all_subsys() {
+            if let Some(css) = child.css(subsys.id()) {
+                css.css_offline()?;
+                css_states.push((subsys, css));
+            }
+        }
+
         let removed_child = parent.children.write().remove_entry(name);
         let removed = self.all_nodes.lock().remove(&child.id());
+        // 最后一个 threaded 子节点移除后，父节点需要从 DomainThreaded 回退到
+        // Domain（对应 Linux cgroup_rmwb 之后的域状态重算），否则 cgroup.type
+        // 卡在 "domain threaded"，后续 mkdir 会继承错误的类型。
+        refresh_domain_state(parent);
         drop(accounting_guard);
 
         // Open directory FDs may keep this node alive; they do not keep its
         // attachments installed after rmdir. Drop program refs outside locks.
         let empty_state = DeviceBpfState::empty();
         let old_state = core::mem::replace(&mut *child.device_bpf.write(), empty_state);
+        for (subsys, css) in css_states {
+            child.clear_css(subsys.id());
+            subsys.css_free(&css);
+            css.css_released();
+        }
         drop(_structure_guard);
         drop(old_state);
         drop(removed);
@@ -808,18 +1137,41 @@ impl CgroupRoot {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct TaskCgroupRef {
     node: Arc<CgroupNode>,
+    css_set: Arc<CssSetToken>,
+}
+
+impl Clone for TaskCgroupRef {
+    fn clone(&self) -> Self {
+        self.css_set.acquire();
+        Self {
+            node: self.node.clone(),
+            css_set: self.css_set.clone(),
+        }
+    }
+}
+
+impl Drop for TaskCgroupRef {
+    fn drop(&mut self) {
+        self.css_set.release();
+    }
 }
 
 impl TaskCgroupRef {
     pub fn new(node: Arc<CgroupNode>) -> Self {
-        Self { node }
+        let css_set = node.css_set();
+        css_set.acquire();
+        Self { node, css_set }
     }
 
     pub fn node(&self) -> Arc<CgroupNode> {
         self.node.clone()
+    }
+
+    pub fn css_set_id(&self) -> usize {
+        self.css_set.id()
     }
 }
 
@@ -901,7 +1253,18 @@ pub fn cgroup_migrate_vet_dst(dst: &Arc<CgroupNode>) -> Result<(), SystemError> 
     if !cgroup_root().is_online(dst) {
         return Err(SystemError::ENOENT);
     }
-    if dst.parent().is_some() && dst.subtree_control().iter().any(|ctrl| ctrl == "memory") {
+    // Domain controllers cannot manage tasks in a threaded subtree.
+    if dst.in_threaded_subtree()
+        && dst
+            .subtree_control()
+            .iter()
+            .any(|ctrl| matches!(ctrl.as_str(), "memory" | "io"))
+    {
+        return Err(SystemError::EBUSY);
+    }
+    // Linux's no-internal-process rule applies to non-threaded domain
+    // controllers. pids/cpu/cpuset are threaded; memory and io are domains.
+    if dst.parent().is_some() && dst.has_domain_controllers() {
         return Err(SystemError::EBUSY);
     }
     Ok(())
@@ -926,30 +1289,12 @@ pub fn cgroup_can_fork_in(node: &Arc<CgroupNode>, new_tasks: usize) -> Result<()
 }
 
 pub fn cgroup_migrate_vet_dst_with_src(
-    src: &Arc<CgroupNode>,
+    _src: &Arc<CgroupNode>,
     dst: &Arc<CgroupNode>,
-    moved_tasks: usize,
+    _moved_tasks: usize,
 ) -> Result<(), SystemError> {
-    cgroup_migrate_vet_dst(dst)?;
-
-    let mut cur = Some(dst.clone());
-    while let Some(cg) = cur {
-        if let Some(max) = cg.pids_max() {
-            let used = cg.pids_current_count();
-            let delta = if cg.is_ancestor_of(src) {
-                0
-            } else {
-                moved_tasks
-            };
-            if used.saturating_add(delta) > max {
-                cg.inc_pids_events_max();
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
-            }
-        }
-        cur = cg.parent();
-    }
-
-    Ok(())
+    // pids.max constrains fork/clone, not organizational migration.
+    cgroup_migrate_vet_dst(dst)
 }
 
 #[allow(dead_code)]

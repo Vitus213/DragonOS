@@ -10,6 +10,7 @@
   vsockDeviceModel ? "vhost-vsock-pci-non-transitional",
   vmstateDir ? null,
   preferSystemQemu ? false,
+  isDarwin ? false,
 }:
 
 let
@@ -34,30 +35,32 @@ let
   mkQemuArgs =
     { arch, isNographic }:
     let
-      baseArgs = [
-        "-m"
-        baseConfig.memory
-        "-smp"
-        "${baseConfig.cores},cores=${baseConfig.cores},threads=1,sockets=1"
-        "-object"
-        "memory-backend-file,size=${baseConfig.memory},id=${baseConfig.shmId},mem-path=/dev/shm/${baseConfig.shmId},share=on"
-        "-usb"
-        "-device"
-        "qemu-xhci,id=xhci,p2=8,p3=4"
-        "-D"
-        "qemu.log"
-
-        # Boot Order
-        "-boot"
-        "order=d"
-        "-rtc"
-        "clock=host,base=localtime"
-        # Trace events
-        "-d"
-        "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
-        "-trace"
-        "fw_cfg*"
-      ];
+      baseArgs =
+        [
+          "-m"
+          baseConfig.memory
+          "-smp"
+          "${baseConfig.cores},cores=${baseConfig.cores},threads=1,sockets=1"
+        ]
+        ++ lib.optionals (!isDarwin) [
+          "-object"
+          "memory-backend-file,size=${baseConfig.memory},id=${baseConfig.shmId},mem-path=/dev/shm/${baseConfig.shmId},share=on"
+        ]
+        ++ [
+          "-usb"
+          "-device"
+          "qemu-xhci,id=xhci,p2=8,p3=4"
+          "-D"
+          "qemu.log"
+          "-boot"
+          "order=d"
+          "-rtc"
+          "clock=host,base=localtime"
+          "-d"
+          "cpu_reset,guest_errors,trace:virtio*,trace:e1000e_rx*,trace:e1000e_tx*,trace:e1000e_irq*"
+          "-trace"
+          "fw_cfg*"
+        ];
       nographicArgs = lib.optionals isNographic (
         [
           "--nographic"
@@ -91,8 +94,6 @@ let
       flags = baseArgs ++ nographicArgs;
       cmdlineExtra = kernelCmdlinePart;
     };
-
-  # 4. 运行脚本生成器
   mkRunScript =
     {
       name,
@@ -106,12 +107,11 @@ let
 
       initProgram = if arch == "riscv64" then "/bin/riscv_rust_init" else "/bin/busybox init";
 
-      # Define static parts of arguments using Nix lists
       commonArchArgs =
         if arch == "x86_64" then
           [
             "-machine"
-            "q35,memory-backend=${baseConfig.shmId}"
+            "q35${lib.optionalString (!isDarwin) ",memory-backend=${baseConfig.shmId}"}"
             "-cpu"
             "IvyBridge,apic,x2apic,+fpu,check,+vmx,"
           ]
@@ -133,7 +133,7 @@ let
             "-device"
             "pcie-root-port"
             "-drive"
-            "id=disk,file=${diskPath},if=none"
+            "id=disk,file=${diskPath},if=none,format=raw"
           ]
         else
           [
@@ -147,15 +147,17 @@ let
       archSpecificBash =
         if arch == "x86_64" then
           ''
-            if [ "$ACCEL" == "kvm" ]; then
-                ARCH_FLAGS+=( "-machine" "accel=kvm" "-enable-kvm" )
-            else
-                ARCH_FLAGS+=( "-machine" "accel=tcg" )
-            fi
+            ${if isDarwin then ''ARCH_FLAGS+=( "-machine" "accel=tcg" )'' else ''
+              if [ "$ACCEL" == "kvm" ]; then
+                  ARCH_FLAGS+=( "-machine" "accel=kvm" "-enable-kvm" )
+              else
+                  ARCH_FLAGS+=( "-machine" "accel=tcg" )
+              fi
+            ''}
           ''
         else
           ''
-            ARCH_FLAGS+=( "-machine" "virt,accel=$ACCEL,memory-backend=${baseConfig.shmId}" )
+            ARCH_FLAGS+=( "-machine" "virt,accel=$ACCEL${lib.optionalString (!isDarwin) ",memory-backend=${baseConfig.shmId}"}" )
           '';
 
       # VM 状态目录配置
@@ -184,7 +186,7 @@ let
         local start_port=$1
         local port=$start_port
         while [ $port -lt 65535 ]; do
-          if ! ${pkgs.iproute2}/bin/ss -tuln | grep -q ":$port "; then
+          if ${if isDarwin then "! /usr/sbin/lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1" else "! ${pkgs.iproute2}/bin/ss -tuln | grep -q \":$port \""}; then
             echo $port
             return 0
           fi
@@ -335,7 +337,7 @@ let
       }
 
       cleanup() {
-        sudo rm -f /dev/shm/${baseConfig.shmId}
+        ${lib.optionalString (!isDarwin) "sudo rm -f /dev/shm/${baseConfig.shmId}"}
         ${
           if hasVmstateDir then
             ''rm -f "$VMSTATE_DIR/pid" "$VMSTATE_DIR/vsock_cid" "$VMSTATE_DIR/port" "$VMSTATE_DIR/gdb"''
@@ -344,10 +346,6 @@ let
         }
       }
       trap cleanup EXIT
-      # FIXED: 既然用了 sudo 运行 qemu，这里创建 shm 也需要权限，
-      # 但实际上 qemu 会自己创建，这里只需要保证清理。
-      # 原脚本是 rm -rf ... -> qemu -> rm -rf ...
-
       EXTRA_CMDLINE="${qemuConfig.cmdlineExtra}"
       CONSOLE_TERM_CMDLINE=""
 
@@ -382,7 +380,7 @@ let
       RNG_ARGS=( "-device" "${if arch == "riscv64" then "virtio-rng-device" else "virtio-rng-pci"}" )
 
       echo -e "================== DragonOS QEMU Command Preview =================="
-      echo -e "Binary: sudo ${qemuBin}"
+      echo -e "Binary: ${qemuBin}"
       echo -e "Base Flags: ${qemuFlagsStr}"
       echo -e "Arch Flags: ''${ARCH_FLAGS[*]}"
       echo -e "Boot Args: ''${BOOT_ARGS[*]}"
@@ -400,7 +398,17 @@ let
       # 使用 exec 方式启动 QEMU，保持交互能力并记录 PID
       # 参考 tools/run-qemu.sh 的 launch_qemu 函数实现
       ${
-        if hasVmstateDir then
+        if isDarwin then
+          ''
+            ${lib.optionalString debug ''
+              GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
+              if [ "''${QEMU_GDB_WAIT:-0}" = "1" ]; then
+                GDB_ARGS+=( "-S" )
+              fi
+            ''}
+            ${qemuBin} ${qemuFlagsStr} "''${NET_ARGS[@]}" "''${RNG_ARGS[@]}" "''${ARCH_FLAGS[@]}" "''${BOOT_ARGS[@]}" "''${DISK_ARGS[@]}" "''${VSOCK_ARGS[@]}" ${lib.optionalString debug ''"''${GDB_ARGS[@]}"''} "$@"
+          ''
+        else if hasVmstateDir then
           ''
             ${lib.optionalString debug ''
               GDB_ARGS=( "-gdb" "tcp::$GDB_PORT" )
