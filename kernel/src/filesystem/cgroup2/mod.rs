@@ -22,8 +22,15 @@ mod mount;
 
 pub(super) const CGROUP2_MAX_NAMELEN: usize = 255;
 pub(super) const CGROUP2_BLOCK_SIZE: u64 = 512;
-pub(super) const AVAILABLE_CONTROLLERS: [&str; 6] =
-    ["cpu", "memory", "pids", "cpuset", "io", "freezer"];
+/// cgroup.controllers 列出的可启用控制器。
+///
+/// 不含 freezer：Linux 6.6 的 v2 freezer 是 cgroup 核心功能而非
+/// cgroup_subsys（kernel/cgroup/freezer.c，cgroup.freeze/cgroup.events 为
+/// 基础文件）；legacy v1 的 freezer_cgrp_subsys（legacy_freezer.c）没有
+/// dfl_cftypes，被 cgroup_init() 计入 cgrp_dfl_inhibit_ss_mask，由
+/// cgroup_control() 从默认层级根的列表中过滤掉，故任何组都不会列出。
+pub(super) const AVAILABLE_CONTROLLERS: [&str; 5] =
+    ["cpu", "memory", "pids", "cpuset", "io"];
 pub(super) const DOMAIN_CONTROLLERS: [&str; 2] = ["memory", "io"];
 
 pub fn cgroup2_init() -> Result<(), SystemError> {

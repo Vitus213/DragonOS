@@ -388,7 +388,9 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         }
         CgroupCoreFile::Type => format!("{}\n", cgroup.cgroup_type_name()).into_bytes(),
         CgroupCoreFile::Freeze => {
-            format!("{}\n", if cgroup.freeze_requested() { 1 } else { 0 }).into_bytes()
+            // Linux 6.6 cgroup_freeze_show() 只回显本组自身的请求
+            // （cgrp->freezer.freeze），不含祖先传播的有效冻结。
+            format!("{}\n", if cgroup.freeze_self_requested() { 1 } else { 0 }).into_bytes()
         }
         CgroupCoreFile::CpuStat => cpu_stat_for(cgroup),
         CgroupCoreFile::CpuWeight => cpu_bytes(cgroup, |cpu| {

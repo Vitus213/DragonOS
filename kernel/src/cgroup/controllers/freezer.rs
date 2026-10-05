@@ -14,9 +14,10 @@ use super::super::{
     subsys::{CgroupSubsys, CgroupSubsysId, CgroupSubsysState, CssFlags},
 };
 
-/// 冻结请求来源位。对应 Linux 的 CGROUP_FREEZING_SELF / CGROUP_FREEZING_PARENT：
-/// SELF 表示本组的 cgroup.freeze 写入，PARENT 表示冻结由祖先传播而来；
-/// 两者任一置位即处于冻结请求状态，读 cgroup.freeze 返回 1。
+/// 冻结请求来源位。对应 Linux 6.6 的 `freezer.freeze`（自身请求）与有效冻结
+/// `freezer.e_freeze`（自身或祖先任一发起）：SELF 表示本组的 cgroup.freeze
+/// 写入，PARENT 表示冻结由祖先传播而来；两者任一置位即处于有效冻结状态。
+/// 注意 cgroup.freeze 的读取值只回显 SELF 位（见 freeze_self_requested）。
 const FREEZING_SELF: u8 = 1 << 0;
 const FREEZING_PARENT: u8 = 1 << 1;
 
@@ -60,6 +61,15 @@ impl FreezerCss {
 
     pub fn freeze_requested(&self) -> bool {
         self.freeze_mask.load(Ordering::Acquire) != 0
+    }
+
+    /// cgroup.freeze 的读取值：只反映本组自身的冻结请求（FREEZING_SELF）。
+    ///
+    /// Linux 6.6 kernel/cgroup/cgroup.c 的 cgroup_freeze_show() 回显
+    /// `cgrp->freezer.freeze`（本组自己的请求位），祖先传播来的有效冻结
+    /// `e_freeze` 不出现在该文件中：祖先冻结下的子组读 cgroup.freeze 为 0。
+    pub fn freeze_self_requested(&self) -> bool {
+        self.freeze_mask.load(Ordering::Acquire) & FREEZING_SELF != 0
     }
 
     /// 写 cgroup.freeze 的入口。与迁移（write_procs）互斥于
@@ -114,12 +124,19 @@ impl FreezerCss {
             .saturating_add(self.nr_frozen_descendants())
     }
 
+    /// 是否已冻结。对应 Linux 6.6 kernel/cgroup/freezer.c 的
+    /// cgroup_update_frozen()：`frozen = CGRP_FREEZE && nr_frozen_tasks ==
+    /// __cgroup_task_count(cgrp)`。空组在有效冻结请求下 0 == 0 立即视为
+    /// 已冻结（Linux 在 cgroup_do_freeze() 收尾特意重访状态以覆盖空叶子
+    /// 组），因此冻结没有任何任务的组时 cgroup.events 的 frozen 为 1。
     pub fn is_frozen(&self) -> bool {
+        if !self.freeze_requested() {
+            return false;
+        }
         let Some(cgroup) = self.cgroup.upgrade() else {
             return false;
         };
-        let nr_tasks = cgroup.subtree_task_count();
-        nr_tasks != 0 && self.nr_frozen_total() == nr_tasks
+        self.nr_frozen_total() == cgroup.subtree_task_count()
     }
 
     /// 冻结本组任务并向全部后代传播 FREEZING_PARENT。
@@ -404,10 +421,24 @@ impl CgroupSubsys for FreezerController {
 
     fn css_alloc(
         &self,
-        _parent: Option<&Arc<dyn CgroupSubsysState>>,
+        parent: Option<&Arc<dyn CgroupSubsysState>>,
         cgroup: &Arc<CgroupNode>,
     ) -> Result<Arc<dyn CgroupSubsysState>, SystemError> {
-        Ok(FreezerCss::new(Arc::downgrade(cgroup)))
+        // Linux 6.6 kernel/cgroup/cgroup.c 的 cgroup_create()：
+        // `cgrp->freezer.e_freeze = parent->freezer.e_freeze;`——父组处于
+        // 有效冻结时，新组直接继承有效冻结并立刻置 CGRP_FREEZE|CGRP_FROZEN
+        // （新组无任务，视为立即冻结）。这里继承 FREEZING_PARENT 而不置
+        // FREEZING_SELF，于是子组 cgroup.freeze 仍读 0；之后任务经
+        // attach()/fork() 落入即冻，is_frozen() 对空子组立即报 1。
+        let css = FreezerCss::new(Arc::downgrade(cgroup));
+        if let Some(parent_css) = parent {
+            if let Some(parent) = parent_css.as_any().downcast_ref::<FreezerCss>() {
+                if parent.freeze_requested() {
+                    css.freeze_mask.fetch_or(FREEZING_PARENT, Ordering::AcqRel);
+                }
+            }
+        }
+        Ok(css)
     }
 
     fn css_free(&self, _css: &Arc<dyn CgroupSubsysState>) {}

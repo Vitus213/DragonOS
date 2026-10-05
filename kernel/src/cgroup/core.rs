@@ -624,6 +624,17 @@ impl CgroupNode {
         false
     }
 
+    /// 本组自身的 freeze 请求（不含祖先传播），cgroup.freeze 的读取值。
+    /// Linux 6.6 的 cgroup_freeze_show() 只回显 `cgrp->freezer.freeze`。
+    pub fn freeze_self_requested(&self) -> bool {
+        if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
+            if let Some(freezer) = freezer_css.as_any().downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>() {
+                return freezer.freeze_self_requested();
+            }
+        }
+        false
+    }
+
     /// 设置 freeze 请求
     pub fn set_freeze_requested(&self, freeze: bool) {
         if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
@@ -716,12 +727,20 @@ impl CgroupRoot {
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let child = CgroupNode::new_child(id, name.to_string(), parent);
+        // 冻结状态继承必须与 cgroup.freeze 写互斥：Linux 6.6 中 mkdir 与
+        // freezer 状态变更同处 cgroup_mutex 之下，父组冻结期间创建的子组
+        // 不可能错过继承。这里用 accounting lock 覆盖「css_alloc 读取父组
+        // 冻结位 → 子组挂入 children 对外可见」整个窗口（锁序 structure →
+        // accounting 与 remove_child 一致），使 freezer 的子树传播要么在
+        // 子组可见前完成（由继承负责），要么已能看到子组（由传播负责）。
+        let accounting_guard = cgroup_accounting_lock().lock();
         Self::initialize_css(&child, Some(parent))?;
         child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
         parent
             .children
             .write()
             .insert(name.to_string(), child.clone());
+        drop(accounting_guard);
 
         self.all_nodes.lock().insert(id, child.clone());
         Ok(child)
