@@ -991,7 +991,8 @@ impl BlockDevice for VirtIOBlkDevice {
     }
 
     fn sync(&self) -> Result<(), SystemError> {
-        let bio = BioRequest::new_flush();
+        // flush 缓冲分配走记账分配器：拒绝时把 ENOMEM 返回给 sync() 调用者。
+        let bio = BioRequest::try_new_flush()?;
         self.submit_bio(bio.clone())?;
         bio.wait_status()
             .inspect_err(|e| log::error!("VirtIOBlkDevice sync flush error: {:?}", e))?;

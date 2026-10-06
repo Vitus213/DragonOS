@@ -141,11 +141,20 @@ impl PerfEventOps for TracepointPerfEvent {
         #[cfg(target_arch = "x86_64")]
         {
             log::info!("Using JIT compilation for BPF program on x86_64 architecture");
-            let jit_mem = Box::new(JITMem::new());
-            let jit_mem = Box::leak(jit_mem);
-            let jit_mem_addr = core::ptr::from_ref::<JITMem>(jit_mem) as usize;
-            vm.set_jit_exec_memory(jit_mem).unwrap();
-            vm.jit_compile().unwrap();
+            // memcg 计费拒绝（当前任务组 memory.max 打满）是可预期的 ENOMEM，
+            // 必须经 `?` 传播回 PERF_EVENT_IOC_SET_BPF 调用者，而不是 panic。
+            let jit_mem = Box::new(JITMem::try_for_bpf_program(prog_slice.len())?);
+            let jit_mem_addr = Box::into_raw(jit_mem) as usize;
+            let jit_result = unsafe {
+                vm.set_jit_exec_memory(&mut *(jit_mem_addr as *mut JITMem))
+                    .and_then(|_| vm.jit_compile())
+            };
+            if let Err(err) = jit_result {
+                log::error!("tracepoint BPF JIT compilation failed: {:?}", err);
+                // 归还已泄漏前的所有权，触发 uncharge，避免计费滞留。
+                unsafe { drop(Box::from_raw(jit_mem_addr as *mut JITMem)) };
+                return Err(SystemError::EINVAL);
+            }
             let basic_callback = BasicPerfEbpfCallBack::new(file, vm, jit_mem_addr);
             callback = Arc::new(TracePointPerfCallBack(basic_callback));
         }
