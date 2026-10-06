@@ -29,7 +29,7 @@
 | core | `cgroup.freeze` / `cgroup.events` | real | freezer 状态机消费；frozen 计数上抛 events |
 | cpu | `cpu.max` | real | `CpuCss::refresh_period/try_consume_runtime` 接入 fair `update_current`（tick/pick_next 共同路径），实体级节流期限 + 周期边界自动恢复 |
 | cpu | `cpu.weight` | real | `set_shares` → `reweight_task_cpu_weight`，对已入队实体实时生效 |
-| cpu | `cpu.stat` | real | `throttled_usec/nr_throttled/nr_periods` 在节流/恢复路径累计 |
+| cpu | `cpu.stat` | real | `throttled_usec/nr_throttled/nr_periods` 在节流/恢复路径累计；`usage_usec/user_usec/system_usec` 按 tick 的 user/kernel 现场分类计费（issue #36） |
 | memory | `memory.current/peak` | real | `MemoryCss::try_charge/uncharge` + 每帧归属（PAGE_OWNERS） |
 | memory | `memory.min/low/high/max` | real | min/low 存储 + 回收权重占位；high 缺页路径有界节流；max 事务式祖先链检查，拒绝走 `oom::scoped_out_of_memory` |
 | memory | `memory.events` / `memory.stat` | real | high/max 事件计数；RSS 分项统计 |
@@ -43,11 +43,11 @@
 
 ## 与 Linux 6.6 的明确边界
 
-- CPU 带宽闭环：fair 实体在 `update_current`（`entity_tick`/`pick_next_task` 的共同计费点）按 `cpu.max` 扣减配额，配额耗尽时写入实体级节流期限（`bandwidth_throttled_until`，扁平模型下 Linux "throttle cfs_rq" 的等价物——实体保留记账但 `entity_eligible`/pick 路径不再选中它），rq 记录最早期限并在周期边界唤醒调度器；下次计费时 `refresh_period` 滚动周期、补充配额并自动解除节流（unthrottle），`throttled_time`/`nr_throttled`/`nr_periods` 累计进 `cpu.stat`。与 Linux 6.6 的剩余差距：尚无 per-task_group 的 `cfs_rq`/组实体挂入运行队列树（`CfsRunQueue::throttled`/`throttled_count` 组级状态机与组路径入队/出队终止逻辑已对齐 `enqueue_task_fair`/`dequeue_task_fair`，但当前无触发者）；配额是 cgroup 全局池而非 per-CPU slice 分发（无 slack 分发/period timer，周期推进为惰性）；祖先 cgroup 配额不逐级计费；`cpu.stat` 用户/系统时间未按执行现场分类。
+- CPU 带宽闭环：fair 实体在 `update_current`（`entity_tick`/`pick_next_task` 的共同计费点）按 `cpu.max` 扣减配额，配额耗尽时写入实体级节流期限（`bandwidth_throttled_until`，扁平模型下 Linux "throttle cfs_rq" 的等价物——实体保留记账但 `entity_eligible`/pick 路径不再选中它），rq 记录最早期限并在周期边界唤醒调度器；下次计费时 `refresh_period` 滚动周期、补充配额并自动解除节流（unthrottle），`throttled_time`/`nr_throttled`/`nr_periods` 累计进 `cpu.stat`。与 Linux 6.6 的剩余差距：尚无 per-task_group 的 `cfs_rq`/组实体挂入运行队列树（`CfsRunQueue::throttled`/`throttled_count` 组级状态机与组路径入队/出队终止逻辑已对齐 `enqueue_task_fair`/`dequeue_task_fair`，但当前无触发者）；配额是 cgroup 全局池而非 per-CPU slice 分发（无 slack 分发/period timer，周期推进为惰性）；祖先 cgroup 配额不逐级计费；`cpu.stat` 用户/系统时间已按 tick 的 user/kernel 现场分类计费（非 tick 残差段归 system，issue #36），但无 per-cpu rstat 聚合与父级层级汇总。
 - fair/RT 支持边界：`cpu.max` 与 `cpu.weight` 只作用于 fair 调度类；SCHED_RT 任务不参与 CFS 带宽控制（与 Linux CFS bandwidth 仅约束 fair class 一致，RT 由独立的 rt bandwidth 机制管理——DragonOS 中为 `RealtimeScheduler` 的 rq 级 `rt.is_throttled()` 节流，不读 cpu 控制器状态）；`cpu.weight` 写入对非 fair 任务为 no-op；DL 调度类未实现。
 - memory 计费具备祖先 max 原子检查、每帧归属记录（释放方与计费方解耦）和 cgroup 范围 OOM（复用 oom.rs 状态机）；`memory.high` 节流与 `memory.max` OOM 都在缺页路径执行，计费路径本身不睡眠不回收。与 Linux 6.6 的剩余差距：无 per-memcg LRU/回收目标（复用全局回收器）、无 charge 迁移（move_charge_at_immigrate）、无 memory.min/low 保护加权、无 swap 实际计费（swap.* 文件仅为接口占位）、slab 对象级记账并入页级计费（无 obj_cgroup）。
 - IO 限速在块设备分发前端以同步等待实现（提交任务睡眠到 slice 边界后重查），不是 Linux block layer 的延迟派发队列（throtl_service_queue/pending_timer）与 bio 层分层节流；超大单次传输按“每 slice 首个请求放行”保证前进；io.stat 在完成时记账，无 per-cpu rstat 聚合。
-- 本轮审计修复的明确范围：修正 `memory.min/low` 默认值、`cpu.max` quota 下界、freezer 生命周期/迁移/唤醒、memcg 内核分配绕过与 scoped OOM。以下审计项仍未实现，不能以“已支持”描述：`cpu.stat` user/system 现场分类与父级 rstat 聚合、`io.weight` 仲裁及 `io.stat` 层级聚合、cpuset 用户 affinity 在迁移后的独立恢复与 `cpuset.mems` NUMA 放置、`write_procs` 多控制器失败回滚；原因分别是调度现场分类、块设备公平队列、任务 affinity 双掩码、NUMA 分配器和迁移事务尚未存在。
+- 本轮审计修复的明确范围：修正 `memory.min/low` 默认值、`cpu.max` quota 下界、freezer 生命周期/迁移/唤醒、memcg 内核分配绕过与 scoped OOM。以下审计项仍未实现，不能以“已支持”描述：`cpu.stat` 父级 rstat 层级聚合（user/system 现场分类已于 issue #36 落地）、`io.weight` 仲裁及 `io.stat` 层级聚合、cpuset 用户 affinity 在迁移后的独立恢复与 `cpuset.mems` NUMA 放置、`write_procs` 多控制器失败回滚；原因分别是块设备公平队列、任务 affinity 双掩码、NUMA 分配器和迁移事务尚未存在。
 - CSS-set token 是每个 cgroup 的稳定生命周期标识，不是 Linux 完整的跨 cgroup CSS 集合哈希去重；threaded 状态机覆盖基础文件语义，未实现完整 threaded domain CSS 传播。
 - freezer 已避免直接伪造唤醒已有 sleeper，但尚未覆盖 Linux job-control freezer 的全部信号/停机交互。
 - pids、cpuset 和 cgroup2 文件接口已覆盖本轮调用链；hugetlb、rdma、misc 等未注册控制器仍不属于当前移植范围。
