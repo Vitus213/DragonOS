@@ -61,5 +61,6 @@ Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 1
 - 回写批次认领时聚合归属（`pick_batch_io_owner` 取首个已知脏主），`submit_writeback_batch` 在 token submission/legacy write_pages/inode 直写三个派发分支前安装覆写，异步 completion 路径（ext4 `account_io_for` 提交时捕获）随之前移解析到脏主。
 - 页回收单页写回（`mm/page.rs::page_writeback`）认领后经 `PageCache::dirty_io_owner` 读回归属并围绕 `write_page`/`write_direct` 安装覆写。
 - 异步读补齐：page cache 预读 work（`start_async_read`）与默认批量读兼容路径（`submit_default_read_batch`）在调度者上下文解析归属、工作线程内安装覆写。
+- 单页异步派发补齐：`AsyncPageCacheBackend::read_page_async`/`write_page_async`（ext4/FAT 常规 inode 与缺页读回填、单页异步写回所走的两跳工作线程派发）在调用方（缺页任务，或已安装脏主覆写的回写/预读线程）解析归属、`pagecache-io`/`pagecache-wb` 工作线程闭包内安装覆写；此前这两跳会把预读/单页回写降级回线程归属（根组），丢失上游批次覆写。
 - 直调点核对（SOP3）：BlockDevice `submit_bio*`/`read_at_sync`/`write_at_sync` 的驱动实现体（virtio_blk/ahcidisk/pmem/mmc/loop_device）均在 GenDisk/适配层 hook 之下；`GenDisk::sync`/`sync_file`/ext4 `flush` 携带 0 字节、按 bytes==0 短路不参与限速（与 Linux blk-flush 不计 io.max 一致）；FATFsInfo::update、LoopDevice 裸 IndexNode 读写为死代码路径。边界如实记入 `CONTROLLER_FRAMEWORK.md`（混合归属批次取首主、ext4 journal 元数据仍按线程归属）。
 - `make kernel ARCH=x86_64` 通过；归属聚合与设备 key 规则有宿主机可运行的 `#[cfg(test)]` 单测。
