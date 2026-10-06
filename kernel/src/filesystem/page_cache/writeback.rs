@@ -4852,8 +4852,8 @@ mod tests {
         let picked = pick_batch_io_owner(owners.iter().cloned());
         assert!(Arc::ptr_eq(&picked.unwrap(), &second));
 
-        let owners = [None, None];
+        let owners: [Option<Arc<u32>>; 2] = [None, None];
         assert!(pick_batch_io_owner(owners.iter().cloned()).is_none());
-        assert!(pick_batch_io_owner(core::iter::empty()).is_none());
+        assert!(pick_batch_io_owner(core::iter::empty::<Option<Arc<u32>>>()).is_none());
     }
 }
