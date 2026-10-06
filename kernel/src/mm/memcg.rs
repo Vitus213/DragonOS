@@ -66,7 +66,6 @@ use crate::{
     arch::MMArch,
     cgroup::{
         controllers::memory::{ChargeToken, MemoryCss},
-        core::CgroupNode,
         subsys::{CgroupSubsysId, CgroupSubsysState},
     },
     libs::spinlock::SpinLock,
