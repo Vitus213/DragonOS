@@ -383,7 +383,7 @@ impl Scheduler for RealtimeScheduler {
         rq.rt.pick_next()
     }
 
-    fn tick(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, _queued: bool) {
+    fn tick(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, _queued: bool, _user_tick: bool) {
         debug_assert_eq!(pcb.sched_info().sched_class(), SchedClass::Realtime);
 
         let Some(highest) = rq.rt.highest_prio() else {
