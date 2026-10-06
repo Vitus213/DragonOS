@@ -18,6 +18,28 @@ use crate::{
     process::RawPid,
 };
 
+/// 对无符号计数器做饱和递减：计数已为 0 时停在 0，绝不回绕翻转成
+/// `usize::MAX`。
+///
+/// cgroup 成员/pids 计数在配对正确时与非零；一旦某个语义缺陷造成
+/// 单次失配（重复 remove_task/uncharge），裸 `fetch_sub` 会把计数器
+/// 翻转为极大值：`pids.current` 变 `usize::MAX` 后 try_charge/can_attach
+/// 恒 EAGAIN，整组永久无法 fork；`subtree_task_counter` 翻转则让
+/// `is_populated`/rmdir/domain 切换判定全部失真。饱和递减把失配的损害
+/// 限制为"该层计数偏低"，可被后续正常配对逐步自愈，且不会制造
+/// 永久性的组级 EAGAIN/EBUSY。所有调用点都持有
+/// `cgroup_accounting_lock`；顺序对与既有 `fetch_sub(_, Release)` 兼容
+/// （成功 Release、失败 Acquire，保守取 AcqRel/Acquire）。
+pub(crate) fn saturating_sub(counter: &AtomicUsize) {
+    let _ = counter.fetch_update(Ordering::AcqRel, Ordering::Acquire, |v| {
+        if v == 0 {
+            None
+        } else {
+            Some(v - 1)
+        }
+    });
+}
+
 /// `BPF_F_PREORDER` is not generated in the current Linux BPF bindings.
 pub const BPF_DEVICE_F_PREORDER: u32 = 1 << 6;
 const BPF_CGROUP_MAX_PROGS: usize = 64;
@@ -338,7 +360,10 @@ impl CgroupNode {
         }
         let mut cur = self.parent();
         while let Some(node) = cur {
-            node.subtree_task_counter.fetch_sub(1, Ordering::Release);
+            // 饱和递减：成员集合命中与计数严格配对，但防御任何未来失配
+            // （如重复 remove）把祖先计数翻转成 usize::MAX——那会让
+            // is_populated/rmdir 与 domain 切换判定永久失真（EBUSY）。
+            saturating_sub(node.subtree_task_counter());
             refresh_domain_state(&node);
             cur = node.parent();
         }
@@ -1410,5 +1435,58 @@ mod tests {
         let right = root.create_child(&root.root(), "right").unwrap();
 
         assert_eq!(cgroup_path_from_view(&right, &left), "/../right");
+    }
+
+    #[test]
+    fn add_remove_pair_keeps_subtree_counter_exact() {
+        let root = CgroupRoot::new();
+        let parent = root.create_child(&root.root(), "p").unwrap();
+        let child = root.create_child(&parent, "c").unwrap();
+
+        child.add_task(RawPid::new(101));
+        assert_eq!(parent.subtree_task_counter().load(Ordering::Acquire), 1);
+        child.remove_task(RawPid::new(101));
+        assert_eq!(parent.subtree_task_counter().load(Ordering::Acquire), 0);
+    }
+
+    /// 固定住幽灵迁移路径的第一半：do_exit 的 remove_task 先摘除成员后，
+    /// 任何对同一 pid 的二次 remove_task（修复前 write_procs 对正退出任务
+    /// 执行 `set_task_cgroup_node` 时对 src 的重复摘除即此形态）在 debug
+    /// 内核必须命中 debug_assert panic——这正是 issue #29 的崩溃点；
+    /// 锁内二次复核把该路径在到达这里之前剔除。
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "does not exist")]
+    fn repeated_remove_task_of_dead_member_panics_under_debug_kernel() {
+        let root = CgroupRoot::new();
+        let src = root.create_child(&root.root(), "src").unwrap();
+        src.add_task(RawPid::new(7));
+        src.remove_task(RawPid::new(7)); // do_exit 锁内摘除
+        src.remove_task(RawPid::new(7)); // 迁移侧迟到的重复摘除 → panic
+    }
+
+    /// release 内核（debug_assert 被编译掉）下同一失配不 panic，成员集
+    /// 未命中提前返回，祖先 subtree_task_counter 保持 0，不翻转成
+    /// usize::MAX——修复前的翻转会让 is_populated/rmdir 与 domain 判定
+    /// 永久失真（EBUSY）。
+    #[cfg(not(debug_assertions))]
+    #[test]
+    fn repeated_remove_task_does_not_wrap_subtree_counter() {
+        let root = CgroupRoot::new();
+        let parent = root.create_child(&root.root(), "p").unwrap();
+        let src = root.create_child(&parent, "src").unwrap();
+        src.add_task(RawPid::new(7));
+        src.remove_task(RawPid::new(7));
+        src.remove_task(RawPid::new(7));
+        assert_eq!(parent.subtree_task_counter().load(Ordering::Acquire), 0);
+    }
+
+    #[test]
+    fn saturating_sub_stops_at_zero() {
+        let counter = AtomicUsize::new(2);
+        saturating_sub(&counter);
+        saturating_sub(&counter);
+        saturating_sub(&counter);
+        assert_eq!(counter.load(Ordering::Acquire), 0);
     }
 }
