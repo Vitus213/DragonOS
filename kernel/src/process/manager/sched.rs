@@ -590,7 +590,33 @@ impl ProcessManager {
     ) -> Result<(), SystemError> {
         let mut pi_guard = pcb.sched_info().pi_lock_irqsave();
         pi_guard.set_cpus_allowed(mask.clone());
+        Self::settle_cpus_allowed_placement(pcb, &mask)
+    }
 
+    /// 以"与任务现有 affinity 求交集"的方式原子发布 cpuset 策略收窄。
+    ///
+    /// 交集的读取与写回都发生在目标任务 `pi_lock` 的同一临界区内，与
+    /// `sched_setaffinity`（同样在 `pi_lock` 临界区内发布 affinity）对
+    /// `cpus_allowed` 的修改线性化互斥，杜绝"先在锁外读旧 mask、写回时
+    /// 覆盖用户刚显式设置的 affinity"的丢失更新。交集为空时返回 EINVAL
+    /// 且不改动 affinity：调用方必须上报失败，而不是跳过该任务继续沿用
+    /// 违反新策略的旧 mask。
+    pub(crate) fn set_cpus_allowed_and(
+        pcb: &Arc<ProcessControlBlock>,
+        policy: &CpuMask,
+    ) -> Result<(), SystemError> {
+        let mut pi_guard = pcb.sched_info().pi_lock_irqsave();
+        let mask = pi_guard.narrow_cpus_allowed(policy)?;
+        Self::settle_cpus_allowed_placement(pcb, &mask)
+    }
+
+    /// affinity 发布后的迁移决策段。调用者必须持有 `pcb` 的 `pi_lock`
+    /// （锁的获取与释放都在上层同一个临界区内完成），锁序
+    /// `pi_lock → rq_lock` 与 Linux `task_rq_lock()` 一致。
+    fn settle_cpus_allowed_placement(
+        pcb: &Arc<ProcessControlBlock>,
+        mask: &CpuMask,
+    ) -> Result<(), SystemError> {
         if pcb.sched_info().is_new_task() {
             return Ok(());
         }
@@ -606,7 +632,7 @@ impl ProcessManager {
 
         if let Some(cpu) = pcb.sched_info().on_cpu() {
             if !mask.get(cpu).unwrap_or(false) {
-                let dest_cpu = select_task_rq(pcb, cpu, WakeupFlags::WF_TTWU, &mask);
+                let dest_cpu = select_task_rq(pcb, cpu, WakeupFlags::WF_TTWU, mask);
                 crate::sched::request_task_migration(pcb, dest_cpu)?;
             }
         }
@@ -828,6 +854,19 @@ impl ProcessManager {
             return;
         }
         if state.is_blocked() {
+            if pcb.flags().contains(ProcessFlags::FROZEN) {
+                // 冻结任务不可被"撤销睡眠"拉回运行态（issue #32）：
+                // __refrigerator() 的 EnterInPlace 或 freeze_task() 的睡眠
+                // 直接转换可能落在 mark_sleep 与本次撤销之间，此刻 FROZEN
+                // 与计数已落账；把 Blocked 抬回 Runnable 会让任务带着冻结
+                // 账目继续运行——正是 #32 的逃逸形态。改走暂存：触发撤销的
+                // 那次 wakeup() 已消费原事件，置 WAKE_PENDING 让解冻路径
+                // （unfreeze_task/迁移解冻）重放唤醒，任务回 Runnable 重查
+                // 等待条件；本轮 __schedule() 照常把它挂起。与 signal_wake
+                // 的 FROZEN 守卫同理。
+                pcb.flags().insert(ProcessFlags::WAKE_PENDING);
+                return;
+            }
             // Only promote the Blocked written by this mark_sleep back to Runnable.
             pcb.sched_info().set_state(ProcessState::Runnable);
             fence(Ordering::SeqCst);

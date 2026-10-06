@@ -308,9 +308,9 @@ impl FreezerCss {
                 self.update_ancestor_counts(-1);
             }
 
-            // The refrigerator always enters from Runnable.  A task which was
-            // already sleeping keeps its original sleep unless a wakeup was
-            // saved while frozen — that wakeup is replayed now.
+            // refrigerator 可以从 Runnable 或事件睡眠两种现场完成冻结：
+            // 前者登记在 wakeable（解冻必须唤醒），后者的唤醒仍归属原等待
+            // 事件；冻结期间到达的唤醒被暂存（WAKE_PENDING），此刻重放。
             was_wakeable || saved_wakeup
         };
 
@@ -386,8 +386,10 @@ impl CgroupSubsysState for FreezerCss {
             .and_then(|parent| parent.css(CgroupSubsysId::Freezer))
     }
 
-    fn cgroup(&self) -> Arc<CgroupNode> {
-        self.cgroup.upgrade().expect("freezer cgroup dropped")
+    fn cgroup_node(&self) -> Option<Arc<CgroupNode>> {
+        // fail-closed（issue #30）：与 subsys trait 一致，节点已随
+        // rmdir 拆除时返回 None，绝不 panic。
+        self.cgroup.upgrade()
     }
 
     fn flags(&self) -> CssFlags {
@@ -476,10 +478,50 @@ pub fn init_freezer_controller() {
     crate::cgroup::subsys::register_subsys(controller);
 }
 
+/// `__refrigerator()` 的状态裁决（纯函数，单元测试入口）：
+///
+/// - Runnable → `EnterBlocked`：从可运行态真正入冰箱——改判为冰箱阻塞态
+///   并登记 wakeable（解冻必须唤醒它，对应 Linux 任务在 freeze trap 处
+///   `cgroup_enter_frozen()` 后 `schedule()` 挂起、解冻时 wake_up_process）；
+/// - Blocked(_) → `EnterInPlace`：任务此刻本就阻塞在事件上（`mark_sleep()`
+///   之后、deactivate 之前被调度点截获），与 `freeze_task()` 的睡眠分支
+///   同构地就地完成冻结——只置 FROZEN 与计数，不改状态、不登记
+///   wakeable（唤醒仍由其原事件负责，冻结期到达的唤醒经 WAKE_PENDING 重放）；
+/// - Stopped / Exited → `Defer`：不接管状态、不置 FROZEN、不计数。Stopped
+///   的去留由 SIGCONT 决定，Exited 交给 exit 钩子清理；保留 FREEZING，
+///   任务下一次到达 `__schedule()` 时再收敛。期间 `is_frozen()` 保守报假
+///   ——这正是"计数 == 实际阻塞集合"的要求。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefrigeratorEntry {
+    EnterBlocked,
+    EnterInPlace,
+    Defer,
+}
+
+fn classify_refrigerator_entry(state: crate::process::ProcessState) -> RefrigeratorEntry {
+    use crate::process::ProcessState;
+    match state {
+        ProcessState::Runnable => RefrigeratorEntry::EnterBlocked,
+        ProcessState::Blocked(_) => RefrigeratorEntry::EnterInPlace,
+        _ => RefrigeratorEntry::Defer,
+    }
+}
+
 /// __refrigerator - 进入冻结状态
 ///
 /// 当任务设置了 FREEZING 标志时，在调度时调用此函数进入冻结状态。
-/// 对应 Linux 的 `__refrigerator()`
+/// 对应 Linux 的 `__refrigerator()` 与 cgroup freezer 的 freeze trap
+/// （`JOBCTL_TRAP_FREEZE` → `cgroup_enter_frozen()`）。
+///
+/// 计数纪律（issue #32 的根因所在）：FROZEN 标志、nr_frozen_tasks 的增、
+/// wakeable 登记必须在同一个 pi_lock 临界区内一并完成，三者一一对应。
+/// 旧实现对已睡眠任务也先置 FROZEN、无条件计数并返回 true，而任务状态
+/// 并未转入冰箱；随后 `__schedule()` 的 `signal_pending_state` 把
+/// Blocked(true)+pending 信号恢复成 Runnable，任务带着 FROZEN 与虚增计数
+/// 继续运行——`is_frozen()` 误报冻结完成，且残留 FROZEN 使后续每次唤醒
+/// 被 `wakeup()` 暂存吞掉，直至解冻才恢复。Linux 用 TASK_FROZEN（无任何
+/// 唤醒位）与 trap 优先级保证冻结态不可被信号恢复、计数只归真实入箱者；
+/// 本实现等价收口：裁决未完成的转移一律不置位、不计数、返回 false。
 pub fn __refrigerator(task: &Arc<ProcessControlBlock>) -> bool {
     use crate::process::ProcessState;
 
@@ -514,22 +556,31 @@ pub fn __refrigerator(task: &Arc<ProcessControlBlock>) -> bool {
         return false;
     }
 
-    let mut entered = false;
-    {
+    let entry = {
         let _pi = task.sched_info().pi_lock_irqsave();
-        // The transition is completed only here, never in freeze_task().
-        task.flags().insert(ProcessFlags::FROZEN);
-        task.flags().remove(ProcessFlags::FREEZING);
-
-        // A task which was already sleeping remains asleep.  Only a task that
-        // entered from Runnable is changed to the freezer's blocking state and
-        // recorded for a later wakeup.
-        if task.sched_info().state().is_runnable() {
-            task.sched_info().set_state(ProcessState::Blocked(false));
-            entered = true;
+        let verdict = classify_refrigerator_entry(task.sched_info().state());
+        match verdict {
+            RefrigeratorEntry::EnterBlocked => {
+                // 从 Runnable 真正入冰箱：置位、清请求、转入冰箱阻塞态。
+                task.flags().insert(ProcessFlags::FROZEN);
+                task.flags().remove(ProcessFlags::FREEZING);
+                task.sched_info().set_state(ProcessState::Blocked(false));
+            }
+            RefrigeratorEntry::EnterInPlace => {
+                // 已在事件睡眠：就地完成冻结，状态原样保留，稍后由本轮
+                // __schedule() 的 deactivate 分支挂起。
+                task.flags().insert(ProcessFlags::FROZEN);
+                task.flags().remove(ProcessFlags::FREEZING);
+            }
+            RefrigeratorEntry::Defer => {}
         }
+        verdict
+    };
+    if entry == RefrigeratorEntry::Defer {
+        // 未完成转移：FREEZING 保留，下轮调度再收敛；不置 FROZEN、不计数。
+        return false;
     }
-    if entered {
+    if entry == RefrigeratorEntry::EnterBlocked {
         let pid = task.raw_pid();
         let mut wakeable = freezer.wakeable_tasks.lock();
         if !wakeable.iter().any(|candidate| *candidate == pid) {
@@ -703,5 +754,82 @@ pub fn cgroup_freezer_migrate_task(
         let _pi = task.sched_info().pi_lock_irqsave();
         task.flags()
             .remove(ProcessFlags::FREEZING | ProcessFlags::WAKE_PENDING);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::ProcessState;
+
+    /// issue #32 复现场景的裁决回归：可中断睡眠（pending 信号在场）的
+    /// FREEZING 任务绝不允许"置 FROZEN + 计数而状态不动"的半程转移——
+    /// 那正是旧实现被 `signal_pending_state` 抬回 Runnable 后计数虚增、
+    /// FROZEN 残留吞唤醒的根因。修复后的形态只有两种合法终态：
+    /// - 就地完成冻结（EnterInPlace）：FROZEN/计数与"任务确实阻塞"同拍；
+    /// - 本轮不接管（Defer）：不置位、不计数，FREEZING 留待下轮。
+    #[test]
+    fn sleeping_task_never_gets_uncounted_frozen_transition() {
+        assert_eq!(
+            classify_refrigerator_entry(ProcessState::Blocked(true)),
+            RefrigeratorEntry::EnterInPlace
+        );
+        assert_eq!(
+            classify_refrigerator_entry(ProcessState::Blocked(false)),
+            RefrigeratorEntry::EnterInPlace
+        );
+    }
+
+    /// 只有真正从 Runnable 入箱的任务才改变状态并登记 wakeable
+    ///（对应 Linux freeze trap 处 cgroup_enter_frozen 后 schedule 挂起，
+    /// 解冻必须唤醒它）。
+    #[test]
+    fn runnable_task_enters_refrigerator_as_wakeable_blocked() {
+        assert_eq!(
+            classify_refrigerator_entry(ProcessState::Runnable),
+            RefrigeratorEntry::EnterBlocked
+        );
+    }
+
+    /// Stopped 的去留由 SIGCONT 决定、Exited 交给 exit 钩子，均不得被
+    /// 冰箱接管计数；保留 FREEZING 等任务下一次到达 `__schedule()` 再收敛，
+    /// 期间 `is_frozen()` 保守报假，保证"计数 == 实际阻塞集合"。
+    #[test]
+    fn stopped_and_exited_defer_freeze_without_counting() {
+        assert_eq!(
+            classify_refrigerator_entry(ProcessState::Stopped),
+            RefrigeratorEntry::Defer
+        );
+        assert_eq!(
+            classify_refrigerator_entry(ProcessState::Exited(0)),
+            RefrigeratorEntry::Defer
+        );
+    }
+
+    /// 不变式：凡完成 FROZEN 转移的裁决（EnterBlocked/EnterInPlace），
+    /// 任务都真实阻塞在睡眠态——计数只归实际入冰箱者；Defer 则相反，
+    /// 计数必须不动。signal_wake 守卫（sched/mod.rs）与 undo_mark_sleep
+    /// 守卫（process/manager/sched.rs）共同保证冻结态不可被信号/撤销
+    /// 恢复回 Runnable，即"被计数的任务不会逃出阻塞集合"。
+    #[test]
+    fn counted_transitions_are_exactly_the_blocked_set() {
+        let all_states = [
+            ProcessState::Runnable,
+            ProcessState::Blocked(true),
+            ProcessState::Blocked(false),
+            ProcessState::Stopped,
+            ProcessState::Exited(0),
+        ];
+        for state in all_states {
+            let counted = classify_refrigerator_entry(state) != RefrigeratorEntry::Defer;
+            // 被计数者要么本轮从 Runnable 转入 Blocked(false)（EnterBlocked
+            // 改判后阻塞），要么本就阻塞（EnterInPlace 状态不动）。
+            let blocked_after = match state {
+                ProcessState::Runnable => true,
+                ProcessState::Blocked(_) => true,
+                _ => false,
+            };
+            assert_eq!(counted, blocked_after, "state={state:?} 计数与阻塞集合失配");
+        }
     }
 }

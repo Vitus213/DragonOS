@@ -89,3 +89,43 @@ Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 1
   cpuset / io / pids / `add_task` 的祖先链与 `prepare_device_snapshots` 的子树遍历
   原本已是迭代式，核查后保持不变。递归深度消耗栈的路径清零；层级深度由 knobs
   显式定界（Linux 语义：默认 max）。
+
+## issue #32 — __refrigerator 信号逃逸（计数虚增 + FROZEN 残留吞唤醒）
+
+- `__refrigerator()` 引入纯裁决 `classify_refrigerator_entry()`：FROZEN 位、
+  nr_frozen_tasks、wakeable 登记三者只在裁决完成的转移里于同一 pi_lock
+  临界区一落账——Runnable→EnterBlocked（转冰箱阻塞态+登记 wakeable）、
+  Blocked→EnterInPlace（状态原样、唤醒归原事件）、Stopped/Exited→Defer
+  （不置位不计数，FREEZING 留待下轮收敛）。旧实现对已睡眠任务先置 FROZEN、
+  无条件计数并返回 true 而状态不动，随后被 `signal_pending_state` 抬回
+  Runnable：计数虚增使 `is_frozen()` 谎报冻结完成，残留 FROZEN 把之后
+  每次 wakeup 吞成 WAKE_PENDING 挂死到解冻。
+- 冻结态不可被信号恢复（Linux TASK_FROZEN 无唤醒位的等价收口）三守卫：
+  `__schedule()` signal_wake 加 `!FROZEN`；`undo_mark_sleep()` 对
+  Blocked+FROZEN 改置 WAKE_PENDING 暂存（不再抬回 Runnable）；wakeup()
+  原有 FROZEN 暂存语义保持不变，由解冻路径（unfreeze_task/迁移解冻）重放。
+- 计数不变式：FROZEN ⟺ 已计数 ⟺ 处于阻塞集合，构造性成立；解冻/迁移/exit
+  清理对"从未入冰箱的任务"幂等（dec 只随 FROZEN、标志全清、双次解冻早退）。
+- 验证：`make kernel ARCH=x86_64` 通过（worktree@aa81b900 基线）；裁决
+  函数宿主切片单测 4 例全绿；旧行为复现模型（缺陷 3 断言全命中）与修复后
+  收敛/幂等模型（8 场景断言）见 issue #32 步骤评论。
+
+## issue #33 — cgroup.type 与 cpuset.cpus 半序列化收口
+
+- `write_type_file` 入口全程持 `cgroup_accounting_lock`；`set_cgroup_type`
+  的 vet→写入（subtree_task_count/域控制器/父类型读改写）与迁移、
+  mkdir/rmdir 串行，杜绝"threaded 子树含域控制器任务"等非法组合固化；
+  函数头落"调用者须持锁"不变量注释 + `debug_assert!` 锁纪律自检。
+- `CpusetCss::set_cpus` 的 commit→validate→apply→回滚全程持
+  `cgroup_accounting_lock`（对齐 can_attach 既有锁内语义与 Linux
+  cgroup_mutex 下的 cpuset 变更）；任务不得恰在 validate 与 apply
+  之间迁入/迁出。回滚重放失败不再 `let _ =` 吞错误，`log::error!`
+  上报"部分任务未回到旧策略"。
+- cpuset 交集写入（apply/fork/attach）移入目标任务 `pi_lock` 临界区：
+  新增 `PiProtected::narrow_cpus_allowed` + `ProcessManager::
+  set_cpus_allowed_and`，与 `sched_setaffinity` 对 cpus_allowed 的
+  读改写线性化互斥；空交集 EINVAL 不改 affinity、由调用方上报。锁序
+  `accounting → pi_lock → rq_lock` 与全部既有持锁链一致，无反向边。
+- 验证：`make kernel ARCH=x86_64` 通过；6 个 cfg(test) 单测随树编译
+  （交集语义/提交门控/串行化）；逻辑切片宿主实测全绿（kernel libtest
+  本机不可运行的定界见 issue #33）。

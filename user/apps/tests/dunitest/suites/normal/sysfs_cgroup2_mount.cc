@@ -283,6 +283,7 @@ void expect_root_p1_visibility(int detail_fd) {
     expect_missing(detail_fd, "/sys/fs/cgroup/cpu.max");
     expect_missing(detail_fd, "/sys/fs/cgroup/memory.current");
     expect_missing(detail_fd, "/sys/fs/cgroup/memory.max");
+    expect_missing(detail_fd, "/sys/fs/cgroup/memory.oom.group");
     expect_missing(detail_fd, "/sys/fs/cgroup/pids.current");
     expect_missing(detail_fd, "/sys/fs/cgroup/pids.max");
 }
@@ -429,6 +430,7 @@ TEST(SysfsCgroup2Mount, Cgroup2P1ControllerFilesFollowSubtreeControl) {
             "/memory.max",
             "/memory.events",
             "/memory.stat",
+            "/memory.oom.group",
             "/memory.swap.current",
             "/memory.swap.peak",
             "/memory.swap.high",
@@ -474,6 +476,18 @@ TEST(SysfsCgroup2Mount, Cgroup2P1ControllerFilesFollowSubtreeControl) {
         }
         expect_text_has(detail_fd, memory_high.c_str(), "4096\n");
         expect_text_has(detail_fd, memory_low.c_str(), "4096\n");
+
+        std::string memory_oom_group = child + "/memory.oom.group";
+        if (!write_text_file(memory_oom_group.c_str(), "1")) {
+            child_fail(detail_fd, "write memory.oom.group 1");
+        }
+        expect_text_has(detail_fd, memory_oom_group.c_str(), "1\n");
+        if (!write_text_file(memory_oom_group.c_str(), "0")) {
+            child_fail(detail_fd, "write memory.oom.group 0");
+        }
+        expect_text_has(detail_fd, memory_oom_group.c_str(), "0\n");
+        expect_write_errno(detail_fd, memory_oom_group.c_str(), "2", EINVAL);
+        expect_write_errno(detail_fd, memory_oom_group.c_str(), "max", EINVAL);
 
         std::string freeze = child + "/cgroup.freeze";
         if (!write_text_file(freeze.c_str(), "1")) {

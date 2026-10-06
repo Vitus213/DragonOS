@@ -1,5 +1,6 @@
 use alloc::{format, string::{String, ToString}, sync::{Arc, Weak}, vec::Vec};
 use core::any::Any;
+use log::error;
 use system_error::SystemError;
 
 use crate::{
@@ -71,7 +72,14 @@ impl CpusetCss {
         self.configured_mems.lock().clone()
     }
 
+    /// 写 cpuset.cpus 的入口：commit→validate→apply→回滚全程持有
+    /// `cgroup_accounting_lock`（对应 Linux 在 cgroup_mutex 下变更
+    /// cpuset）。任务迁移（write_procs/fork/exit）同样串行于该锁，
+    /// 因此不会出现"任务恰在 validate 与 apply 之间迁入被跳过"（亲和
+    /// 违反刚生效的 mask）或"迁出者仍被套新组 mask 永久收窄"的交错。
+    /// 调用链不得已持有该锁（自旋锁不可重入），本函数负责在入口取锁。
     pub fn set_cpus(&self, value: &str) -> Result<(), SystemError> {
+        let _accounting_guard = crate::cgroup::core::cgroup_accounting_lock().lock();
         let value = value.trim();
         let mask = if value.is_empty() {
             None
@@ -117,7 +125,16 @@ impl CpusetCss {
         }
         if let Err(error) = self.apply_to_tasks() {
             *self.configured_cpus.lock() = old;
-            let _ = self.apply_to_tasks();
+            // 回滚不得静默：apply 半途失败时部分任务已被新（更窄）mask
+            // 收窄；恢复旧配置后再走一遍 apply 还原，若仍失败，在向调用
+            // 者报错的同时用 error! 上报"部分任务未回到旧策略"，避免
+            // 声称未改而实际半应用的静默不一致。
+            if let Err(rollback_error) = self.apply_to_tasks() {
+                error!(
+                    "cpuset: cpuset.cpus 写入失败后的回滚未能完整生效: apply error {:?}, rollback error {:?}",
+                    error, rollback_error
+                );
+            }
             return Err(error);
         }
         Ok(())
@@ -193,11 +210,10 @@ impl CpusetCss {
             let mask = cpuset.effective_cpus();
             for pid in node.tasks() {
                 if let Some(task) = ProcessManager::find(pid) {
-                    let mut task_mask = task.sched_info().cpus_allowed();
-                    task_mask.bitand_assign(&mask);
-                    if !task_mask.is_empty() {
-                        ProcessManager::set_cpus_allowed(&task, task_mask)?;
-                    }
+                    // 交集读改写整体在目标任务 pi_lock 临界区内完成，
+                    // 与 sched_setaffinity 线性化互斥；失败直接上抛触发
+                    // set_cpus 的显式回滚，而非静默跳过该任务。
+                    ProcessManager::set_cpus_allowed_and(&task, &mask)?;
                 }
             }
             pending.extend(node.children());
@@ -208,7 +224,10 @@ impl CpusetCss {
 
 impl CgroupSubsysState for CpusetCss {
     fn subsys_id(&self) -> CgroupSubsysId { CgroupSubsysId::Cpuset }
-    fn cgroup(&self) -> Arc<CgroupNode> { self.cgroup.upgrade().expect("cpuset cgroup dropped") }
+    fn cgroup_node(&self) -> Option<Arc<CgroupNode>> {
+        // fail-closed（issue #30）：节点已随 rmdir 拆除时返回 None，绝不 panic。
+        self.cgroup.upgrade()
+    }
     fn parent(&self) -> Option<Arc<dyn CgroupSubsysState>> {
         self.cgroup
             .upgrade()
@@ -233,22 +252,19 @@ impl CgroupSubsysState for CpusetCss {
     }
 
     fn fork(&self, task: &Arc<ProcessControlBlock>) {
-        let mut task_mask = task.sched_info().cpus_allowed();
-        task_mask.bitand_assign(&self.effective_cpus());
-        if !task_mask.is_empty() {
-            let _ = ProcessManager::set_cpus_allowed(task, task_mask);
-        }
+        // 交集读写在子任务 pi_lock 临界区内一次完成；与
+        // sched_setaffinity 互斥。空交集（理论不变量下不可达）保持
+        // 原"跳过收窄"降级语义。
+        let _ = ProcessManager::set_cpus_allowed_and(task, &self.effective_cpus());
     }
     fn attach(&self, tasks: &[Arc<ProcessControlBlock>]) {
         let mask = self.effective_cpus();
         for task in tasks {
-            let mut task_mask = task.sched_info().cpus_allowed();
-            task_mask.bitand_assign(&mask);
             // can_attach rejects empty intersections. Avoid silently replacing
             // a user's affinity if policy changed between validation and commit.
-            if !task_mask.is_empty() {
-                let _ = ProcessManager::set_cpus_allowed(task, task_mask);
-            }
+            // 交集读改写整体在目标 pi_lock 临界区内与 sched_setaffinity
+            // 线性化互斥；空交集时原语不做改动并报错，等价于旧的跳过。
+            let _ = ProcessManager::set_cpus_allowed_and(task, &mask);
         }
     }
     fn as_any(&self) -> &dyn Any { self }
@@ -339,5 +355,42 @@ mod tests {
         assert_eq!(parse_cpumask("3-1"), Err(SystemError::EINVAL));
         assert_eq!(parse_cpumask("0-1-2"), Err(SystemError::EINVAL));
         assert_eq!(parse_cpumask("1-"), Err(SystemError::EINVAL));
+    }
+
+    /// `set_cpus` 的 commit→validate→apply 全程在
+    /// `cgroup_accounting_lock` 内完成：测试主线程持锁期间，并发
+    /// `set_cpus` 不得发布新配置（拿不到锁即被阻塞）；主线程放锁后
+    /// 才生效。这正是"并发迁移不得插在 validate 与 apply 之间"由
+    /// 同一把锁覆盖的证明。
+    #[test]
+    fn set_cpus_commits_only_under_accounting_lock() {
+        let cpuset = CpusetCss::new(Weak::new());
+        // 预置一个已配置 mask（Weak 无 cgroup，提交/读取可离线验证）。
+        *cpuset.configured_cpus.lock() = Some(parse_cpumask("0-1").unwrap());
+
+        let guard = crate::cgroup::cgroup_accounting_lock().lock();
+        let writer_cpuset = cpuset.clone();
+        let writer = std::thread::spawn(move || writer_cpuset.set_cpus(""));
+        // 持锁窗口内 writer 无法提交：配置保持旧值。
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        assert_eq!(cpuset.configured_cpus_string(), "0-1");
+        drop(guard);
+        writer.join().unwrap().expect("set_cpus must succeed");
+        // 放锁后提交生效。
+        assert!(cpuset.configured_cpus_string().is_empty());
+    }
+
+    #[test]
+    fn set_cpus_rejects_out_of_range_before_committing() {
+        // 解析门禁在取锁提交前拒绝：越界 CPU 不改变现有配置。
+        // parse_cpumask 对 >= MAX_CPU_NUM 的编号直接 EINVAL，不会触碰
+        // 未初始化的 SMP 状态机。
+        let cpuset = CpusetCss::new(Weak::new());
+        *cpuset.configured_cpus.lock() = Some(parse_cpumask("0").unwrap());
+        assert_eq!(
+            cpuset.set_cpus(&format!("{}", PerCpu::MAX_CPU_NUM)),
+            Err(SystemError::EINVAL)
+        );
+        assert_eq!(cpuset.configured_cpus_string(), "0");
     }
 }
