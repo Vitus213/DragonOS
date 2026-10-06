@@ -828,6 +828,19 @@ impl ProcessManager {
             return;
         }
         if state.is_blocked() {
+            if pcb.flags().contains(ProcessFlags::FROZEN) {
+                // 冻结任务不可被"撤销睡眠"拉回运行态（issue #32）：
+                // __refrigerator() 的 EnterInPlace 或 freeze_task() 的睡眠
+                // 直接转换可能落在 mark_sleep 与本次撤销之间，此刻 FROZEN
+                // 与计数已落账；把 Blocked 抬回 Runnable 会让任务带着冻结
+                // 账目继续运行——正是 #32 的逃逸形态。改走暂存：触发撤销的
+                // 那次 wakeup() 已消费原事件，置 WAKE_PENDING 让解冻路径
+                // （unfreeze_task/迁移解冻）重放唤醒，任务回 Runnable 重查
+                // 等待条件；本轮 __schedule() 照常把它挂起。与 signal_wake
+                // 的 FROZEN 守卫同理。
+                pcb.flags().insert(ProcessFlags::WAKE_PENDING);
+                return;
+            }
             // Only promote the Blocked written by this mark_sleep back to Runnable.
             pcb.sched_info().set_state(ProcessState::Runnable);
             fence(Ordering::SeqCst);

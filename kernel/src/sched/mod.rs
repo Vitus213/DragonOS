@@ -1443,7 +1443,19 @@ fn __schedule_inner(sched_mod: SchedMode, current: Option<Arc<ProcessControlBloc
         //   TASK_STOPPED       → 仅 SIGKILL → 恢复 RUNNING
         //   TASK_UNINTERRUPTIBLE → 不检查信号，直接 deactivate
         // SM_PREEMPT（被抢占）不检查信号，因为异步 stop 不应被信号恢复。
+        //
+        // FROZEN 守卫（issue #32）：冻结态不可被信号恢复。本轮带着
+        // FROZEN 撞上此分支的有两个来源：
+        //   1) __refrigerator() 就地冻结（EnterInPlace）——FROZEN 与计数
+        //      已落账，若放行信号，任务带着冻结账目继续运行，正是 #32
+        //      的逃逸形态；
+        //   2) freeze_task() 对睡眠任务的直接转换与本轮 mark_sleep 竞争
+        //      （FREEZING 从未置位，__refrigerator 已提前返回 false）。
+        // Linux 的对应物：TASK_FROZEN 不含任何唤醒位，signal_pending 恒
+        // 不匹配冻结态；冻结期唤醒由 wakeup() 的 FROZEN 分支暂存为
+        // WAKE_PENDING，解冻时重放。
         let signal_wake = !sched_mod.contains(SchedMode::SM_MASK_PREEMPT)
+            && !prev.flags().contains(ProcessFlags::FROZEN)
             && Signal::signal_pending_state(interruptible, wake_kill, &prev);
 
         if signal_wake {
