@@ -208,7 +208,10 @@ impl CpusetCss {
 
 impl CgroupSubsysState for CpusetCss {
     fn subsys_id(&self) -> CgroupSubsysId { CgroupSubsysId::Cpuset }
-    fn cgroup(&self) -> Arc<CgroupNode> { self.cgroup.upgrade().expect("cpuset cgroup dropped") }
+    fn cgroup_node(&self) -> Option<Arc<CgroupNode>> {
+        // fail-closed（issue #30）：节点已随 rmdir 拆除时返回 None，绝不 panic。
+        self.cgroup.upgrade()
+    }
     fn parent(&self) -> Option<Arc<dyn CgroupSubsysState>> {
         self.cgroup
             .upgrade()

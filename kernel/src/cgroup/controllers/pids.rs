@@ -183,8 +183,10 @@ impl CgroupSubsysState for PidsCgroupState {
         CgroupSubsysId::Pids
     }
 
-    fn cgroup(&self) -> Arc<CgroupNode> {
-        self.cgroup.upgrade().expect("pids cgroup dropped")
+    fn cgroup_node(&self) -> Option<Arc<CgroupNode>> {
+        // fail-closed（issue #30）：与 subsys trait 一致，节点已随
+        // rmdir 拆除时返回 None，绝不 panic。
+        self.cgroup.upgrade()
     }
 
     fn parent(&self) -> Option<Arc<dyn CgroupSubsysState>> {

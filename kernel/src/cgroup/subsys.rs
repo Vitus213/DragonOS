@@ -116,8 +116,14 @@ pub trait CgroupSubsysState: Debug + Send + Sync {
     /// 获取子系统 ID
     fn subsys_id(&self) -> CgroupSubsysId;
 
-    /// 获取所属 cgroup 节点
-    fn cgroup(&self) -> Arc<CgroupNode>;
+    /// 获取所属 cgroup 节点；节点已被 rmdir 拆除时返回 `None`。
+    ///
+    /// fail-closed：CSS 可能被离组引用（pending OOM、页面归属记录）
+    /// 保留得比它的 cgroup 节点久，此时旧的 `upgrade().expect(...)`
+    /// 会在缺页等不可失败路径上 panic。实现必须直接 upgrade 自身的
+    /// 弱引用并返回 `Option`；调用方对 `None` 只能丢弃请求或返回
+    /// 错误，绝不得 panic。
+    fn cgroup_node(&self) -> Option<Arc<CgroupNode>>;
 
     /// 获取父状态（如果不是根）
     fn parent(&self) -> Option<Arc<dyn CgroupSubsysState>>;
