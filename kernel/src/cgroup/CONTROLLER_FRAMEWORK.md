@@ -47,6 +47,7 @@
 - fair/RT 支持边界：`cpu.max` 与 `cpu.weight` 只作用于 fair 调度类；SCHED_RT 任务不参与 CFS 带宽控制（与 Linux CFS bandwidth 仅约束 fair class 一致，RT 由独立的 rt bandwidth 机制管理——DragonOS 中为 `RealtimeScheduler` 的 rq 级 `rt.is_throttled()` 节流，不读 cpu 控制器状态）；`cpu.weight` 写入对非 fair 任务为 no-op；DL 调度类未实现。
 - memory 计费具备祖先 max 原子检查、每帧归属记录（释放方与计费方解耦）和 cgroup 范围 OOM（复用 oom.rs 状态机）；`memory.high` 节流与 `memory.max` OOM 都在缺页路径执行，计费路径本身不睡眠不回收。与 Linux 6.6 的剩余差距：无 per-memcg LRU/回收目标（复用全局回收器）、无 charge 迁移（move_charge_at_immigrate）、无 memory.min/low 保护加权、无 swap 实际计费（swap.* 文件仅为接口占位）、slab 对象级记账并入页级计费（无 obj_cgroup）。
 - IO 限速在块设备分发前端以同步等待实现（提交任务睡眠到 slice 边界后重查），不是 Linux block layer 的延迟派发队列（throtl_service_queue/pending_timer）与 bio 层分层节流；超大单次传输按“每 slice 首个请求放行”保证前进；io.stat 在完成时记账，无 per-cpu rstat 聚合。
+- 本轮审计修复的明确范围：修正 `memory.min/low` 默认值、`cpu.max` quota 下界、freezer 生命周期/迁移/唤醒、memcg 内核分配绕过与 scoped OOM。以下审计项仍未实现，不能以“已支持”描述：`cpu.stat` user/system 现场分类与父级 rstat 聚合、`io.weight` 仲裁及 `io.stat` 层级聚合、cpuset 用户 affinity 在迁移后的独立恢复与 `cpuset.mems` NUMA 放置、`write_procs` 多控制器失败回滚；原因分别是调度现场分类、块设备公平队列、任务 affinity 双掩码、NUMA 分配器和迁移事务尚未存在。
 - CSS-set token 是每个 cgroup 的稳定生命周期标识，不是 Linux 完整的跨 cgroup CSS 集合哈希去重；threaded 状态机覆盖基础文件语义，未实现完整 threaded domain CSS 传播。
 - freezer 已避免直接伪造唤醒已有 sleeper，但尚未覆盖 Linux job-control freezer 的全部信号/停机交互。
 - pids、cpuset 和 cgroup2 文件接口已覆盖本轮调用链；hugetlb、rdma、misc 等未注册控制器仍不属于当前移植范围。
