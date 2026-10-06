@@ -21,7 +21,7 @@ use crate::{
         PostWriteSyncPolicy,
     },
     libs::{mutex::MutexGuard, rwsem::RwSem, spinlock::SpinLock},
-    process::ProcessManager,
+    process::{ProcessControlBlock, ProcessFlags, ProcessManager},
     time::PosixTimeSpec,
 };
 
@@ -518,13 +518,15 @@ impl Cgroup2Inode {
         };
         let others = leader.threads_read_irqsave().group_tasks_clone();
 
+        // 存活预筛（锁外）：只为减少锁内复核的工作量；权威判定在取得
+        // accounting 锁之后进行（见下），锁外窗口内的状态变化不影响正确性。
         let mut to_move = Vec::new();
-        if !leader.is_exited() {
+        if Self::task_attachable(&leader) {
             to_move.push(leader.clone());
         }
         for weak in others {
             if let Some(t) = weak.upgrade() {
-                if !t.is_exited() {
+                if Self::task_attachable(&t) {
                     to_move.push(t);
                 }
             }
@@ -532,10 +534,30 @@ impl Cgroup2Inode {
         if to_move.is_empty() {
             return Err(SystemError::ESRCH);
         }
-        let moved_tasks = to_move.len();
 
         let _cgroup_guard = cgroup_accounting_lock().lock();
-        cgroup_migrate_vet_dst_with_src(&src, cgroup, moved_tasks)?;
+        // 锁内二次复核（本修复的核心线性化点）：do_exit 的 PF_EXITING
+        // 置位（manager/exit.rs 的 mark_exiting，带 SeqCst fence）先于它
+        // 在同一把 accounting 锁内执行的 remove_task；本处复核在取得该锁
+        // 之后进行，因此两种交错都收敛：
+        // 1) 若目标任务已经执行完 do_exit 锁内 remove_task，则 EXITING
+        //    必然经锁的 release/acquire 序对本临界区可见，此处将其剔出
+        //    to_move。否则 set_task_cgroup_node 对 src 的 remove_task 会
+        //    命中 core.rs 的 debug_assert!(false)（debug 内核 panic），
+        //    release 静默跳过后 dst.add_task 又把死 pid 永久塞进目标组
+        //    （cgroup.procs 显示死 pid、rmdir 永久 EBUSY、pids 计数错位、
+        //    freezer/cpuset attach 钩子对尸体执行）。
+        // 2) 若复核通过（任务尚未进入 do_exit 锁内删除段），迁移先完成；
+        //    do_exit 随后在同一把锁下重读 pcb.task_cgroup_node()（已指向
+        //    目标组）并从目标组 remove_task，成员与计数照常收敛。
+        to_move.retain(|t| Self::task_attachable(t));
+        if to_move.is_empty() {
+            // 目标进程在预筛与取锁之间整体退出：对齐 Linux
+            // cgroup_procs_write 对已退出进程返回 ESRCH 的语义。
+            return Err(SystemError::ESRCH);
+        }
+        cgroup_migrate_vet_dst_with_src(&src, cgroup, to_move.len())?;
+
         for id in crate::cgroup::subsys::CgroupSubsysId::all() {
             if let Some(css) = cgroup.css(*id) {
                 css.can_attach(&to_move)?;
@@ -555,6 +577,29 @@ impl Cgroup2Inode {
             }
         }
         Ok(buf.len())
+    }
+
+    /// 判定任务是否可以作为 cgroup.procs 迁移目标。
+    ///
+    /// 覆盖 do_exit 的三个可观察阶段，任意一阶段命中都视为不可迁移：
+    /// - `ProcessFlags::EXITING`：`mark_exiting()`（PF_EXITING）已在
+    ///   pid_membership 锁内、do_exit 的 accounting 临界区 remove_task
+    ///   **之前**置位（manager/exit.rs），是"该任务即将或已经从其 cgroup
+    ///   成员表摘除"的最早线性化信号；只依赖它才能堵住
+    ///   `ProcessState::Exited` 尚未发布、remove_task 已完成的窗口。
+    /// - `ProcessState::Exited`：set_state 已发布（wait 语义）。
+    /// - `ExitState::Zombie/Dead`：exit_notify 已发布，僵尸按 Linux 语义
+    ///   不得出现在 cgroup.procs。
+    ///
+    /// 锁外预筛与锁内复核共用本谓词：EXITING 经 SeqCst fence 与
+    /// accounting 锁的 release/acquire 序对持锁读者先于 remove_task 可见
+    /// （见 write_procs 内注释），谓词自身只做原子读，可在自旋锁临界区
+    /// 内安全调用。
+    fn task_attachable(task: &Arc<ProcessControlBlock>) -> bool {
+        !task.flags().contains(ProcessFlags::EXITING)
+            && !task.is_exited()
+            && !task.is_zombie()
+            && !task.is_dead()
     }
 
     fn write_subtree_control(
