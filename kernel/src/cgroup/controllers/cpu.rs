@@ -614,4 +614,78 @@ mod tests {
         assert_eq!(tg.stats.nr_periods.load(Ordering::Relaxed), 1);
         assert_eq!(tg.runtime_remaining, 2_000_000);
     }
+
+    /// cpu.stat 恒等式与 user/kernel 归属回归（issue #36）。
+    ///
+    /// 修复前计费点硬编码 `let user = false;`，user_usec 恒 0、system_usec
+    /// 吞并全部执行时间；修复后 tick 的 user/kernel 现场逐段传入
+    /// `account_runtime_checked`。本测例锁定三条语义：
+    /// 1. 恒等式 user_usec + system_usec == usage_usec（files.rs cpu_stat_for
+    ///    以 (utime+stime)/1000 渲染 usage_usec，恒等式由构造保证，回归其不被
+    ///    后续改动破坏）；
+    /// 2. `is_user == true`（tick 用户态现场）的计费增长 utime/user_usec；
+    /// 3. `is_user == false`（tick 内核态现场与非 tick 残差冲刷段）的计费只增长
+    ///    stime/system_usec。
+    #[test]
+    fn cpu_stat_user_system_usage_identity() {
+        let css = CpuCss::new(None, Weak::new());
+        let clock = 1_000_000_000u64;
+
+        // tick 用户态现场：一个滴答计费 10ms
+        css.account_runtime_checked(clock, 10_000_000, true);
+        // tick 内核态现场 + 非 tick 残差段：共 4ms，全部归 system
+        css.account_runtime_checked(clock + 10_000_000, 3_000_000, false);
+        css.account_runtime_checked(clock + 13_000_000, 1_000_000, false);
+
+        let stats = css.stats();
+        // cpu.stat 渲染值（files.rs：纳秒除以 1000 得 usec）
+        let user_usec = stats.utime / 1000;
+        let system_usec = stats.stime / 1000;
+        let usage_usec = user_usec + system_usec;
+
+        assert_eq!(user_usec + system_usec, usage_usec);
+        assert_eq!(
+            user_usec, 10_000,
+            "用户态滴答必须计入 user_usec（修复前恒 0）"
+        );
+        assert_eq!(system_usec, 4_000, "内核态/非 tick 段计入 system_usec");
+        assert_eq!(usage_usec, 14_000);
+
+        // 纳秒级恒等式：每段 delta 恰被计入 utime/stime 之一，无丢失、无双计
+        assert_eq!(stats.utime + stats.stime, 14_000_000);
+    }
+
+    /// 配额开启、节流状态机工作时，user/kernel 交替计费的纳秒恒等式依然成立：
+    /// 节流不吞时间，每段执行时间只入账一次。
+    #[test]
+    fn cpu_stat_identity_holds_across_throttle_cycles() {
+        let css = CpuCss::new(None, Weak::new());
+        // quota 50ms / period 100ms
+        css.set_bandwidth(Some(50_000), 100_000).unwrap();
+
+        let mut clock = 0u64;
+        let mut charged_ns = 0u64;
+        let mut user_ns = 0u64;
+        for i in 0..1000u64 {
+            let delta = 1_000_000 + i * 1_000;
+            // 模拟 tick 现场：每 3 个滴答 1 个内核态，其余用户态
+            let user = i % 3 != 0;
+            css.account_runtime_checked(clock, delta, user);
+            clock += delta;
+            charged_ns += delta;
+            if user {
+                user_ns += delta;
+            }
+        }
+
+        let stats = css.stats();
+        assert_eq!(
+            stats.utime + stats.stime,
+            charged_ns,
+            "每段执行时间必须且只能计入 utime/stime 之一"
+        );
+        assert_eq!(stats.utime, user_ns);
+        assert_eq!(stats.stime, charged_ns - user_ns);
+        assert!(stats.nr_periods > 0, "时钟推进应产生周期计数");
+    }
 }

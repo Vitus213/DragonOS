@@ -307,7 +307,9 @@ pub trait Scheduler {
     ) -> Option<Arc<ProcessControlBlock>>;
 
     /// ## 被时间滴答函数调用，它可能导致进程切换。驱动了运行时抢占。
-    fn tick(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, queued: bool);
+    /// `user_tick` 是本次 tick 的 user/kernel 现场（来自 trap frame），下传给
+    /// cgroup cpu 计费点，决定该滴答记入 user_usec 还是 system_usec。
+    fn tick(rq: &mut CpuRunQueue, pcb: Arc<ProcessControlBlock>, queued: bool, user_tick: bool);
 
     /// ## 在进程fork时，如需加入cfs，则调用
     fn task_fork(pcb: Arc<ProcessControlBlock>);
@@ -1214,7 +1216,7 @@ impl ProcessManager {
         let pcb = Self::current_pcb();
         CpuTimeFunc::irqtime_account_process_tick(&pcb, user_tick, 1);
 
-        scheduler_tick();
+        scheduler_tick(user_tick);
     }
 }
 
@@ -1224,10 +1226,18 @@ impl ProcessManager {
 /// after advancing the entity's `exec_start`. A throttle decision carries the
 /// period deadline back to the entity; the entity remains accounted on the
 /// rq, but fair pick paths exclude it until that deadline.
+///
+/// `is_user` 是本段执行时间归入 `cpu.stat` 的 user_usec 还是 system_usec 的现场标志。
+/// 只有时钟滴答携带 user/kernel 现场：`update_process_times` 的 `user_tick` 来自
+/// trap frame 的 `is_from_user()`，与 Linux `account_process_tick(user_tick)` 同源。
+/// 非滴答路径（入队/出队/选任务/put_prev/fork/wakeup 抢占检查）冲刷出的残差段现场
+/// 未知，按 Linux 语义保守归入 system 时间（stime），因此恒等式
+/// `user_usec + system_usec == usage_usec` 成立，且用户态忙循环的 user_usec 会增长。
 pub(crate) fn account_cgroup_runtime(
     current: &Arc<ProcessControlBlock>,
     clock_ns: u64,
     delta_ns: u64,
+    is_user: bool,
 ) -> Option<u64> {
     use crate::cgroup::controllers::cpu::{CpuCss, CpuRuntimeDecision};
     use crate::cgroup::subsys::CgroupSubsysId;
@@ -1236,8 +1246,7 @@ pub(crate) fn account_cgroup_runtime(
         .task_cgroup_node()
         .css(CgroupSubsysId::Cpu)?;
     let css = css_state.as_any().downcast_ref::<CpuCss>()?;
-    let user = false;
-    match css.account_runtime_checked(clock_ns, delta_ns, user) {
+    match css.account_runtime_checked(clock_ns, delta_ns, is_user) {
         CpuRuntimeDecision::Throttle { period_deadline_ns, .. } => Some(period_deadline_ns),
         CpuRuntimeDecision::Unlimited | CpuRuntimeDecision::Allow { .. } => None,
     }
@@ -1291,7 +1300,7 @@ pub fn task_change_group_cpu_bandwidth(pcb: &Arc<ProcessControlBlock>) {
     }
 }
 
-pub fn scheduler_tick() {
+pub fn scheduler_tick(user_tick: bool) {
     fence(Ordering::SeqCst);
     // 获取当前CPU索引
     let cpu_idx = smp_get_processor_id().data() as usize;
@@ -1317,9 +1326,9 @@ pub fn scheduler_tick() {
     let current_class = current.sched_info().sched_class();
     RealtimeScheduler::update_bandwidth(rq, current_class);
     match current_class {
-        SchedClass::Realtime => RealtimeScheduler::tick(rq, current, false),
-        SchedClass::Fair => CompletelyFairScheduler::tick(rq, current, false),
-        SchedClass::Idle => IdleScheduler::tick(rq, current, false),
+        SchedClass::Realtime => RealtimeScheduler::tick(rq, current, false, user_tick),
+        SchedClass::Fair => CompletelyFairScheduler::tick(rq, current, false, user_tick),
+        SchedClass::Idle => IdleScheduler::tick(rq, current, false, user_tick),
     }
 
     rq.calculate_global_load_tick();

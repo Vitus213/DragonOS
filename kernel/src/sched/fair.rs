@@ -615,9 +615,11 @@ impl CfsRunQueue {
     }
 
     /// 处理调度实体的时间片到期事件
-    pub fn entity_tick(&mut self, curr: Arc<FairSchedEntity>, queued: bool) {
-        // 更新当前调度实体的运行时间统计信息
-        self.update_current();
+    pub fn entity_tick(&mut self, curr: Arc<FairSchedEntity>, queued: bool, user_tick: bool) {
+        // 更新当前调度实体的运行时间统计信息。
+        // user_tick 来自 tick 现场，决定本段执行时间计入 cpu.stat 的
+        // user_usec 还是 system_usec。
+        self.update_current(user_tick);
 
         self.update_load_avg(&curr, UpdateAvgFlags::UPDATE_TG);
 
@@ -633,7 +635,12 @@ impl CfsRunQueue {
     }
 
     /// 更新当前调度实体的运行时间统计信息
-    pub fn update_current(&mut self) {
+    ///
+    /// `user_tick` 为本次调用携带的 user/kernel 现场：true 仅出现在时钟滴答
+    /// 发生于用户态时（cgroup cpu 计费记入 utime/user_usec）；false 表示内核态
+    /// 滴答或现场未知的残差冲刷段（入队/出队/选任务/put_prev/fork/wakeup 检查），
+    /// 与 Linux 一致保守归入 stime/system_usec，保证 user+system==usage 恒等式。
+    pub fn update_current(&mut self, user_tick: bool) {
         let curr = self.current();
         if unlikely(curr.is_none()) {
             return;
@@ -664,7 +671,7 @@ impl CfsRunQueue {
         // the fair entity. A throttle decision is represented on this entity,
         // not by merely requesting a schedule while leaving it selectable.
         if let Some(deadline) =
-            super::account_cgroup_runtime(&curr.pcb(), now, delta_exec)
+            super::account_cgroup_runtime(&curr.pcb(), now, delta_exec, user_tick)
         {
             curr.set_bandwidth_throttled_until(deadline);
             let rq = self.rq();
@@ -778,7 +785,7 @@ impl CfsRunQueue {
         if se.on_rq() {
             // 如果是当前任务
             if is_curr {
-                self.update_current();
+                self.update_current(false);
             } else {
                 // 否则，出队
                 self.inner_dequeue_entity(&se);
@@ -1108,7 +1115,7 @@ impl CfsRunQueue {
             self.place_entity(se.clone(), flags);
         }
 
-        self.update_current();
+        self.update_current(false);
 
         self.update_load_avg(se, UpdateAvgFlags::UPDATE_TG | UpdateAvgFlags::DO_ATTACH);
 
@@ -1144,7 +1151,7 @@ impl CfsRunQueue {
             action |= UpdateAvgFlags::DO_DETACH;
         }
 
-        self.update_current();
+        self.update_current(false);
 
         self.update_load_avg(se, action);
 
@@ -1184,7 +1191,7 @@ impl CfsRunQueue {
     /// 将前一个调度的task放回队列
     pub fn put_prev_entity(&mut self, prev: Arc<FairSchedEntity>) {
         if prev.on_rq() {
-            self.update_current();
+            self.update_current(false);
         }
 
         if prev.on_rq() {
@@ -1790,7 +1797,7 @@ impl Scheduler for CompletelyFairScheduler {
 
         rq.update_rq_clock();
 
-        cfs_rq.update_current();
+        cfs_rq.update_current(false);
 
         rq.clock_updata_flags |= ClockUpdataFlag::RQCF_REQ_SKIP;
 
@@ -1862,7 +1869,7 @@ impl Scheduler for CompletelyFairScheduler {
 
         let cfs_rq = se.cfs_rq();
         let cfs_rq = cfs_rq.force_mut();
-        cfs_rq.update_current();
+        cfs_rq.update_current(false);
 
         if let Some(pick_se) = cfs_rq.pick_eevdf_entity(Some(&se)) {
             if Arc::ptr_eq(&pick_se, &pse) {
@@ -1885,7 +1892,7 @@ impl Scheduler for CompletelyFairScheduler {
             let curr = cfs.current();
             let curr = if let Some(curr) = curr {
                 if curr.on_rq() {
-                    cfs.update_current();
+                    cfs.update_current(false);
                     Some(curr)
                 } else {
                     None
@@ -1910,7 +1917,12 @@ impl Scheduler for CompletelyFairScheduler {
         se.map(|se| se.pcb())
     }
 
-    fn tick(_rq: &mut CpuRunQueue, pcb: Arc<crate::process::ProcessControlBlock>, queued: bool) {
+    fn tick(
+        _rq: &mut CpuRunQueue,
+        pcb: Arc<crate::process::ProcessControlBlock>,
+        queued: bool,
+        user_tick: bool,
+    ) {
         let mut se = pcb.sched_info().sched_entity();
 
         FairSchedEntity::for_each_in_group(&mut se, |se| {
@@ -1918,7 +1930,7 @@ impl Scheduler for CompletelyFairScheduler {
             let binding = binding.cfs_rq();
             let cfs_rq = binding.force_mut();
 
-            cfs_rq.entity_tick(se, queued);
+            cfs_rq.entity_tick(se, queued, user_tick);
             (true, true)
         });
     }
@@ -1935,7 +1947,7 @@ impl Scheduler for CompletelyFairScheduler {
         let cfs_rq = cfs_rq.force_mut();
 
         if cfs_rq.current().is_some() {
-            cfs_rq.update_current();
+            cfs_rq.update_current(false);
         }
 
         cfs_rq.place_entity(se.clone(), EnqueueFlag::ENQUEUE_INITIAL);
@@ -1958,7 +1970,7 @@ impl Scheduler for CompletelyFairScheduler {
                 if curr.is_some() {
                     // Linux updates runnable curr before EEVDF pick on the path
                     // that has not put_prev_entity() yet.
-                    cfs.update_current();
+                    cfs.update_current(false);
                 }
             }
 
