@@ -1504,4 +1504,63 @@ mod tests {
         saturating_sub(&counter);
         assert_eq!(counter.load(Ordering::Acquire), 0);
     }
+
+    /// 类型 vet→写入在 accounting 锁内串行后，与迁移方（write_procs/
+    /// fork 的等价段：持锁改成员）并发时，writer 无论何时拿到锁，看到
+    /// 的都是成对 add/remove 之外的稳定空子树——不会固化"子树仍有
+    /// 任务却变 threaded"的非法组合。
+    #[test]
+    fn threaded_type_write_serializes_with_migration() {
+        let root = CgroupRoot::new();
+        let parent = root.create_child(&root.root(), "s-parent").unwrap();
+        let child = root.create_child(&parent, "s-child").unwrap();
+
+        let writer = {
+            let child = child.clone();
+            std::thread::spawn(move || {
+                // 模拟 write_type_file 入口：全程持锁 vet→写入。
+                let _guard = cgroup_accounting_lock().lock();
+                child.set_cgroup_type("threaded")
+            })
+        };
+        // 并发迁移方（write_procs/fork 的等价段）：只有拿到锁才能改成员。
+        let migrator = {
+            let child = child.clone();
+            std::thread::spawn(move || {
+                for pid in 5000..5100usize {
+                    let _guard = cgroup_accounting_lock().lock();
+                    let pid = RawPid::new(pid);
+                    child.add_task(pid);
+                    child.remove_task(pid);
+                }
+            })
+        };
+        let writer_result = writer.join().expect("writer thread must not panic");
+        migrator.join().expect("migrator thread must not panic");
+
+        assert!(writer_result.is_ok());
+        assert_eq!(child.cgroup_type(), CgroupType::Threaded);
+        assert_eq!(child.subtree_task_count(), 0);
+        // 父节点被提升为域 threaded（Linux 语义）。
+        assert_eq!(parent.cgroup_type(), CgroupType::DomainThreaded);
+    }
+
+    /// vet 在锁内读取的拓扑计数对迁移方可见：本组仍有任务时必须拒绝
+    /// （EOPNOTSUPP），任务离开后放行。
+    #[test]
+    fn threaded_rejected_when_subtree_populated() {
+        let root = CgroupRoot::new();
+        let parent = root.create_child(&root.root(), "p2").unwrap();
+        let child = root.create_child(&parent, "c2").unwrap();
+
+        let _guard = cgroup_accounting_lock().lock();
+        child.add_task(RawPid::new(9301));
+        assert_eq!(
+            child.set_cgroup_type("threaded"),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        );
+        child.remove_task(RawPid::new(9301));
+        assert!(child.set_cgroup_type("threaded").is_ok());
+        assert_eq!(child.cgroup_type(), CgroupType::Threaded);
+    }
 }
