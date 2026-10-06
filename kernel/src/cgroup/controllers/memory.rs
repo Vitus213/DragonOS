@@ -151,10 +151,27 @@ impl MemoryCss {
         exceeded
     }
     fn uncharge_chain(&self, pages: u64) {
-        if let Some(parent) = self.parent() {
-            if let Some(memcg) = parent.as_any().downcast_ref::<MemoryCss>() {
-                memcg.uncharge_chain(pages);
+        // #39 递归定界：旧实现沿树深递归到 root 再回卷递减；改为先把
+        // parent→root 的 memcg 链收集成 Vec，再按 root→parent→self 的
+        // 原回卷顺序递减——与 try_charge 提交序精确互逆的语义不变，
+        // 深树下栈消耗有界（链长=深度，堆分配）。锁获取点按
+        // LOCK_ORDER.md §1 使用 lock_irqsave。
+        let mut ancestors: Vec<Arc<dyn CgroupSubsysState>> = Vec::new();
+        let mut current = self.parent();
+        while let Some(css) = current {
+            if css.as_any().downcast_ref::<MemoryCss>().is_none() {
+                break;
             }
+            current = css.parent();
+            ancestors.push(css);
+        }
+        // 自 root 向 leaf 递减（原递归的回卷顺序）。
+        for css in ancestors.iter().rev() {
+            let Some(memcg) = css.as_any().downcast_ref::<MemoryCss>() else {
+                continue;
+            };
+            let mut inner = memcg.inner.lock_irqsave();
+            inner.usage = inner.usage.saturating_sub(pages);
         }
         let mut inner = self.inner.lock_irqsave();
         inner.usage = inner.usage.saturating_sub(pages);

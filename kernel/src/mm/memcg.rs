@@ -442,9 +442,14 @@ fn find_max_exceeded(leaf: &Arc<dyn CgroupSubsysState>) -> Option<Arc<dyn Cgroup
 
 /// All task pids in `node` and its descendants.
 fn collect_subtree_tasks(node: &Arc<CgroupNode>) -> Vec<RawPid> {
+    // #39 递归定界：旧实现按树深递归，超深树在 fault/OOM 路径上栈消耗
+    // 不可控；改为显式 worklist 遍历。收集顺序允许变化（调用方只做
+    // victim 候选集合），成员集合与旧实现完全一致。
     let mut pids = node.tasks();
-    for child in node.children() {
-        pids.extend(collect_subtree_tasks(&child));
+    let mut pending: Vec<Arc<CgroupNode>> = node.children();
+    while let Some(child) = pending.pop() {
+        pids.extend(child.tasks());
+        pending.extend(child.children());
     }
     pids
 }
