@@ -337,11 +337,7 @@ fn pids_max_write(css: &Arc<dyn CgroupSubsysState>, input: &str) -> Result<(), S
     let max = if value == "max" {
         None
     } else {
-        Some(
-            value
-                .parse::<usize>()
-                .map_err(|_| SystemError::EINVAL)?,
-        )
+        Some(value.parse::<usize>().map_err(|_| SystemError::EINVAL)?)
     };
     pids_state(css)?.set_max(max);
     Ok(())
@@ -464,7 +460,8 @@ mod tests {
         assert_eq!(snap(&f.mnt_state), before.2); // 迁移只改分布，不改层级总数
 
         // cancel_attach 的底层核心：与预演严格互逆。
-        f.dst_state.revert_migration(&[f.src.clone(), f.src.clone()]);
+        f.dst_state
+            .revert_migration(&[f.src.clone(), f.src.clone()]);
         assert_eq!(
             (snap(&f.src_state), snap(&f.dst_state), snap(&f.mnt_state)),
             before,
@@ -479,9 +476,7 @@ mod tests {
     fn precharge_reverts_prefix_when_a_src_lacks_pids_css() {
         let f = txn_fixture("pf");
         let root_mgr = crate::cgroup::core::cgroup_root().clone();
-        let orphan = root_mgr
-            .create_child(&f.mnt, "i38-pf-orphan")
-            .unwrap(); // 不装 Pids css
+        let orphan = root_mgr.create_child(&f.mnt, "i38-pf-orphan").unwrap(); // 不装 Pids css
 
         f.src_state.charge_unchecked();
         let err = f
@@ -511,7 +506,8 @@ mod tests {
             .precharge_migration(&[f.src.clone(), f.src.clone()])
             .expect("迁入不受 pids.max 阻塞");
         assert_eq!(f.dst_state.local_current(), 2);
-        f.dst_state.revert_migration(&[f.src.clone(), f.src.clone()]);
+        f.dst_state
+            .revert_migration(&[f.src.clone(), f.src.clone()]);
         assert_eq!(f.dst_state.local_current(), 0);
         assert_eq!(f.src_state.local_current(), 2);
     }
