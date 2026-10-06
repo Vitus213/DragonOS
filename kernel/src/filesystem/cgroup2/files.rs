@@ -468,10 +468,16 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         }
     }
 }
+/// 写 cgroup.type 的入口。全程持有 cgroup_accounting_lock：
+/// 类型变更的 vet→写入必须与任务迁移（write_procs/fork/exit）、
+/// mkdir/rmdir 串行，才能杜绝与并发迁移交错产生的非法层级组合
+/// （如 threaded 子树内含域控制器任务）。set_cgroup_type 的
+/// "调用者须持锁"不变量在此处满足。
 pub(super) fn write_type_file(
     cgroup: &Arc<CgroupNode>,
     input: &str,
 ) -> Result<Vec<u8>, SystemError> {
+    let _accounting_guard = crate::cgroup::core::cgroup_accounting_lock().lock();
     cgroup.set_cgroup_type(input)?;
     Ok(format!("{}\n", cgroup.cgroup_type_name()).into_bytes())
 }
