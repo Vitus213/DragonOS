@@ -5,11 +5,12 @@ use system_error::SystemError;
 
 use crate::{
     arch::{ipc::signal::Signal, mm::LockedFrameAllocator, MMArch},
-    cgroup::CgroupNode,
+    cgroup::{controllers::memory::MemoryCss, subsys::CgroupSubsysId, CgroupNode},
     ipc::signal_types::{SigCode, SigInfo, SigType},
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
     mm::{allocator::page_frame::FrameAllocator, MemoryManagementArch},
     process::{pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
+    time::Duration,
 };
 
 use super::ucontext::AddressSpace;
@@ -92,6 +93,15 @@ struct OomCandidate {
 }
 
 const OOM_SCORE_ADJ_MIN: i16 = -1000;
+
+/// scoped OOM「触发者不可杀且组内无可杀受害者」时的等待上界（毫秒）。
+/// Linux `mem_cgroup_oom_synchronize()` 是无界 TASK_KILLABLE 等待；
+/// DragonOS 尚无 oom_reaper 与 memcg oom notify，组内回收可能只靠
+/// 外部（管理员上调 max / 组内任务退出）推进，因此取有界等待 +
+/// charge 重试：等待醒来后无论是否解除越限都返回 Retry，下一次缺页
+/// 重新排水；致命信号可随时打断（wait_event_interruptible_timeout
+/// 在信号挂起时立即退出，循环头部的 killable 检查随即收敛）。
+const SCOPED_OOM_NO_VICTIM_WAIT_MS: u64 = 100;
 
 fn wake_oom_waiters() {
     OOM_WAITQ.wake_all();
@@ -380,10 +390,31 @@ fn begin_selection() -> Result<u64, ()> {
     }
 }
 
+/// 无条件闭合本轮选择。调用前提：调用方仍**独占**自己赢得的那一轮
+/// 单飞标记（`begin_selection` 成功后从未让出，`selecting` 必为真且
+/// 代际为调用方的）。若槽位可能已经让出（见
+/// [`out_of_memory_loop`] 的 SIGKILL 投递失败臂），必须改用
+/// [`finish_selection_for`]。
 fn finish_selection_none() {
     {
         let mut state = OOM_STATE.lock_irqsave();
         state.selecting = false;
+    }
+    wake_oom_waiters();
+}
+
+/// 按代际闭合选择（issue #27 审计）：`no_victim` 回调的第二处调用点
+/// （SIGKILL 投递失败）发生在 `send_oom_sigkill` 内部已把 `selecting`
+/// 转登 inflight、又回滚让出槽位**之后**——此刻别的 CPU 可能已赢得
+/// 更新的一代际并置起 `selecting`，无条件清标记会把别人的单飞锁抹掉，
+/// 放两个选择者并发击杀。代际不符即说明本轮标记早已被自己闭合，
+/// 无需也不能再动；唤醒照发（幂等）。
+fn finish_selection_for(generation: u64) {
+    {
+        let mut state = OOM_STATE.lock_irqsave();
+        if state.generation == generation {
+            state.selecting = false;
+        }
     }
     wake_oom_waiters();
 }
@@ -552,13 +583,16 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
 ///
 /// `no_victim` 决定「选不出受害者」时的去向（issue #27 核心）：全局
 /// 入口记录错误并返回 NoVictim；scoped 入口绝不逃逸到全局选择，只能
-/// 在越限子树内恢复（必要时击杀触发者自身），对齐 Linux 6.6
+/// 在越限子树内恢复（触发者自杀或等待），对齐 Linux 6.6
 /// `out_of_memory()` 中 `is_memcg_oom` 分支不 panic、不升格全局的语义。
+/// 选择代际 `generation` 传入回调：scoped 自杀路径要按同一代际登记
+/// inflight 受害者（与 [`send_oom_sigkill`] 相同的记账协议），并发
+/// 触发者才会等待这次击杀回收内存，而不是抢先另起一轮选择。
 fn out_of_memory_loop(
     ctx: OomContext,
     scope: Option<&Arc<CgroupNode>>,
     select: &mut dyn FnMut() -> Option<OomCandidate>,
-    no_victim: &mut dyn FnMut() -> OomOutcome,
+    no_victim: &mut dyn FnMut(u64) -> OomOutcome,
 ) -> OomOutcome {
     loop {
         if current_is_killed_or_exiting() {
@@ -574,8 +608,9 @@ fn out_of_memory_loop(
         };
 
         let Some(candidate) = select() else {
-            finish_selection_none();
-            return no_victim();
+            // 选择失败的去向由入口决定；本代际的 selecting 标记由
+            // no_victim 负责闭合（自杀路径要把它转登记为 inflight）。
+            return no_victim(generation);
         };
 
         let current = ProcessManager::current_pcb();
@@ -627,8 +662,7 @@ fn out_of_memory_loop(
                     "oom: failed to SIGKILL victim tgid={} for trigger pid={} err={:?}",
                     candidate_tgid, ctx.trigger_pid, err
                 );
-                finish_selection_none();
-                return no_victim();
+                return no_victim(generation);
             }
         }
     }
@@ -642,7 +676,8 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
     if let Some(outcome) = super::memcg::drain_pending_memcg_oom(ctx) {
         return outcome;
     }
-    out_of_memory_loop(ctx, None, &mut select_victim, &mut || {
+    out_of_memory_loop(ctx, None, &mut select_victim, &mut |generation| {
+        finish_selection_for(generation);
         error!(
             "oom: no victim for trigger pid={} tgid={} addr={:#x} ip={:#x}",
             ctx.trigger_pid,
@@ -670,59 +705,163 @@ pub fn scoped_out_of_memory(ctx: OomContext, scope: Arc<CgroupNode>) -> OomOutco
         ctx,
         Some(&scope),
         &mut || select_scoped_victim(&scope),
-        &mut || scoped_no_victim(ctx, &scope),
+        &mut |generation| scoped_no_victim(ctx, &scope, generation),
     )
 }
 
-/// 给当前任务挂 SIGKILL。触发者自杀路径专用：致命信号置位由信号递送
-/// 路径完成；本函数只保证「SIGKILL 已挂起」，任务在返回用户态后于
-/// do_exit 中释放 mm、解除 inflight。
-fn kill_current_task() {
-    let current = ProcessManager::current_pcb();
-    let mut info = SigInfo::new(
-        Signal::SIGKILL,
-        0,
-        SigCode::Kernel,
-        SigType::Kill {
-            pid: RawPid::new(0),
-            uid: 0,
-        },
-    );
-    if let Err(err) =
-        Signal::SIGKILL.send_signal_info_to_pcb(Some(&mut info), current, PidType::TGID)
-    {
-        warn!("oom: failed to SIGKILL scoped trigger: {:?}", err);
+/// 越限子树此刻是否已解除超限（`memory.max` 被上调、残量已被其它路径
+/// 释放等）。作用域内任一在线 memory CSS 仍超限即返回 `false`——与
+/// `memcg::find_max_exceeded` 的「沿链找第一个超限层」同一判据：超限
+/// 已解除时 scoped 等待必须立即结束，否则触发者会白等到超时。
+fn scope_pressure_relieved(scope: &Arc<CgroupNode>) -> bool {
+    let mut stack = vec![scope.clone()];
+    while let Some(node) = stack.pop() {
+        if let Some(css) = node.css(CgroupSubsysId::Memory) {
+            if let Some(memcg) = css.as_any().downcast_ref::<MemoryCss>() {
+                if memcg.max_exceeded_now() {
+                    return false;
+                }
+            }
+        }
+        stack.extend(node.children());
     }
+    true
+}
+
+/// 触发者自杀路径的记账核心（issue #27 审计修正）：
+///
+/// 与 [`send_oom_sigkill`] 走完全相同的受害者登记协议——
+/// `record_oom_victim_mm`（等价 Linux `mark_oom_victim` 的 TIF_MEMDIE）
+/// + `inflight` 登记 + SIGKILL 投递，失败时成对回滚。缺了登记，被杀
+/// 触发者的退出路径会重新落入 memcg 计费拒绝（`memcg_alloc_charge`
+/// 依赖 `current_is_oom_victim()` 给受害者放行 reserve 访问，
+/// `retry_oom_victim_page_frame_alloc` 同理），退出释放的 mm 也无法
+/// 经 `note_oom_victim_mm_released` 解除 inflight、唤醒并发触发者。
+///
+/// 调用前提：调用方曾以 `generation` 赢得单飞选择。两处调用点的槽位
+/// 所有权不同（选择失败=仍独占；SIGKILL 投递失败=已在
+/// `send_oom_sigkill` 的回滚中让出），因此本函数必须**先验证书与**
+/// 再转移：只有 `OOM_STATE` 仍是本代际且 `selecting` 仍置起时，才把
+/// selecting 转登记为 inflight；否则（别的 CPU 已赢得更新的一代际，
+/// 或本轮标记已闭合）配对撤销登记并返回 `EBUSY`，绝不劫持别人的单飞
+/// 槽位。锁序与 [`send_oom_sigkill`] 一致：先 `sighand` 记账后取
+/// `OOM_STATE`，不得倒置。
+fn mark_current_oom_victim(generation: u64) -> Result<(), SystemError> {
+    let current = ProcessManager::current_pcb();
+    current.with_task_lock_irqsave(|| {
+        let Some(mm) = current.basic().user_vm() else {
+            // 无用户地址空间（理论不可达：越限 charge 来自用户 mm 的
+            // 缺页；防御性拒绝自杀登记，调用方退化为等待路径）。
+            return Err(SystemError::ESRCH);
+        };
+        let tgid = current.raw_tgid();
+        let mm_id = mm.id();
+        let sighand = current.sighand();
+        sighand.record_oom_victim_mm(tgid, &mm);
+        {
+            let mut state = OOM_STATE.lock_irqsave();
+            if state.generation != generation || !state.selecting {
+                // 槽位已不在手上（见文档注释）：撤销记账后让路。
+                drop(state);
+                sighand.clear_oom_mm_if(tgid, mm_id);
+                return Err(SystemError::EBUSY);
+            }
+            state.selecting = false;
+            state.inflight = Some(OomVictimState {
+                generation,
+                tgid,
+                mm_id,
+            });
+        }
+        let mut info = SigInfo::new(
+            Signal::SIGKILL,
+            0,
+            SigCode::Kernel,
+            SigType::Kill {
+                pid: RawPid::new(0),
+                uid: 0,
+            },
+        );
+        match Signal::SIGKILL.send_signal_info_to_pcb(
+            Some(&mut info),
+            current.clone(),
+            PidType::TGID,
+        ) {
+            Ok(_) => Ok(()),
+            Err(err) => {
+                sighand.clear_oom_mm_if(tgid, mm_id);
+                if rollback_inflight(generation, tgid, mm_id) {
+                    wake_oom_waiters();
+                }
+                Err(err)
+            }
+        }
+    })
 }
 
 /// scoped 无组内受害者时的恢复决策（issue #27 防逃逸核心）。
 ///
-/// 对齐 Linux 6.6：`out_of_memory()` 对 `is_memcg_oom` 的 `!oc->chosen`
-/// 分支既不 panic 也不升格全局；触发者自身退出等价
-/// `task_will_free_mem(current)` 的自杀语义可释放额度；此后 charge
-/// 再次失败、缺页路径重试，等价 `pagefault_out_of_memory()` 的
-/// “Huh VM_FAULT_OOM leaked out ... Retrying PF” 前进语义。
-///
-/// 因此本函数只会二选一，绝不返回 `NoVictim`、绝不全局选受害者：
-/// 1. 触发者在越限子树内 → 击杀触发者（组内自杀），返回
-///    `CurrentTaskKilled`；其地址空间消亡即释放组内额度；
-/// 2. 触发者在组外（如异步退出路径的分配）→ `Retry`，由 charge 重试
-///    驱动，行为有界且组外进程零误伤。
-fn scoped_no_victim(_ctx: OomContext, scope: &Arc<CgroupNode>) -> OomOutcome {
+/// 对齐 Linux 6.6 的三段语义，绝不返回 `NoVictim`、绝不全局选受害者：
+/// 1. 触发者**可杀**且在越限子树内 → 登记为 OOM 受害者并自杀
+///    （`out_of_memory()` 的 `task_will_free_mem(current)` →
+///    `mark_oom_victim` + 回收），其 mm 消亡即释放组内额度；
+/// 2. 触发者**不可杀**（pid1/kthread/vfork 等待/`oom_score_adj=-1000`
+///    ——Linux 的 `oom_unkillable_task` 不会杀它们）且在组内 →
+///    killable 等待组内回收或越限解除（`mem_cgroup_oom_synchronize`
+///    的 TASK_KILLABLE 等待），绝不升级为击杀不可杀任务；
+/// 3. 触发者在组外 → `Retry`，由 charge 重试驱动，行为有界、
+///    组外进程零误伤。
+fn scoped_no_victim(ctx: OomContext, scope: &Arc<CgroupNode>, generation: u64) -> OomOutcome {
     if current_is_killed_or_exiting() {
+        // 本臂只可能来自「选择失败」调用点（此时槽位仍在手上），但
+        // 统一走按代际闭合，规则只有一条：no_victim 永不无条件清
+        // selecting（见 [`finish_selection_for`]）。
+        finish_selection_for(generation);
         return OomOutcome::CurrentTaskKilled;
     }
     let current = ProcessManager::current_pcb();
-    let current_node = task_cgroup_node_of(&current);
+    let current_leader = leader_of(current.clone());
+    let current_node = task_cgroup_node_of(&current_leader);
     if scope.is_ancestor_of(&current_node) {
-        error!(
-            "oom: cgroup scope has no killable victim, killing trigger tgid={}",
-            current.raw_tgid()
-        );
-        kill_current_task();
-        count_oom_kill();
-        return OomOutcome::CurrentTaskKilled;
+        let oom_score_adj = current_leader.sig_info_irqsave().oom_score_adj();
+        if !should_skip_candidate(&current_leader, oom_score_adj) {
+            match mark_current_oom_victim(generation) {
+                Ok(()) => {
+                    error!(
+                        "oom: cgroup scope has no killable victim, killing trigger tgid={} addr={:#x} ip={:#x}",
+                        current.raw_tgid(),
+                        ctx.fault_address.data(),
+                        ctx.fault_ip
+                    );
+                    count_oom_kill();
+                    return OomOutcome::CurrentTaskKilled;
+                }
+                Err(err) => {
+                    // 自杀登记失败：`EBUSY`=槽位已被更新的一代际赢得
+                    // （绝不能再动别人的 selecting），`ESRCH`/信号错误
+                    // =本轮标记仍在手上。按代际闭合两种情形都正确。
+                    warn!(
+                        "oom: scoped trigger self-kill bookkeeping failed tgid={} err={:?}",
+                        current.raw_tgid(),
+                        err
+                    );
+                    finish_selection_for(generation);
+                }
+            }
+        } else {
+            // 触发者不可杀：等待组内其它回收或 max 上调，对齐
+            // `mem_cgroup_oom_synchronize` 的 killable 等待。
+            finish_selection_for(generation);
+            let _ = OOM_WAITQ.wait_event_interruptible_timeout(
+                || current_is_killed_or_exiting() || scope_pressure_relieved(scope),
+                Some(Duration::from_millis(SCOPED_OOM_NO_VICTIM_WAIT_MS)),
+            );
+        }
+        return OomOutcome::Retry;
     }
+    // 组外触发者：不等待（越限解除由组内任务推进），直接让 charge
+    // 重试驱动本次缺页前进。
+    finish_selection_for(generation);
     OomOutcome::Retry
 }
 
