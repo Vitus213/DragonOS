@@ -108,6 +108,31 @@ impl PiProtected {
         self.nr_cpus_allowed = self.cpus_allowed.iter_cpu().count();
     }
 
+    /// 将现有 affinity 与 cpuset 有效策略求交集并原子发布，返回生效 mask。
+    ///
+    /// 读取、求交、写回都在本结构（即 `pi_lock`）的保护内完成，调用方
+    /// 无需（也不允许）在 `pi_lock` 外先读旧值再写回，否则会与
+    /// `sched_setaffinity` 的读改写互相丢失更新。交集为空时返回
+    /// `EINVAL` 并保持原 mask 不变——调用方必须把失败上报，而不是
+    /// 让任务带着违反新策略的旧 affinity 继续运行。
+    ///
+    /// 锁序：本方法只能在已持有目标任务 `pi_lock`（本结构借 `&mut self`
+    /// 表达）时调用，其外层的 cpuset 应用链为
+    /// `cgroup_accounting_lock → pi_lock → rq_lock`，与迁移路径
+    /// （write_procs/fork 持 accounting 后设置 affinity）一致；任何
+    /// 持 `pi_lock`/`rq_lock` 的代码都不得反向获取 accounting_lock。
+    /// `ProcessManager::set_cpus_allowed`（直接发布完整 mask）走同一
+    /// 锁序，二者的区别仅是本方法把"读旧值→求交"也收进临界区。
+    pub fn narrow_cpus_allowed(&mut self, policy: &CpuMask) -> Result<CpuMask, SystemError> {
+        let mut mask = self.cpus_allowed.clone();
+        mask.bitand_assign(policy);
+        if mask.is_empty() {
+            return Err(SystemError::EINVAL);
+        }
+        self.set_cpus_allowed(mask.clone());
+        Ok(mask)
+    }
+
     #[inline]
     pub fn sched_reset_on_fork(&self) -> bool {
         self.sched_reset_on_fork
@@ -483,5 +508,54 @@ impl ProcessControlBlock {
                 "fork target cpu and SE bound rq must stay consistent"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use bitmap::traits::BitMapOps;
+
+    fn mask_of(cpus: &[u32]) -> CpuMask {
+        let mut mask = CpuMask::new();
+        for cpu in cpus {
+            mask.set(ProcessorId::new(*cpu), true);
+        }
+        mask
+    }
+
+    fn same_mask(left: &CpuMask, right: &CpuMask) -> bool {
+        (0..left.inner().size()).all(|bit| left.inner().get(bit) == right.inner().get(bit))
+    }
+
+    /// cpuset 收窄必须与任务现有 affinity 求交而非覆盖：用户显式
+    /// 设置的更窄 affinity 不能被放宽；交集为空时保持原 mask 并报
+    /// EINVAL（调用方不得静默跳过）。
+    #[test]
+    fn narrow_cpus_allowed_intersects_without_widening() {
+        let mut pi = PiProtected::new(mask_of(&[0, 1]));
+        // 策略更宽：保持用户的窄 affinity，不放宽。
+        let widened = pi.narrow_cpus_allowed(&mask_of(&[0, 1, 2, 3])).unwrap();
+        assert!(same_mask(&widened, &mask_of(&[0, 1])));
+        // 策略部分相交：收窄为交集。
+        let narrowed = pi.narrow_cpus_allowed(&mask_of(&[1, 2])).unwrap();
+        assert!(same_mask(&narrowed, &mask_of(&[1])));
+        // 策略不相交：拒绝且不改写、不更新 nr_cpus_allowed。
+        assert_eq!(
+            pi.narrow_cpus_allowed(&mask_of(&[2, 3])).map(|_| ()),
+            Err(SystemError::EINVAL)
+        );
+        assert!(same_mask(&pi.cpus_allowed, &mask_of(&[1])));
+        assert_eq!(pi.nr_cpus_allowed, 1);
+    }
+
+    #[test]
+    fn narrow_cpus_allowed_rejects_empty_policy() {
+        let mut pi = PiProtected::new(mask_of(&[0, 3]));
+        assert_eq!(
+            pi.narrow_cpus_allowed(&CpuMask::new()).map(|_| ()),
+            Err(SystemError::EINVAL)
+        );
+        assert!(same_mask(&pi.cpus_allowed, &mask_of(&[0, 3])));
     }
 }

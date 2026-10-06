@@ -283,7 +283,22 @@ impl CgroupNode {
 
     /// Apply a cgroup.type write. The parent is promoted to the appropriate
     /// domain state when a new threaded subtree is established.
+    ///
+    /// 调用者必须持有 `cgroup_accounting_lock`：cgroup.type 的
+    /// vet→写入是"读拓扑态（subtree_task_count/域控制器/父类型）→改
+    /// 类型"的读改写序列，必须与任务迁移（write_procs/fork/exit）以及
+    /// mkdir/rmdir 串行。否则并发迁移恰好插在 vet 与写入之间时，可固化
+    /// "threaded 子树内存在域控制器任务"等非法组合，后续 vet/rmdir 把
+    /// 非法态当真，导致持久 EBUSY 或 no-internal-process 规则绕过。
+    /// 入口 `write_type_file` 负责取锁。
     pub fn set_cgroup_type(&self, requested: &str) -> Result<(), SystemError> {
+        // 锁纪律自检：SpinLock::is_locked 为弱判定（并发持锁者可能使
+        // 漏取锁的调用侥幸通过），但足以在单线程复现路径与调试期稳定
+        // 捕获"未持锁即变更类型"的违约。
+        debug_assert!(
+            cgroup_accounting_lock().is_locked(),
+            "set_cgroup_type 必须在持有 cgroup_accounting_lock 的临界区内调用"
+        );
         match requested.trim() {
             "threaded" => {
                 if self.parent().is_none() || self.cgroup_type() != CgroupType::Domain {
@@ -1494,5 +1509,64 @@ mod tests {
         saturating_sub(&counter);
         saturating_sub(&counter);
         assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    /// 类型 vet→写入在 accounting 锁内串行后，与迁移方（write_procs/
+    /// fork 的等价段：持锁改成员）并发时，writer 无论何时拿到锁，看到
+    /// 的都是成对 add/remove 之外的稳定空子树——不会固化"子树仍有
+    /// 任务却变 threaded"的非法组合。
+    #[test]
+    fn threaded_type_write_serializes_with_migration() {
+        let root = CgroupRoot::new();
+        let parent = root.create_child(&root.root(), "s-parent").unwrap();
+        let child = root.create_child(&parent, "s-child").unwrap();
+
+        let writer = {
+            let child = child.clone();
+            std::thread::spawn(move || {
+                // 模拟 write_type_file 入口：全程持锁 vet→写入。
+                let _guard = cgroup_accounting_lock().lock();
+                child.set_cgroup_type("threaded")
+            })
+        };
+        // 并发迁移方（write_procs/fork 的等价段）：只有拿到锁才能改成员。
+        let migrator = {
+            let child = child.clone();
+            std::thread::spawn(move || {
+                for pid in 5000..5100usize {
+                    let _guard = cgroup_accounting_lock().lock();
+                    let pid = RawPid::new(pid);
+                    child.add_task(pid);
+                    child.remove_task(pid);
+                }
+            })
+        };
+        let writer_result = writer.join().expect("writer thread must not panic");
+        migrator.join().expect("migrator thread must not panic");
+
+        assert!(writer_result.is_ok());
+        assert_eq!(child.cgroup_type(), CgroupType::Threaded);
+        assert_eq!(child.subtree_task_count(), 0);
+        // 父节点被提升为域 threaded（Linux 语义）。
+        assert_eq!(parent.cgroup_type(), CgroupType::DomainThreaded);
+    }
+
+    /// vet 在锁内读取的拓扑计数对迁移方可见：本组仍有任务时必须拒绝
+    /// （EOPNOTSUPP），任务离开后放行。
+    #[test]
+    fn threaded_rejected_when_subtree_populated() {
+        let root = CgroupRoot::new();
+        let parent = root.create_child(&root.root(), "p2").unwrap();
+        let child = root.create_child(&parent, "c2").unwrap();
+
+        let _guard = cgroup_accounting_lock().lock();
+        child.add_task(RawPid::new(9301));
+        assert_eq!(
+            child.set_cgroup_type("threaded"),
+            Err(SystemError::EOPNOTSUPP_OR_ENOTSUP)
+        );
+        child.remove_task(RawPid::new(9301));
+        assert!(child.set_cgroup_type("threaded").is_ok());
+        assert_eq!(child.cgroup_type(), CgroupType::Threaded);
     }
 }
