@@ -4,11 +4,12 @@ use log::{error, warn};
 use system_error::SystemError;
 
 use crate::{
-    arch::{MMArch, ipc::signal::Signal, mm::LockedFrameAllocator},
+    arch::{ipc::signal::Signal, mm::LockedFrameAllocator, MMArch},
+    cgroup::CgroupNode,
     ipc::signal_types::{SigCode, SigInfo, SigType},
     libs::{spinlock::SpinLock, wait_queue::WaitQueue},
-    mm::{MemoryManagementArch, allocator::page_frame::FrameAllocator},
-    process::{ProcessControlBlock, ProcessFlags, ProcessManager, RawPid, pid::PidType},
+    mm::{allocator::page_frame::FrameAllocator, MemoryManagementArch},
+    process::{pid::PidType, ProcessControlBlock, ProcessFlags, ProcessManager, RawPid},
 };
 
 use super::ucontext::AddressSpace;
@@ -200,11 +201,40 @@ fn rollback_inflight(generation: u64, tgid: RawPid, mm_id: u64) -> bool {
     }
 }
 
-fn kill_targets_for_mm(mm: &Arc<AddressSpace>) -> Vec<Arc<ProcessControlBlock>> {
+/// 全局 OOM 的 pid 快照（选择时重新解引用，不携带缓存语义）。
+fn collect_all_task_pids() -> Vec<RawPid> {
+    ProcessManager::get_all_processes()
+}
+
+/// scoped OOM 的组内成员快照（issue #27：每轮选择重新收集，禁止缓存
+/// 上一轮结果——pid 空间会被组外任务复用，静态快照在重试窗口内即失效）。
+///
+/// 锁序：父节点读锁（children）先于子节点读锁（tasks），仅由父向子
+/// 递降；兄弟子树不相交、图无环，不可能构成环等待。沿用原 memcg 侧
+/// 收集方式：std RwLock 读锁做成员快照遍历，不新增 IRQ 持锁。
+/// pm37（#37）复用本函数做整组击杀遍历。
+pub(crate) fn collect_subtree_task_pids(node: &Arc<CgroupNode>) -> Vec<RawPid> {
+    let mut pids = node.tasks();
+    for child in node.children() {
+        pids.extend(collect_subtree_task_pids(&child));
+    }
+    pids
+}
+
+/// 共享受害者 mm 的同组击杀集（issue #27：`scope` 非空时组内成员才
+/// 入选）。
+///
+/// 受害者与其线程组使用同一 mm；vfork 等待父等组外共享者绝不能被
+/// 击杀（Linux memcg OOM 只在越限子树内选择）。返回项为线程粒度，
+/// 实际发送以 TGID 定向整个线程组。
+fn kill_targets_for_mm(
+    mm: &Arc<AddressSpace>,
+    scope: Option<&Arc<CgroupNode>>,
+) -> Vec<Arc<ProcessControlBlock>> {
     let mut seen_tgids = Vec::new();
     let mut targets = Vec::new();
 
-    for pid in ProcessManager::get_all_processes() {
+    for pid in collect_all_task_pids() {
         let Some(task) = ProcessManager::find(pid) else {
             continue;
         };
@@ -222,20 +252,72 @@ fn kill_targets_for_mm(mm: &Arc<AddressSpace>) -> Vec<Arc<ProcessControlBlock>> 
         if is_global_init_or_kthread(&leader) {
             continue;
         }
+        if let Some(scope) = scope {
+            // 组外共享者不进入 kill 集；发送前 [`scoped_validate_pid`]
+            // 还会对入选者复核（双重防线）。
+            if !scope.is_ancestor_of(&task_cgroup_node_of(&leader)) {
+                continue;
+            }
+        }
         targets.push(task);
     }
 
     targets
 }
 
+/// 全局 OOM：从全部用户任务中选出最高分受害者。
 fn select_victim() -> Option<OomCandidate> {
-    select_victim_from(ProcessManager::get_all_processes())
+    select_victim_from(collect_all_task_pids(), None)
 }
 
-/// Select the highest-scored candidate among `pids`.  Used both for the
-/// global OOM (all processes) and for cgroup-scoped OOM
-/// (`memory.max`), whose victims must come from the offending subtree.
-fn select_victim_from(pids: Vec<RawPid>) -> Option<OomCandidate> {
+/// scoped OOM（issue #27）：从越限子树【当前】成员中选出受害者。
+/// 每次调用（含 ESRCH 重试与抢占失败后的重选）都重新遍历子树收集
+/// pid，绝不复用上一轮的快照——pid 号空间会被组外任务复用，静态
+/// 快照在重试窗口内即失效（issue #27 缺陷二）。
+fn select_scoped_victim(scope: &Arc<CgroupNode>) -> Option<OomCandidate> {
+    select_victim_from(collect_subtree_task_pids(scope), Some(scope))
+}
+
+/// 任务当前直接归属的 memory cgroup 节点。
+///
+/// 迁移路径（`write_procs` / fork 继承）在 `cgroup_accounting_lock` 下
+/// 原子地完成 remove_task + add_task + `task_cgroup` 字段写入；字段访问
+/// 经 `ArcSwap` 无锁读取，因此这里返回的必然是「迁移前旧节点」或
+/// 「迁移后新节点」之一（两个都是稳定 `Arc`），不存在中间态。
+fn task_cgroup_node_of(task: &Arc<ProcessControlBlock>) -> Arc<CgroupNode> {
+    task.task_cgroup_node()
+}
+
+/// scoped 归属复核（SIGKILL 发送前）：受害者必须仍位于越限子树内、
+/// 仍使用选定的 mm、且仍是其线程组的 leader。
+///
+/// 这是 issue #27 的防「pid 复用误杀」闸门：若候选 tgid 对应的进程已
+/// 退出且 pid 被组外任务复用，`ProcessManager::find` 返回的是复用者，
+/// 其归属节点必然在子树外（或它不是 leader、或已不持有该 mm），
+/// 三项校验任一失败即放弃本次击杀并返回 `ESRCH` 触发重选。
+fn scoped_validate_pid(
+    tgid: RawPid,
+    expected_mm: &Arc<AddressSpace>,
+    scope: &Arc<CgroupNode>,
+) -> Result<Arc<ProcessControlBlock>, SystemError> {
+    let task = ProcessManager::find(tgid).ok_or(SystemError::ESRCH)?;
+    if !scope.is_ancestor_of(&task_cgroup_node_of(&task)) {
+        return Err(SystemError::ESRCH);
+    }
+    if !task_uses_mm(&task, expected_mm) {
+        return Err(SystemError::ESRCH);
+    }
+    let leader = leader_of(task.clone());
+    if leader.raw_pid() != tgid || !scope.is_ancestor_of(&task_cgroup_node_of(&leader)) {
+        return Err(SystemError::ESRCH);
+    }
+    Ok(task)
+}
+
+/// 在 `pids` 中选出最高分候选。`scope` 为 `Some` 时是 scoped OOM
+/// （`memory.max`，issue #27）：候选 leader 必须直接归属越限子树，
+/// 击杀时刻仍会复核组内归属（[`scoped_validate_pid`]）。
+fn select_victim_from(pids: Vec<RawPid>, scope: Option<&Arc<CgroupNode>>) -> Option<OomCandidate> {
     let total_pages = total_system_pages();
     let mut seen_tgids = Vec::new();
     let mut best: Option<OomCandidate> = None;
@@ -254,6 +336,15 @@ fn select_victim_from(pids: Vec<RawPid>) -> Option<OomCandidate> {
             continue;
         }
         seen_tgids.push(tgid);
+
+        let leader_node = task_cgroup_node_of(&leader);
+        if let Some(scope) = scope {
+            // 组外成员（含 pid 复用后落入本表的组外任务）直接跳过：
+            // scoped OOM 的受害者只能来自越限子树。
+            if !scope.is_ancestor_of(&leader_node) {
+                continue;
+            }
+        }
 
         let oom_score_adj = leader.sig_info_irqsave().oom_score_adj();
         if should_skip_candidate(&leader, oom_score_adj) {
@@ -306,20 +397,35 @@ pub fn note_oom_victim_mm_released(mm_id: u64) {
 fn send_oom_sigkill(
     generation: u64,
     candidate: &OomCandidate,
+    scope: Option<&Arc<CgroupNode>>,
 ) -> Result<Option<RawPid>, SystemError> {
-    let targets = kill_targets_for_mm(&candidate.mm);
-    let Some(victim) = targets
-        .iter()
-        .find(|target| target.raw_tgid() == candidate.tgid)
-        .or_else(|| {
-            targets
-                .iter()
-                .find(|target| task_uses_mm(target, &candidate.mm))
-        })
-        .cloned()
-    else {
-        finish_selection_none();
-        return Err(SystemError::ESRCH);
+    let targets = kill_targets_for_mm(&candidate.mm, scope);
+    // scoped：候选 tgid 必须在击杀时刻仍然是组内、仍持有该 mm 的
+    // leader（[`scoped_validate_pid`]）；全局：保持原有 tgid 反查。
+    let victim = match scope {
+        Some(scope) => match scoped_validate_pid(candidate.tgid, &candidate.mm, scope) {
+            Ok(victim) => victim,
+            Err(_) => {
+                finish_selection_none();
+                return Err(SystemError::ESRCH);
+            }
+        },
+        None => match targets
+            .iter()
+            .find(|target| target.raw_tgid() == candidate.tgid)
+            .or_else(|| {
+                targets
+                    .iter()
+                    .find(|target| task_uses_mm(target, &candidate.mm))
+            })
+            .cloned()
+        {
+            Some(victim) => victim,
+            None => {
+                finish_selection_none();
+                return Err(SystemError::ESRCH);
+            }
+        },
     };
     let victim_tgid = victim.raw_tgid();
     let victim_mm_id = candidate.mm.id();
@@ -341,6 +447,14 @@ fn send_oom_sigkill(
         if !task_uses_mm(&victim, &candidate.mm) {
             finish_selection_none();
             return Err(SystemError::ESRCH);
+        }
+        if let Some(scope) = scope {
+            // SIGKILL 前最后一道归属复核（task_lock 下，与迁移的
+            // task_lock 互斥）：受害者此刻必须仍在越限子树内。
+            if !scope.is_ancestor_of(&task_cgroup_node_of(&victim)) {
+                finish_selection_none();
+                return Err(SystemError::ESRCH);
+            }
         }
 
         let sighand = victim.sighand();
@@ -368,6 +482,12 @@ fn send_oom_sigkill(
     for target in targets {
         if target.raw_tgid() == victim_tgid {
             continue;
+        }
+        if let Some(scope) = scope {
+            // 双重防线：发送时刻再复核一次组内归属。
+            if scoped_validate_pid(target.raw_tgid(), &candidate.mm, scope).is_err() {
+                continue;
+            }
         }
         match send_sigkill(target) {
             Ok(_) | Err(SystemError::ESRCH) => {}
@@ -429,9 +549,16 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
 /// Shared body of the OOM state machine: single-flight victim selection,
 /// SIGKILL delivery (including group members sharing the victim mm),
 /// inflight-victim tracking and killable recovery waits.
+///
+/// `no_victim` 决定「选不出受害者」时的去向（issue #27 核心）：全局
+/// 入口记录错误并返回 NoVictim；scoped 入口绝不逃逸到全局选择，只能
+/// 在越限子树内恢复（必要时击杀触发者自身），对齐 Linux 6.6
+/// `out_of_memory()` 中 `is_memcg_oom` 分支不 panic、不升格全局的语义。
 fn out_of_memory_loop(
     ctx: OomContext,
+    scope: Option<&Arc<CgroupNode>>,
     select: &mut dyn FnMut() -> Option<OomCandidate>,
+    no_victim: &mut dyn FnMut() -> OomOutcome,
     on_kill: &mut dyn FnMut(Option<RawPid>),
 ) -> OomOutcome {
     loop {
@@ -449,14 +576,7 @@ fn out_of_memory_loop(
 
         let Some(candidate) = select() else {
             finish_selection_none();
-            error!(
-                "oom: no victim for trigger pid={} tgid={} addr={:#x} ip={:#x}",
-                ctx.trigger_pid,
-                ctx.trigger_tgid,
-                ctx.fault_address.data(),
-                ctx.fault_ip
-            );
-            return OomOutcome::NoVictim;
+            return no_victim();
         };
 
         let current = ProcessManager::current_pcb();
@@ -468,7 +588,7 @@ fn out_of_memory_loop(
         let victim_score = candidate.score;
         let victim_oom_score_adj = candidate.oom_score_adj;
         let victim_resident_pages = candidate.resident_pages;
-        match send_oom_sigkill(generation, &candidate) {
+        match send_oom_sigkill(generation, &candidate, scope) {
             Ok(killed_tgid) => {
                 if let Some(killed_tgid) = killed_tgid {
                     count_oom_kill();
@@ -509,7 +629,8 @@ fn out_of_memory_loop(
                     "oom: failed to SIGKILL victim tgid={} for trigger pid={} err={:?}",
                     candidate_tgid, ctx.trigger_pid, err
                 );
-                return OomOutcome::NoVictim;
+                finish_selection_none();
+                return no_victim();
             }
         }
     }
@@ -523,26 +644,101 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
     if let Some(outcome) = super::memcg::drain_pending_memcg_oom(ctx) {
         return outcome;
     }
-    out_of_memory_loop(ctx, &mut select_victim, &mut |_| {})
+    out_of_memory_loop(
+        ctx,
+        None,
+        &mut select_victim,
+        &mut || {
+            error!(
+                "oom: no victim for trigger pid={} tgid={} addr={:#x} ip={:#x}",
+                ctx.trigger_pid,
+                ctx.trigger_tgid,
+                ctx.fault_address.data(),
+                ctx.fault_ip
+            );
+            OomOutcome::NoVictim
+        },
+        &mut |_| {},
+    )
 }
 
-/// Cgroup-scoped OOM (`memory.max`): victim selection is restricted to
-/// `candidate_pids` (the subtree of the CSS whose limit was exceeded);
-/// selection, kill and recovery still run through the shared state
-/// machine, so memcg and global OOM exclude each other and share the
-/// inflight-victim bookkeeping.  `on_kill` fires once per successful kill
-/// with the victim tgid, letting the memcg caller count `oom_kill` events
-/// and run the `memory.oom.group` subtree cleanup.
+/// Cgroup-scoped OOM（`memory.max`，issue #27）：受害者只能来自越限子树。
+///
+/// 与旧实现的两个本质区别：
+/// 1. 作用域以 `Arc<CgroupNode>` 传入（而非一次性 pid 快照），每次选择
+///    （首轮、ESRCH 重试、inflight 抢占后重选）都重新遍历子树收集成员
+///    （[`select_scoped_victim`]）；
+/// 2. SIGKILL 发送前对击杀目标复核仍在越限子树内
+///    （[`scoped_validate_pid`] + [`send_oom_sigkill`] 的 task_lock 复核），
+///    组外任务（含 pid 复用者、组外 mm 共享者）绝不会被击杀。
+///
+/// 组内选不出受害者时**绝不**逃逸为全局选择（[`scoped_no_victim`]）。
+/// `on_kill` 每次成功击杀携受害者 tgid 回调一次（issue #37），让 memcg
+/// 调用方计 `oom_kill` 事件并执行 `memory.oom.group` 的组子树清理。
 pub fn scoped_out_of_memory(
     ctx: OomContext,
-    candidate_pids: Vec<RawPid>,
+    scope: Arc<CgroupNode>,
     on_kill: &mut dyn FnMut(Option<RawPid>),
 ) -> OomOutcome {
     out_of_memory_loop(
         ctx,
-        &mut || select_victim_from(candidate_pids.clone()),
+        Some(&scope),
+        &mut || select_scoped_victim(&scope),
+        &mut || scoped_no_victim(ctx, &scope),
         on_kill,
     )
+}
+
+/// 给当前任务挂 SIGKILL。触发者自杀路径专用：致命信号置位由信号递送
+/// 路径完成；本函数只保证「SIGKILL 已挂起」，任务在返回用户态后于
+/// do_exit 中释放 mm、解除 inflight。
+fn kill_current_task() {
+    let current = ProcessManager::current_pcb();
+    let mut info = SigInfo::new(
+        Signal::SIGKILL,
+        0,
+        SigCode::Kernel,
+        SigType::Kill {
+            pid: RawPid::new(0),
+            uid: 0,
+        },
+    );
+    if let Err(err) =
+        Signal::SIGKILL.send_signal_info_to_pcb(Some(&mut info), current, PidType::TGID)
+    {
+        warn!("oom: failed to SIGKILL scoped trigger: {:?}", err);
+    }
+}
+
+/// scoped 无组内受害者时的恢复决策（issue #27 防逃逸核心）。
+///
+/// 对齐 Linux 6.6：`out_of_memory()` 对 `is_memcg_oom` 的 `!oc->chosen`
+/// 分支既不 panic 也不升格全局；触发者自身退出等价
+/// `task_will_free_mem(current)` 的自杀语义可释放额度；此后 charge
+/// 再次失败、缺页路径重试，等价 `pagefault_out_of_memory()` 的
+/// “Huh VM_FAULT_OOM leaked out ... Retrying PF” 前进语义。
+///
+/// 因此本函数只会二选一，绝不返回 `NoVictim`、绝不全局选受害者：
+/// 1. 触发者在越限子树内 → 击杀触发者（组内自杀），返回
+///    `CurrentTaskKilled`；其地址空间消亡即释放组内额度；
+/// 2. 触发者在组外（如异步退出路径的分配）→ `Retry`，由 charge 重试
+///    驱动，行为有界且组外进程零误伤。
+fn scoped_no_victim(_ctx: OomContext, scope: &Arc<CgroupNode>) -> OomOutcome {
+    if current_is_killed_or_exiting() {
+        return OomOutcome::CurrentTaskKilled;
+    }
+    let current = ProcessManager::current_pcb();
+    let current_node = task_cgroup_node_of(&current);
+    if scope.is_ancestor_of(&current_node) {
+        error!(
+            "oom: cgroup scope has no killable victim, killing trigger tgid={}",
+            current.raw_tgid()
+        );
+        kill_current_task();
+        count_oom_kill();
+        return OomOutcome::CurrentTaskKilled;
+    }
+    OomOutcome::Retry
 }
 
 pub fn notify_mm_drop(mm_id: u64) {

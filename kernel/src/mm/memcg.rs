@@ -73,7 +73,7 @@ use crate::{
     mm::{
         allocator::page_frame::PageFrameCount, page::PageReclaimer, MemoryManagementArch, PhysAddr,
     },
-    process::{ProcessManager, RawPid},
+    process::ProcessManager,
     time::{sleep::nanosleep, PosixTimeSpec},
 };
 
@@ -446,18 +446,18 @@ pub fn memcg_handle_over_high() {
 /// every killable task in its subtree while the group's
 /// `memory.events.oom_group_kill` counter is bumped once per cleanup.
 ///
-/// Returns `Some(outcome)` when the memcg OOM path acted (kill issued and
-/// memory released, or the current task is the victim; or the refusal is
-/// stale — see the fail-closed branches); `None` lets the caller fall
-/// back to the global OOM path.
+/// `None`（与 #30 约定的不变量一致）只意味着「本次没有需要 scoped 处理
+/// 的越限」：无挂起请求，或越限已被其它路径解除（`find_max_exceeded`
+/// 为空）——此时调用方回退全局路径是正确的。
+/// 一旦确定存在越限子树，本函数**必须**返回 `Some`：scoped 结果里
+/// 不存在「逃逸全局」这一选项（issue #27 缺陷一）。
 ///
 /// fail-closed（issue #30）：pending 是弱引用令牌，指向的 CSS/节点可能
 /// 已被 rmdir 拆除。两条悬挂路径（令牌无法解析、越限 CSS 的节点归属
 /// 已注销）都丢弃 pending 并返回 `Retry`——缺页任务重试自己的分配，
 /// 其计费若仍被在线组拒绝会重新存入**该组自己**的 pending，下一轮
 /// 排水即正常作用域化；绝不会走旧实现的 `expect("cgroup node dropped")`
-/// panic 面。（"越限组无任务时 `return None` 落入全局误杀"由 #27 收口，
-/// 不在本卡范围。）
+/// panic 面。
 pub(crate) fn drain_pending_memcg_oom(
     ctx: crate::mm::oom::OomContext,
 ) -> Option<crate::mm::oom::OomOutcome> {
@@ -478,23 +478,23 @@ pub(crate) fn drain_pending_memcg_oom(
     let exceeded = find_max_exceeded(&leaf)?;
 
     // 越限 CSS 若在解析后被并发 rmdir：节点归属已注销，作用域消失，
-    // 与上面同样丢弃 pending 并让缺页任务重试。
+    // 与上面同样丢弃 pending 并让缺页任务重试（fail-closed，issue #30）。
+    // 空子树不再回退全局选择：作用域成立时 scoped 必须闭合（issue #27）。
     let Some(node) = exceeded.cgroup_node() else {
         return Some(OomOutcome::Retry);
     };
-    let pids = collect_subtree_tasks(&node);
-    if pids.is_empty() {
-        return None;
-    }
-
     if let Some(memcg) = exceeded.as_any().downcast_ref::<MemoryCss>() {
         memcg.note_memcg_oom();
     }
-    // `group_cleanup_done` makes the subtree cleanup fire at most once per
-    // drain: the state machine may kill several victims across retries and
-    // must not re-kill the whole group on every victim kill.
+    // issue #27：传入越限子树的节点（作用域），由 oom.rs 每轮选择时
+    // 重新收集组内任务；不再传递一次性 pid 快照。#30 后取法为
+    // cgroup_node(): Option（悬挂即 fail-closed 返回 Retry，见上）。
+    // issue #37：on_kill 回调携带被杀受害者 tgid，做 oom_kill 事件计数
+    // 与 memory.oom.group 的组子树清理。`group_cleanup_done` 使清理每次
+    // 排水至多触发一轮：状态机跨重试可能击杀多个受害者，不能每次击杀
+    // 都重杀全组。
     let mut group_cleanup_done = false;
-    let outcome = oom::scoped_out_of_memory(ctx, pids, &mut |killed| {
+    let outcome = oom::scoped_out_of_memory(ctx, node, &mut |killed| {
         let Some(killed_tgid) = killed else {
             return;
         };
@@ -532,9 +532,10 @@ pub(crate) fn drain_pending_memcg_oom(
     });
     match outcome {
         OomOutcome::Retry | OomOutcome::CurrentTaskKilled => Some(outcome),
-        // Nothing killable inside the offending subtree: fall through to
-        // the global OOM path (same behaviour as its own NoVictim).
-        OomOutcome::NoVictim => None,
+        // scoped 路径的 no_victim 回调绝不产出 NoVictim（issue #27 防
+        // 逃逸不变量）；防御性兜底：即使出现，也按 Retry 处理（charge
+        // 重试驱动前进），绝不返回 None 让缺页路径落入全局受害者选择。
+        OomOutcome::NoVictim => Some(OomOutcome::Retry),
     }
 }
 
@@ -558,7 +559,7 @@ fn kill_oom_group_subtree(group: &Arc<CgroupNode>, victim_tgid: RawPid) {
     use crate::ipc::signal_types::{SigCode, SigInfo, SigType};
     use crate::process::pid::PidType;
 
-    let pids = collect_subtree_tasks(group);
+    let pids = crate::mm::oom::collect_subtree_task_pids(group);
     let targets = select_group_kill_targets(pids, victim_tgid, |pid| {
         ProcessManager::find(pid).map(|task| {
             let tgid = task.raw_tgid();
@@ -669,15 +670,6 @@ fn find_max_exceeded(leaf: &Arc<dyn CgroupSubsysState>) -> Option<Arc<dyn Cgroup
         current = css.parent();
     }
     None
-}
-
-/// All task pids in `node` and its descendants.
-fn collect_subtree_tasks(node: &Arc<CgroupNode>) -> Vec<RawPid> {
-    let mut pids = node.tasks();
-    for child in node.children() {
-        pids.extend(collect_subtree_tasks(&child));
-    }
-    pids
 }
 
 #[cfg(test)]
