@@ -105,8 +105,8 @@ struct IoSliceState {
 }
 
 impl IoSliceState {
-    /// Roll expired slices forward, refilling the dispatch budget on every
-    /// boundary (the io counterpart of the cpu controller's
+    /// Roll expired slices forward in O(1), refilling the dispatch budget on
+    /// the new boundary (the io counterpart of the cpu controller's
     /// `refresh_period_locked`).
     fn settle(&mut self, now_ns: u64) {
         if !self.initialized {
@@ -114,8 +114,16 @@ impl IoSliceState {
             self.slice_start_ns = now_ns;
             return;
         }
-        while now_ns.saturating_sub(self.slice_start_ns) >= THROTL_SLICE_NS {
-            self.slice_start_ns = self.slice_start_ns.saturating_add(THROTL_SLICE_NS);
+        // 整除一次推进（与 cpu.max 周期追赶同型修复）：`slice_start_ns` 仅在
+        // 该 (cgroup, device) 对有 dispatch 时前进，块路径挂起 T 后再回来时，
+        // 旧的逐 slice `while` 追赶要跑 T/slice 次迭代。中间 slice 逐个补偿
+        // 与最终状态一致（预算整体清零重填），故直接跳到 `now_ns` 所在 slice。
+        let elapsed = now_ns.saturating_sub(self.slice_start_ns);
+        let slices = elapsed / THROTL_SLICE_NS;
+        if slices > 0 {
+            self.slice_start_ns = self
+                .slice_start_ns
+                .saturating_add(slices.saturating_mul(THROTL_SLICE_NS));
             self.bytes_disp = 0;
             self.io_disp = 0;
         }
@@ -580,6 +588,28 @@ mod tests {
 
         assert_eq!(slice_allowance(10_240), 1024);
         assert_eq!(slice_allowance(u64::MAX), 1_844_674_407_370_955_161);
+    }
+
+    #[test]
+    fn io_slice_settle_advances_in_one_step_after_long_idle() {
+        // 与 cpu.max 同型的有界性验证：块路径挂起 10 分钟（6000 个 100ms
+        // slice）后首次 dispatch，旧逐 slice while 追赶要跑 6000 次迭代；
+        // 现在一次整除推进到 `now` 所在 slice 并整体重填预算。
+        let mut bucket = IoSliceState::default();
+        let t0 = 1_000_000_000u64;
+        bucket.settle(t0);
+        bucket.bytes_disp = 1024;
+        bucket.io_disp = 4;
+        let idle = 600_000_000_000u64; // 10 分钟 = 6000 slices
+        let now = t0 + idle + 3;
+        bucket.settle(now);
+        assert_eq!(bucket.slice_start_ns, t0 + 6000 * THROTL_SLICE_NS);
+        assert!(bucket.slice_start_ns <= now && now - bucket.slice_start_ns < THROTL_SLICE_NS);
+        assert_eq!(bucket.bytes_disp, 0);
+        assert_eq!(bucket.io_disp, 0);
+        // 同一时刻再次 settle 为零推进（迭代次数与睡眠长度无关）。
+        bucket.settle(now);
+        assert_eq!(bucket.slice_start_ns, t0 + 6000 * THROTL_SLICE_NS);
     }
 
     #[test]
