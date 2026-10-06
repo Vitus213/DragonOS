@@ -518,13 +518,13 @@ pub(crate) fn drain_pending_memcg_oom(
         // Linux `oom_kill_memcg_member` scans the group *subtree*
         // (`for_each_mem_cgroup_tree` + `css_task_iter`) and kills every
         // killable task; the main victim above was already SIGKILLed and
-        // counted, so the scan skips its tgid.  The group CSS was found
-        // inside the offending subtree; its node can only be rmdir'd once
-        // it is empty, in which case there is nothing left to clean.
+        // counted, so the scan skips its tgid.  节点访问走 #30 的
+        // fail-closed `cgroup_node()`：CSS 若已 offline（并发 rmdir 拆除
+        // 中）返回 None，放弃本轮清理即可（任务计费仍由 CSS 强引用持有）。
         let Some(group_memcg) = group.as_any().downcast_ref::<MemoryCss>() else {
             return;
         };
-        let Some(group_node) = group_memcg.try_cgroup() else {
+        let Some(group_node) = group_memcg.cgroup_node() else {
             return;
         };
         kill_oom_group_subtree(&group_node, killed_tgid);

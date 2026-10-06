@@ -563,13 +563,6 @@ impl MemoryCss {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// 非 panic 版 cgroup 节点访问：oom.group 清理运行在缺页 OOM 路径，
-    /// 目标 CSS 的节点可能在扫描窗口内被并发 rmdir 掉，此时放弃本轮清理
-    /// 即可（任务计费仍由 CSS 强引用持有，语义无损）。
-    pub(crate) fn try_cgroup(&self) -> Option<Arc<CgroupNode>> {
-        self.cgroup.upgrade()
-    }
-
     /// 对应 Linux `mem_cgroup_get_oom_group` 的层级遍历：从 victim 的 memory
     /// CSS 沿父链向上，直到（并包含）OOM 域 CSS `domain` 为止，返回路径上
     /// **最高一层**置位 `memory.oom.group` 的 CSS；没有任何一层置位则返回
