@@ -23,11 +23,37 @@
 //!   ([`memcg_handle_over_high`] and the drain hooked into
 //!   `oom::pagefault_out_of_memory`), like Linux
 //!   `mem_cgroup_handle_over_high()` and the memcg OOM handler.
+//! # 锁序与中断纪律（issue #28，全序图见 `kernel/src/cgroup/LOCK_ORDER.md`）
+//!
+//! `LockedFrameAllocator::free` 每次释放都会进入 [`memcg_free_uncharge`]
+//! 与 `uncharge_css → MemoryCss::uncharge`，而页帧释放会发生在硬中断
+//! 上下文里（驱动 IRQ 处理路径）。本模块锁族的纪律：
+//!
+//! ```text
+//! 嵌套方向（外 → 内）。修复后 PAGE_OWNERS 与 MEMORY_CHARGE_LOCK 互不
+//! 嵌套（free 路径持 PAGE_OWNERS 时只做归属摘取，放锁后才 uncharge），
+//! 唯一保留的嵌套边是 MEMORY_CHARGE_LOCK → MemoryCss::inner：
+//!
+//!   PAGE_OWNERS(irqsave)                  独立获取；锁内零分配、零嵌套
+//!   MEMORY_CHARGE_LOCK(irqsave)           独立获取，或 ↓ 嵌套
+//!     → MemoryCss::inner(irqsave)
+//!   PENDING_MAX_OOM(irqsave)              独立获取；锁内零嵌套
+//! ```
+//!
+//! - `PAGE_OWNERS` 一律 `lock_irqsave()`（含一次性初始化），临界区内只
+//!   做归属槽位的 take/填值，绝不跨 uncharge 持有、绝不在其下分配内存
+//!   （分配可能触发 slab 补帧 → 同 CPU 重进本锁）。free 路径的两段式
+//!   见 [`memcg_free_uncharge`]。
+//! - `MEMORY_CHARGE_LOCK` 族（含 `MemoryCss::inner`）与 `PENDING_MAX_OOM`
+//!   全仓一律 `lock_irqsave()`：free 钩子在硬中断里单独获取该锁族，若
+//!   允许任何 IRQ-on 持有者存在，持锁 task 被同 CPU 硬中断打断、IRQ
+//!   重进同一把非重入 CAS 自旋锁即永久锁死（本卡修复的原始缺陷）。
+//! - memcg 锁族从不持锁回调页分配器，也从不持锁进入调度器锁
+//!   （pi_lock/rq_lock/task_lock/freezer task_lock）；freezer 与 OOM
+//!   的进程侧锁链不含任何 memcg 锁，两侧无交叉边。全部交叉点的
+//!   逐一论证见 LOCK_ORDER.md。
 
-use alloc::{
-    sync::Arc,
-    vec::Vec,
-};
+use alloc::{sync::Arc, vec::Vec};
 use system_error::SystemError;
 
 use crate::{
@@ -39,10 +65,10 @@ use crate::{
     },
     libs::spinlock::SpinLock,
     mm::{
-        MemoryManagementArch, PhysAddr, allocator::page_frame::PageFrameCount, page::PageReclaimer,
+        allocator::page_frame::PageFrameCount, page::PageReclaimer, MemoryManagementArch, PhysAddr,
     },
     process::{ProcessManager, RawPid},
-    time::{PosixTimeSpec, sleep::nanosleep},
+    time::{sleep::nanosleep, PosixTimeSpec},
 };
 
 /// `memory.high` throttle bounds: pages reclaimed per synchronous round,
@@ -56,11 +82,21 @@ const MEMORY_HIGH_MAX_ROUNDS: u32 = 8;
 /// `page->memcg`).  Frames without an owner were allocated while memcg
 /// accounting was unavailable (early boot, interrupt context, OOM-victim
 /// bypass) and are never uncharged.
+///
+/// 中断纪律（issue #28）：一律 `lock_irqsave()` 获取（获取点共 3 处，
+/// 均在本模块：init、alloc 侧 record、free 侧批摘取循环）；
+/// 临界区内只做槽位 take/填值与 `FREE_RUN_BATCH` 栈批写入，绝不获取
+/// 任何其他锁、绝不分配内存、绝不跨 `uncharge_css` 持有。页帧释放在
+/// 硬中断里可达，任何 IRQ-on 持有该锁的窗口都等于把同 CPU 重入死锁
+/// 留给下一次驱动释放。
 static PAGE_OWNERS: SpinLock<Option<Vec<Option<Arc<dyn CgroupSubsysState>>>>> = SpinLock::new(None);
 
 /// Leaf memory CSS of the most recent charge refused by a `memory.max`
 /// limit.  The refusal is retained until the fault path consumes it;
 /// concurrent refusals are serialized instead of overwriting one another.
+///
+/// 中断纪律（issue #28）：与 memcg charge 锁族同级，一律 `lock_irqsave()`；
+/// 锁内只 clone/take 一个 `Option<Arc<dyn CgroupSubsysState>>`，零嵌套。
 static PENDING_MAX_OOM: SpinLock<Option<Arc<dyn CgroupSubsysState>>> = SpinLock::new(None);
 
 /// Size the per-frame ownership map from the physical memory map.
@@ -93,6 +129,9 @@ pub fn memcg_page_owners_init() {
         return;
     }
     owners.resize(max_pfn, None);
+    // 统一使用 lock_irqsave()（见本模块文档锁序节）：PAGE_OWNERS 所有
+    // 获取点必须使用同一中断纪律，否则持 lock() IRQ-on 的 CPU 被硬中断
+    // 打断、IRQ 再取同一把非重入 CAS 自旋锁即同 CPU 永久锁死。
     *PAGE_OWNERS.lock_irqsave() = Some(owners);
     log::info!("memcg: page ownership map covers {} frames", max_pfn);
 }
@@ -145,6 +184,9 @@ pub fn memcg_alloc_charge(start: PhysAddr, pages: u64) -> Result<(), SystemError
             // Keep the first refusal until the fault path consumes it.
             // Later concurrent refusals are coalesced instead of replacing
             // the CSS that identified the active OOM scope.
+            //
+            // irqsave 纪律与 memcg 锁族一致（见模块头）：本锁只保护
+            // pending 槽，绝不在此临界区获取其他锁。
             let mut pending = PENDING_MAX_OOM.lock_irqsave();
             if pending.is_none() {
                 *pending = Some(css.clone());
@@ -157,46 +199,125 @@ pub fn memcg_alloc_charge(start: PhysAddr, pages: u64) -> Result<(), SystemError
 /// Uncharge `pages` frames starting at `start` from the CSS that owns
 /// them.  Called by `LockedFrameAllocator::free`.
 ///
-/// Consecutive frames with the same owner are released as one hierarchy
-/// transaction.  This performs no allocation and never sleeps.
+/// 两段式（issue #28；完整锁序论证见模块头与
+/// `kernel/src/cgroup/LOCK_ORDER.md`）：
+/// 1. `PAGE_OWNERS`（irqsave）临界区内只做一件事——把连续同归属的页帧
+///    摘取（`slot.take()`）合并成 runs 装入栈上批数组
+///    （[`take_owner_runs`]）；临界区内零堆分配——分配可能经 slab 补帧
+///    回调 `LockedFrameAllocator::allocate`/`free` 重进本锁；
+/// 2. 放锁之后逐段调用 [`uncharge_css`] 完成层级 uncharge 事务。
+///
+/// 为什么必须"先放锁、再 uncharge"：原实现在持 `PAGE_OWNERS` 期间调用
+/// `uncharge_css → MemoryCss::uncharge → MEMORY_CHARGE_LOCK`，新增了
+/// PAGE_OWNERS → MEMORY_CHARGE_LOCK 嵌套边；而 charge 侧是
+/// MEMORY_CHARGE_LOCK（单独获取、放锁）→ record_frame_owners 取
+/// PAGE_OWNERS（单独获取）。同一锁族两个方向、且 free 路径在硬中断里
+/// 可达：叠加 `record_frame_owners` 旧实现的 IRQ-on `lock()`，硬中断落
+/// 在 charge 侧任一持锁段时，被中断 task 持有的 MEMORY_CHARGE_LOCK 被
+/// IRQ 的帧释放路径重进——非重入 CAS 自旋锁同 CPU 永久锁死，并拖死
+/// 同链等待者（本卡修复的原始缺陷）。修复后两锁互不嵌套，全锁族统一
+/// irqsave 纪律，同 CPU 重入与跨 CPU 成环两条路径同时被封死。
+///
+/// 批与批之间允许其他 CPU 对同区间的 charge/free 插队：buddy 单次释放
+/// 的块由同一次 `record_frame_owners` 整段记名，常态一批摘完（1 个
+/// run）；归属交错的病态输入由续扫批兜底——正确性只依赖"每个锁段摘
+/// 走的 runs 必在放锁后才 uncharge"，不依赖批大小。
+///
+/// Never sleeps, never allocates.
 pub fn memcg_free_uncharge(start: PhysAddr, pages: u64) {
-    let mut guard = PAGE_OWNERS.lock_irqsave();
-    let Some(map) = guard.as_mut() else {
-        return;
-    };
-
     let first = start.data() >> MMArch::PAGE_SHIFT;
-    if first >= map.len() {
-        return;
-    }
-    let last = (first + pages as usize).min(map.len());
-
-    let mut run_owner: Option<Arc<dyn CgroupSubsysState>> = None;
-    let mut run_len: u64 = 0;
-    for slot in &mut map[first..last] {
-        let owner = slot.take();
-        let same_run = match (&run_owner, &owner) {
-            (Some(current), Some(new)) => Arc::ptr_eq(current, new),
-            _ => false,
+    let end = first.saturating_add(pages as usize);
+    let mut pos = first;
+    loop {
+        let mut batch: [(Option<Arc<dyn CgroupSubsysState>>, u64); FREE_RUN_BATCH] =
+            core::array::from_fn(|_| (None, 0));
+        let (used, resume) = {
+            let mut guard = PAGE_OWNERS.lock_irqsave();
+            let Some(map) = guard.as_mut() else {
+                return;
+            };
+            take_owner_runs(map, pos, end, Arc::ptr_eq, &mut batch)
         };
-        if same_run {
-            run_len += 1;
-        } else {
-            if let Some(current) = run_owner.take() {
-                uncharge_css(&current, run_len);
-            }
-            match owner {
-                Some(next) => {
-                    run_owner = Some(next);
-                    run_len = 1;
-                }
-                None => run_len = 0,
+        // 锁已释放：以下只获取 MEMORY_CHARGE_LOCK 锁族（irqsave），
+        // 不再触碰 PAGE_OWNERS。
+        for slot in batch.iter_mut().take(used) {
+            if let Some(owner) = slot.0.take() {
+                uncharge_css(&owner, slot.1);
             }
         }
+        match resume {
+            None => return,
+            Some(next) => pos = next,
+        }
     }
-    if let Some(current) = run_owner {
-        uncharge_css(&current, run_len);
+}
+
+/// 一次 `PAGE_OWNERS` 锁段带走的 run 批容量。buddy 单次释放是
+/// `record_frame_owners` 写入的连续段（常态 1 run）；8 槽覆盖一切
+/// 现实形态，满批后续扫兜底。
+const FREE_RUN_BATCH: usize = 8;
+
+/// 纯逻辑摘取段：把 `[pos, min(end, map.len()))` 内连续同归属（`same`
+/// 判定）的页帧归属从槽位 `take()` 出来并合并成 runs，按序写入 `batch`。
+/// 批槽用尽时不再摘取，返回 `Some(首个未摘槽位下标)`（该下标之后区间
+/// 原封未动；调用方 uncharge 本批后从这里续扫，游标严格前进——能返回
+/// `Some` 的前提是批已装满，即至少摘走过一个 run）。区间处理完返回
+/// `None`。返回 `(本批装入的 run 数, 续扫点?)`。
+///
+/// 泛型 owner + `same` 判定使宿主单测无需真实锁/PCB/中断即可直接验证
+/// 摘取、归并、缝隙跳过、钳制与分批续扫语义（见模块尾 tests）。
+/// 不变式（锁序纪律要求，见模块头）：只在调用者已持有的 `PAGE_OWNERS`
+/// 临界区内运行；不获取任何锁、不分配内存、不触碰 memcg 计数。
+fn take_owner_runs<T, S>(
+    map: &mut Vec<Option<T>>,
+    pos: usize,
+    end: usize,
+    same: S,
+    batch: &mut [(Option<T>, u64)],
+) -> (usize, Option<usize>)
+where
+    S: Fn(&T, &T) -> bool,
+{
+    let last = end.min(map.len());
+    let mut count = 0usize;
+    let mut run_owner: Option<T> = None;
+    let mut run_len: u64 = 0;
+    let mut i = pos;
+    while i < last {
+        let continues = match (&run_owner, &map[i]) {
+            (Some(current), Some(next)) => same(current, next),
+            _ => false,
+        };
+        if continues {
+            map[i].take();
+            run_len += 1;
+            i += 1;
+            continue;
+        }
+        // run 边界（换主或无主缝隙）：结算已打开的 run。
+        if let Some(current) = run_owner.take() {
+            batch[count] = (Some(current), run_len);
+            count += 1;
+        }
+        if count >= batch.len() {
+            // 批满且 map[i] 未摘：放锁 uncharge 本批后从 i 续扫。
+            return (count, Some(i));
+        }
+        match map[i].take() {
+            Some(next) => {
+                run_owner = Some(next);
+                run_len = 1;
+            }
+            // 无主缝隙：只消费槽位，不占批槽。
+            None => run_len = 0,
+        }
+        i += 1;
     }
+    if let Some(current) = run_owner.take() {
+        batch[count] = (Some(current), run_len);
+        count += 1;
+    }
+    (count, None)
 }
 
 fn uncharge_css(css: &Arc<dyn CgroupSubsysState>, pages: u64) {
@@ -209,6 +330,10 @@ fn uncharge_css(css: &Arc<dyn CgroupSubsysState>, pages: u64) {
 }
 
 fn record_frame_owners(start: PhysAddr, pages: u64, owner: &Arc<dyn CgroupSubsysState>) {
+    // irqsave 纪律与 free 侧一致（见模块头锁序节）：本临界区在硬中断
+    // 可达的分配路径上（free 一定在 IRQ 下可达，allocate 的调用方如
+    // 驱动 probe/DMA 同样可能在 IRQ-off 上下文），统一纪律消除同 CPU
+    // 重入窗口。
     let mut guard = PAGE_OWNERS.lock_irqsave();
     let Some(map) = guard.as_mut() else {
         return;
@@ -268,6 +393,9 @@ pub(crate) fn drain_pending_memcg_oom(
 ) -> Option<crate::mm::oom::OomOutcome> {
     use crate::mm::oom::{self, OomOutcome};
 
+    // irqsave 纪律（模块头锁序节）：PENDING_MAX_OOM 与 charge 锁族同级。
+    // 守卫在本语句末释放——随后的 find_max_exceeded 在无锁状态下获取
+    // MemoryCss::inner，绝不构成 PENDING → inner 嵌套。
     let leaf = PENDING_MAX_OOM.lock_irqsave().take()?;
 
     // The refusal may already have been relieved (a kill from another
@@ -319,4 +447,186 @@ fn collect_subtree_tasks(node: &Arc<CgroupNode>) -> Vec<RawPid> {
         pids.extend(collect_subtree_tasks(&child));
     }
     pids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 宿主可运行的归属摘取测例（pm31 切片手法：marker 抽取本 mod +
+    /// `take_owner_runs`/`FREE_RUN_BATCH` 到独立文件 `rustc --test`
+    /// 执行）。owner 用 `Arc<u32>` 替身、`same` 用 `Arc::ptr_eq`，与
+    /// 生产语义一致；这些契约就是锁序修复后 free 路径锁外可测的全部
+    /// 行为面（irqsave 纪律与"锁内零嵌套零分配"由获取点静态核查，
+    /// 见 `kernel/src/cgroup/LOCK_ORDER.md` §5）。
+    fn same_ptr(a: &Arc<u32>, b: &Arc<u32>) -> bool {
+        Arc::ptr_eq(a, b)
+    }
+
+    fn map_of(owners: &[Option<Arc<u32>>]) -> Vec<Option<Arc<u32>>> {
+        owners.to_vec()
+    }
+
+    fn batch_new() -> [(Option<Arc<u32>>, u64); FREE_RUN_BATCH] {
+        core::array::from_fn(|_| (None, 0))
+    }
+
+    fn used_runs(batch: &[(Option<Arc<u32>>, u64)]) -> Vec<(*const u32, u64)> {
+        batch
+            .iter()
+            .filter_map(|(owner, len)| owner.as_ref().map(|o| (Arc::as_ptr(o), *len)))
+            .collect()
+    }
+
+    #[test]
+    fn coalesces_same_owner_and_empties_slots() {
+        let a = Arc::new(1u32);
+        let b = Arc::new(2u32);
+        let mut map = map_of(&[Some(a.clone()), Some(a.clone()), Some(b.clone()), None]);
+        let mut batch = batch_new();
+        let (used, resume) = take_owner_runs(&mut map, 0, 4, same_ptr, &mut batch);
+        assert_eq!(resume, None);
+        assert_eq!(used, 2);
+        let runs = used_runs(&batch);
+        assert_eq!(runs, vec![(Arc::as_ptr(&a), 2), (Arc::as_ptr(&b), 1)]);
+        // 摘取语义：区间内归属槽位必须全部清空（二次 free 不重复 uncharge）。
+        assert!(map.iter().all(|slot| slot.is_none()));
+    }
+
+    #[test]
+    fn skips_gaps_and_honors_offset() {
+        let a = Arc::new(1u32);
+        let b = Arc::new(2u32);
+        // [None, None, a, b, None, b]：从 pfn 2 起摘 4 页 →
+        // runs = (a,1),(b,1)，尾部无主缝隙不占批槽、不报错。
+        let mut map = map_of(&[
+            None,
+            None,
+            Some(a.clone()),
+            Some(b.clone()),
+            None,
+            Some(b.clone()),
+        ]);
+        let mut batch = batch_new();
+        let (used, resume) = take_owner_runs(&mut map, 2, 6, same_ptr, &mut batch);
+        assert_eq!(resume, None);
+        assert_eq!(used, 3);
+        let runs = used_runs(&batch);
+        assert_eq!(
+            runs,
+            vec![
+                (Arc::as_ptr(&a), 1),
+                (Arc::as_ptr(&b), 1),
+                (Arc::as_ptr(&b), 1)
+            ]
+        );
+        // 区间外的缝隙槽位不受影响。
+        assert!(map[0].is_none() && map[1].is_none());
+    }
+
+    #[test]
+    fn clamps_past_map_end_and_rejects_out_of_range_start() {
+        let a = Arc::new(1u32);
+        let mut map = map_of(&[Some(a.clone()), Some(a.clone())]);
+        let mut batch = batch_new();
+        // 请求 10 页，钳制到 map 长度 2。
+        let (used, resume) = take_owner_runs(&mut map, 0, 10, same_ptr, &mut batch);
+        assert_eq!(resume, None);
+        assert_eq!(used, 1);
+        assert_eq!(used_runs(&batch), vec![(Arc::as_ptr(&a), 2)]);
+        // 起点越界：零摘取、无续扫（外层 free 循环据此返回）。
+        let mut batch = batch_new();
+        let (used, resume) = take_owner_runs(&mut map, 5, 3, same_ptr, &mut batch);
+        assert_eq!(used, 0);
+        assert_eq!(resume, None);
+    }
+
+    #[test]
+    fn full_batch_resumes_with_remaining_slots_untouched() {
+        // FREE_RUN_BATCH + 2 个单页 run：首批装满 → Some(resume)，
+        // resume 之后区间原封未动（外层循环靠它续扫）。
+        let owners: Vec<Arc<u32>> = (0..(FREE_RUN_BATCH + 2) as u32).map(Arc::new).collect();
+        let mut map: Vec<Option<Arc<u32>>> = owners.iter().cloned().map(Some).collect();
+
+        let total = map.len();
+        let mut batch = batch_new();
+        let (used, resume) = take_owner_runs(&mut map, 0, total, same_ptr, &mut batch);
+        assert_eq!(used, FREE_RUN_BATCH);
+        let resume = resume.expect("批满必须返回续扫点");
+        assert_eq!(resume, FREE_RUN_BATCH);
+        let runs = used_runs(&batch);
+        for (i, slot) in runs.iter().enumerate() {
+            assert_eq!(*slot, (Arc::as_ptr(&owners[i]), 1));
+        }
+        assert!(map[..resume].iter().all(|s| s.is_none()));
+        for (i, slot) in map[resume..].iter().enumerate() {
+            assert!(Arc::ptr_eq(slot.as_ref().unwrap(), &owners[resume + i]));
+        }
+
+        // 外层循环语义：放锁 uncharge 本批后从 resume 续扫剩余 run。
+        let mut batch = batch_new();
+        let (used, resume) = take_owner_runs(&mut map, resume, total, same_ptr, &mut batch);
+        assert_eq!(resume, None);
+        assert_eq!(used, 2);
+        let runs = used_runs(&batch);
+        assert_eq!(runs[0], (Arc::as_ptr(&owners[FREE_RUN_BATCH]), 1));
+        assert!(map.iter().all(|s| s.is_none()));
+    }
+
+    #[test]
+    fn interleaved_runs_fill_batch_exactly_without_spurious_resume() {
+        // a,b,a,b,… 8 页 8 run：恰好装满且区间扫完 → (8, None)。
+        // 批满判定先行返回 Some(len) 的"伪续扫"必须不影响正确性
+        // （外层会再以 (0, None) 收敛），但这里验证边界不 panic。
+        let a = Arc::new(1u32);
+        let b = Arc::new(2u32);
+        let mut map = map_of(&[
+            Some(a.clone()),
+            Some(b.clone()),
+            Some(a.clone()),
+            Some(b.clone()),
+            Some(a.clone()),
+            Some(b.clone()),
+            Some(a.clone()),
+            Some(b.clone()),
+        ]);
+        let mut batch = batch_new();
+        let (used, resume) = take_owner_runs(&mut map, 0, 8, same_ptr, &mut batch);
+        assert_eq!(used, 8);
+        assert!(map.iter().all(|s| s.is_none()));
+        // resume 若存在，必须恰为区间终点（无未摘残留）。
+        assert!(resume == None || resume == Some(8));
+    }
+
+    /// 锁序回归静态论证的可执行部分：`run` 数超过批容量时（8 run 后
+    /// 仍有归属），必须返回续扫点而非静默丢弃——否则将泄漏 uncharge
+    /// （计数不归零）。`full_batch_resumes…` 覆盖正向；此处覆盖
+    /// "续扫收敛"：模拟外层循环直到 (0, None)。
+    #[test]
+    fn batched_take_converges_like_free_loop() {
+        let owners: Vec<Arc<u32>> = (0..(2 * FREE_RUN_BATCH + 3) as u32).map(Arc::new).collect();
+        let mut map: Vec<Option<Arc<u32>>> = owners.iter().cloned().map(Some).collect();
+        let total = map.len();
+        let mut pos = 0usize;
+        let mut uncharged_pages = 0u64;
+        let mut batches = 0usize;
+        loop {
+            let mut batch = batch_new();
+            let (used, resume) = take_owner_runs(&mut map, pos, total, same_ptr, &mut batch);
+            for slot in batch.iter().take(used) {
+                uncharged_pages += slot.1;
+            }
+            batches += 1;
+            match resume {
+                None => break,
+                Some(next) => {
+                    assert!(next > pos, "游标必须严格前进");
+                    pos = next;
+                }
+            }
+        }
+        assert_eq!(uncharged_pages, total as u64);
+        assert_eq!(batches, 3);
+        assert!(map.iter().all(|s| s.is_none()));
+    }
 }
