@@ -144,6 +144,12 @@ pub struct ProcessControlBlock {
     pub(super) nsproxy: RcuOptionArcSlot<NsProxy>,
     /// The cgroup (v2) this task belongs to.
     pub(super) task_cgroup: RwLock<TaskCgroupRef>,
+    /// Linux `current->blkcg_css` 的对应物：任务级块 I/O 归属覆写。内核侧
+    /// 派发者（pagecache 回写/预读工作线程、回收线程）在处理"别人"的脏页时
+    /// 安装它，使 io.max 限速与 io.stat 记账跟随 I/O 的真实属主，而不是恰好
+    /// 跑这段代码的工作线程。`None` 表示"用 `task_cgroup`"。
+    /// 经 RCU 发布：完成路径可能在别的上下文替换它时读取。
+    pub(super) blkcg_owner: RcuOptionArcSlot<CgroupNode>,
 
     pub(super) sem_undo: SpinLock<Option<SemUndoAttachment>>,
 
