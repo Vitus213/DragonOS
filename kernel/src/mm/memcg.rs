@@ -93,7 +93,7 @@ pub fn memcg_page_owners_init() {
         return;
     }
     owners.resize(max_pfn, None);
-    *PAGE_OWNERS.lock() = Some(owners);
+    *PAGE_OWNERS.lock_irqsave() = Some(owners);
     log::info!("memcg: page ownership map covers {} frames", max_pfn);
 }
 
@@ -145,7 +145,7 @@ pub fn memcg_alloc_charge(start: PhysAddr, pages: u64) -> Result<(), SystemError
             // Keep the first refusal until the fault path consumes it.
             // Later concurrent refusals are coalesced instead of replacing
             // the CSS that identified the active OOM scope.
-            let mut pending = PENDING_MAX_OOM.lock();
+            let mut pending = PENDING_MAX_OOM.lock_irqsave();
             if pending.is_none() {
                 *pending = Some(css.clone());
             }
@@ -209,7 +209,7 @@ fn uncharge_css(css: &Arc<dyn CgroupSubsysState>, pages: u64) {
 }
 
 fn record_frame_owners(start: PhysAddr, pages: u64, owner: &Arc<dyn CgroupSubsysState>) {
-    let mut guard = PAGE_OWNERS.lock();
+    let mut guard = PAGE_OWNERS.lock_irqsave();
     let Some(map) = guard.as_mut() else {
         return;
     };
@@ -268,7 +268,7 @@ pub(crate) fn drain_pending_memcg_oom(
 ) -> Option<crate::mm::oom::OomOutcome> {
     use crate::mm::oom::{self, OomOutcome};
 
-    let leaf = PENDING_MAX_OOM.lock().take()?;
+    let leaf = PENDING_MAX_OOM.lock_irqsave().take()?;
 
     // The refusal may already have been relieved (a kill from another
     // charger, task exits, or a raised limit).
