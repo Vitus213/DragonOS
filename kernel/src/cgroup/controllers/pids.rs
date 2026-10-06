@@ -398,4 +398,121 @@ mod tests {
         state.uncharge();
         assert_eq!(state.local_current(), 0);
     }
+
+    /// 给节点装 Pids css 并返回状态句柄。宿主测试环境的
+    /// `SUBSYS_REGISTRY` 为空，`create_child` 不自动挂 css，正好允许手动
+    /// 构造「有/无 Pids 控制器」的层级拓扑；每个用例用唯一节点名在
+    /// 全局 `cgroup_root()` 下挂私有子链，互不串扰。
+    fn install_pids(node: &Arc<CgroupNode>) -> Arc<PidsCgroupState> {
+        let state = Arc::new(PidsCgroupState::new(Arc::downgrade(node)));
+        node.set_css(CgroupSubsysId::Pids, state.clone());
+        state
+    }
+
+    /// 搭 `mnt ─ {src, dst}` 子链，三节点全装 Pids；orphan 参数指定
+    /// 一个不装 Pids 的旁支节点名（缺 css 异常拓扑用例用）。
+    struct TxnFixture {
+        mnt: Arc<CgroupNode>,
+        src: Arc<CgroupNode>,
+        dst: Arc<CgroupNode>,
+        src_state: Arc<PidsCgroupState>,
+        dst_state: Arc<PidsCgroupState>,
+        mnt_state: Arc<PidsCgroupState>,
+    }
+
+    fn txn_fixture(tag: &str) -> TxnFixture {
+        let root_mgr = crate::cgroup::core::cgroup_root().clone();
+        let mnt = root_mgr
+            .create_child(&root_mgr.root(), &format!("i38-{tag}-mnt"))
+            .unwrap();
+        let src = root_mgr
+            .create_child(&mnt, &format!("i38-{tag}-src"))
+            .unwrap();
+        let dst = root_mgr
+            .create_child(&mnt, &format!("i38-{tag}-dst"))
+            .unwrap();
+        TxnFixture {
+            mnt_state: install_pids(&mnt),
+            src_state: install_pids(&src),
+            dst_state: install_pids(&dst),
+            mnt,
+            src,
+            dst,
+        }
+    }
+
+    /// 迁移预演/回退的层级计数事务核心（issue #38 SOP-1/SOP-3）：
+    /// `precharge_migration` 把 2 个任务的计数从 src 搬入 dst 子链
+    /// （共同祖先 mnt 总量守恒），`revert_migration` 与之严格互逆——
+    /// 回退后各级 local/subtree 逐字段回到迁移前。
+    #[test]
+    fn precharge_and_revert_transfer_counts_across_levels_atomically() {
+        let f = txn_fixture("tx");
+        let snap = |s: &PidsCgroupState| (s.local_current(), s.subtree_current());
+
+        f.src_state.charge_unchecked();
+        f.src_state.charge_unchecked();
+        let before = (snap(&f.src_state), snap(&f.dst_state), snap(&f.mnt_state));
+        assert_eq!(before.0, (2, 2));
+        assert_eq!(before.2, (0, 2)); // mnt 只见 src 的 2 个层级任务
+
+        f.dst_state
+            .precharge_migration(&[f.src.clone(), f.src.clone()])
+            .unwrap();
+        assert_eq!(snap(&f.src_state), (0, 0));
+        assert_eq!(snap(&f.dst_state), (2, 2));
+        assert_eq!(snap(&f.mnt_state), before.2); // 迁移只改分布，不改层级总数
+
+        // cancel_attach 的底层核心：与预演严格互逆。
+        f.dst_state.revert_migration(&[f.src.clone(), f.src.clone()]);
+        assert_eq!(
+            (snap(&f.src_state), snap(&f.dst_state), snap(&f.mnt_state)),
+            before,
+            "回退后各级 pids 计数必须逐字段回到迁移前"
+        );
+    }
+
+    /// 预演内部的前缀自撤（Linux `pids_try_charge` 失败 revert 循环同构）：
+    /// 第 2 个任务的源组缺 Pids css（异常拓扑）时，第 1 个任务已施加的
+    /// 搬运必须就地撤销并返回 ENOENT——失败方无需再为本控制器 cancel。
+    #[test]
+    fn precharge_reverts_prefix_when_a_src_lacks_pids_css() {
+        let f = txn_fixture("pf");
+        let root_mgr = crate::cgroup::core::cgroup_root().clone();
+        let orphan = root_mgr
+            .create_child(&f.mnt, "i38-pf-orphan")
+            .unwrap(); // 不装 Pids css
+
+        f.src_state.charge_unchecked();
+        let err = f
+            .dst_state
+            .precharge_migration(&[f.src.clone(), orphan])
+            .expect_err("缺 Pids css 的源组必须使预演失败");
+        assert_eq!(err, SystemError::ENOENT);
+        // 前缀（任务 #0）搬运已自撤：dst 无残留，src 计数复原。
+        assert_eq!(f.dst_state.local_current(), 0);
+        assert_eq!(f.dst_state.subtree_current(), 0);
+        assert_eq!(f.src_state.local_current(), 1);
+        assert_eq!(f.src_state.subtree_current(), 1);
+        assert_eq!(f.mnt_state.subtree_current(), 1);
+    }
+
+    /// 语义取舍锁定（issue #38）：迁移是组织操作，`precharge_migration`
+    /// 无条件搬运、不受 `pids.max` 阻塞（Linux `pids_can_attach` 无 max
+    /// 检查，只有 fork/clone 受限）；与被删除的死代码 max 门形态相反。
+    #[test]
+    fn migration_precharge_ignores_pids_max_and_revert_restores() {
+        let f = txn_fixture("mx");
+        f.dst_state.set_max(Some(1)); // dst 上限 1，迁入 2 也必须放行
+
+        f.src_state.charge_unchecked();
+        f.src_state.charge_unchecked();
+        f.dst_state
+            .precharge_migration(&[f.src.clone(), f.src.clone()])
+            .expect("迁入不受 pids.max 阻塞");
+        assert_eq!(f.dst_state.local_current(), 2);
+        f.dst_state.revert_migration(&[f.src.clone(), f.src.clone()]);
+        assert_eq!(f.dst_state.local_current(), 0);
+        assert_eq!(f.src_state.local_current(), 2);
+    }
 }
