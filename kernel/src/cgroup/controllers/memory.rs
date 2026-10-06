@@ -25,7 +25,7 @@ use crate::{
         subsys::{CfType, CfTypeFlags, CgroupSubsys, CgroupSubsysId, CgroupSubsysState, CssFlags},
     },
     libs::spinlock::SpinLock,
-    mm::{MemoryManagementArch, page::PageReclaimer},
+    mm::{page::PageReclaimer, MemoryManagementArch},
 };
 const PAGE_SIZE: usize = MMArch::PAGE_SIZE;
 
@@ -130,14 +130,14 @@ impl MemoryCss {
 
     pub(crate) fn high_limit_exceeded(&self) -> bool {
         let mut exceeded = {
-            let inner = self.inner.lock();
+            let inner = self.inner.lock_irqsave();
             inner.high.is_some_and(|high| inner.usage > high)
         };
         self.for_each_ancestor(|memcg| {
             if exceeded {
                 return;
             }
-            let inner = memcg.inner.lock();
+            let inner = memcg.inner.lock_irqsave();
             exceeded = inner.high.is_some_and(|high| inner.usage > high);
         });
         exceeded
@@ -148,7 +148,7 @@ impl MemoryCss {
                 memcg.uncharge_chain(pages);
             }
         }
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock_irqsave();
         inner.usage = inner.usage.saturating_sub(pages);
     }
 
@@ -158,21 +158,24 @@ impl MemoryCss {
         self.high_trip.swap(false, Ordering::Relaxed)
     }
 
-
     /// Whether this CSS's usage is still at or above its own `memory.max`.
     pub(crate) fn max_exceeded_now(&self) -> bool {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         inner.max.is_some_and(|max| inner.usage >= max)
     }
     /// Count a `memory.events` `oom` event (scoped OOM machinery entered).
     pub(crate) fn note_memcg_oom(&self) {
-        self.inner.lock().events.oom.fetch_add(1, Ordering::Relaxed);
+        self.inner
+            .lock_irqsave()
+            .events
+            .oom
+            .fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a `memory.events` `oom_kill` event (victim selected and killed).
     pub(crate) fn note_memcg_oom_kill(&self) {
         self.inner
-            .lock()
+            .lock_irqsave()
             .events
             .oom_kill
             .fetch_add(1, Ordering::Relaxed);
@@ -197,13 +200,13 @@ impl MemoryCss {
         let mut max_exceeded = false;
 
         {
-            let _charge_guard = MEMORY_CHARGE_LOCK.lock();
+            let _charge_guard = MEMORY_CHARGE_LOCK.lock_irqsave();
 
             // Check every limit before changing any usage. The global
             // transaction lock prevents another charger from consuming the
             // capacity between these checks and the updates below.
             {
-                let inner = self.inner.lock();
+                let inner = self.inner.lock_irqsave();
                 if inner
                     .max
                     .is_some_and(|max| inner.usage.saturating_add(pages) > max)
@@ -217,7 +220,7 @@ impl MemoryCss {
                     if max_exceeded {
                         return;
                     }
-                    let inner = memcg.inner.lock();
+                    let inner = memcg.inner.lock_irqsave();
                     if inner
                         .max
                         .is_some_and(|max| inner.usage.saturating_add(pages) > max)
@@ -229,7 +232,7 @@ impl MemoryCss {
             }
             if !max_exceeded {
                 {
-                    let mut inner = self.inner.lock();
+                    let mut inner = self.inner.lock_irqsave();
                     inner.usage = inner.usage.saturating_add(pages);
                     if inner.usage > inner.peak {
                         inner.peak = inner.usage;
@@ -243,7 +246,7 @@ impl MemoryCss {
                     }
                 }
                 self.for_each_ancestor(|memcg| {
-                    let mut inner = memcg.inner.lock();
+                    let mut inner = memcg.inner.lock_irqsave();
                     inner.usage = inner.usage.saturating_add(pages);
                     if inner.usage > inner.peak {
                         inner.peak = inner.usage;
@@ -274,7 +277,7 @@ impl MemoryCss {
 
     /// 释放指定页数的计费
     pub fn uncharge(&self, pages: u64) {
-        let _charge_guard = MEMORY_CHARGE_LOCK.lock();
+        let _charge_guard = MEMORY_CHARGE_LOCK.lock_irqsave();
 
         // Recursing to the root before decrementing the leaf gives the
         // exact inverse order of the charge transaction.
@@ -283,97 +286,109 @@ impl MemoryCss {
 
     /// 读取当前用量（字节）
     pub fn current(&self) -> u64 {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         inner.usage * PAGE_SIZE as u64
     }
 
     /// 读取峰值用量（字节）
     pub fn peak(&self) -> u64 {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         inner.peak * PAGE_SIZE as u64
     }
 
     /// 设置 memory.min（字节）
     pub fn set_min(&self, bytes: Option<u64>) -> Result<(), SystemError> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock_irqsave();
         inner.min = bytes.map(|b| b / PAGE_SIZE as u64);
         Ok(())
     }
 
     /// 设置 memory.low（字节）
     pub fn set_low(&self, bytes: Option<u64>) -> Result<(), SystemError> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock_irqsave();
         inner.low = bytes.map(|b| b / PAGE_SIZE as u64);
         Ok(())
     }
 
     /// 设置 memory.high（字节）
     pub fn set_high(&self, bytes: Option<u64>) -> Result<(), SystemError> {
-        let _charge_guard = MEMORY_CHARGE_LOCK.lock();
-        let mut inner = self.inner.lock();
+        let _charge_guard = MEMORY_CHARGE_LOCK.lock_irqsave();
+        let mut inner = self.inner.lock_irqsave();
         inner.high = bytes.map(|b| b / PAGE_SIZE as u64);
         Ok(())
     }
 
     /// 设置 memory.max（字节）
     pub fn set_max(&self, bytes: Option<u64>) -> Result<(), SystemError> {
-        let _charge_guard = MEMORY_CHARGE_LOCK.lock();
-        let mut inner = self.inner.lock();
+        let _charge_guard = MEMORY_CHARGE_LOCK.lock_irqsave();
+        let mut inner = self.inner.lock_irqsave();
         inner.max = bytes.map(|b| b / PAGE_SIZE as u64);
         Ok(())
     }
     pub fn set_swap_high(&self, bytes: Option<u64>) -> Result<(), SystemError> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock_irqsave();
         inner.swap_high = bytes.map(|b| b / PAGE_SIZE as u64);
         Ok(())
     }
 
     pub fn set_swap_max(&self, bytes: Option<u64>) -> Result<(), SystemError> {
-        let mut inner = self.inner.lock();
+        let mut inner = self.inner.lock_irqsave();
         inner.swap_max = bytes.map(|b| b / PAGE_SIZE as u64);
         Ok(())
     }
     pub fn min(&self) -> Option<u64> {
-        self.inner.lock().min.map(|pages| pages * PAGE_SIZE as u64)
+        self.inner
+            .lock_irqsave()
+            .min
+            .map(|pages| pages * PAGE_SIZE as u64)
     }
 
     pub fn low(&self) -> Option<u64> {
-        self.inner.lock().low.map(|pages| pages * PAGE_SIZE as u64)
+        self.inner
+            .lock_irqsave()
+            .low
+            .map(|pages| pages * PAGE_SIZE as u64)
     }
 
     pub fn high(&self) -> Option<u64> {
-        self.inner.lock().high.map(|pages| pages * PAGE_SIZE as u64)
+        self.inner
+            .lock_irqsave()
+            .high
+            .map(|pages| pages * PAGE_SIZE as u64)
     }
 
     pub fn max(&self) -> Option<u64> {
-        self.inner.lock().max.map(|pages| pages * PAGE_SIZE as u64)
+        self.inner
+            .lock_irqsave()
+            .max
+            .map(|pages| pages * PAGE_SIZE as u64)
     }
 
     pub fn swap_current(&self) -> u64 {
-        self.inner.lock().swap_usage * PAGE_SIZE as u64
+        self.inner.lock_irqsave().swap_usage * PAGE_SIZE as u64
     }
 
     pub fn swap_peak(&self) -> u64 {
-        self.inner.lock().swap_peak * PAGE_SIZE as u64
+        self.inner.lock_irqsave().swap_peak * PAGE_SIZE as u64
     }
 
     pub fn swap_high(&self) -> Option<u64> {
         self.inner
-            .lock()
+            .lock_irqsave()
             .swap_high
             .map(|pages| pages * PAGE_SIZE as u64)
     }
 
     pub fn swap_max(&self) -> Option<u64> {
         self.inner
-            .lock()
+            .lock_irqsave()
             .swap_max
             .map(|pages| pages * PAGE_SIZE as u64)
     }
 
     /// 读取 memory.events
     pub fn events(&self) -> String {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         format!(
             "low {}\nhigh {}\nmax {}\noom {}\noom_kill {}\noom_group_kill {}\n",
             inner.events.low.load(Ordering::Relaxed),
@@ -387,7 +402,7 @@ impl MemoryCss {
 
     /// 读取 memory.stat（简化版）
     pub fn stat(&self) -> String {
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         format!(
             "anon {}\nfile 0\nkernel 0\npagetables 0\nslab 0\nsock 0\n\
              file_mapped 0\nfile_dirty 0\nfile_writeback 0\n\
@@ -414,11 +429,11 @@ impl CgroupSubsysState for MemoryCss {
     }
 
     fn flags(&self) -> CssFlags {
-        *self.flags.lock()
+        *self.flags.lock_irqsave()
     }
 
     fn set_flags(&self, flags: CssFlags) {
-        *self.flags.lock() = flags;
+        *self.flags.lock_irqsave() = flags;
     }
 
     fn css_online(&self) -> Result<(), SystemError> {
@@ -427,7 +442,7 @@ impl CgroupSubsysState for MemoryCss {
 
     fn css_offline(&self) -> Result<(), SystemError> {
         // 确保所有内存已释放
-        let inner = self.inner.lock();
+        let inner = self.inner.lock_irqsave();
         if inner.usage > 0 {
             log::warn!(
                 "memcg offline with {} bytes still charged",
@@ -542,7 +557,7 @@ fn memory_min_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemErr
         .as_any()
         .downcast_ref::<MemoryCss>()
         .ok_or(SystemError::EINVAL)?;
-    let inner = mem.inner.lock();
+    let inner = mem.inner.lock_irqsave();
     Ok(format!(
         "{}\n",
         inner.min.map(|p| p * PAGE_SIZE as u64).unwrap_or(0)
@@ -568,7 +583,7 @@ fn memory_low_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemErr
         .as_any()
         .downcast_ref::<MemoryCss>()
         .ok_or(SystemError::EINVAL)?;
-    let inner = mem.inner.lock();
+    let inner = mem.inner.lock_irqsave();
     Ok(format!(
         "{}\n",
         inner.low.map(|p| p * PAGE_SIZE as u64).unwrap_or(0)
@@ -594,7 +609,7 @@ fn memory_high_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemEr
         .as_any()
         .downcast_ref::<MemoryCss>()
         .ok_or(SystemError::EINVAL)?;
-    let inner = mem.inner.lock();
+    let inner = mem.inner.lock_irqsave();
     Ok(match inner.high {
         Some(pages) => format!("{}\n", pages * PAGE_SIZE as u64),
         None => "max\n".to_string(),
@@ -620,7 +635,7 @@ fn memory_max_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemErr
         .as_any()
         .downcast_ref::<MemoryCss>()
         .ok_or(SystemError::EINVAL)?;
-    let inner = mem.inner.lock();
+    let inner = mem.inner.lock_irqsave();
     Ok(match inner.max {
         Some(pages) => format!("{}\n", pages * PAGE_SIZE as u64),
         None => "max\n".to_string(),
