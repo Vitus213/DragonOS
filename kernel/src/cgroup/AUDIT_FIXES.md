@@ -14,6 +14,40 @@
 
 Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 10 分钟无串口输出，因此本轮不重复启动。剩余边界见 `CONTROLLER_FRAMEWORK.md`。
 
+## issue #34 · 计费入口 panic：JITMem expect 于可拒绝的记账分配
+
+分支 `pm/issue-34`（PR #44），基线 vitus/master@23557e57。
+
+### 已修复
+
+- `JITMem::new()`（`allocate_page_frames(...).expect("JITMem alloc failed")` + `phys_2_virt().unwrap()`）删除；kprobe/tracepoint 的 `PERF_EVENT_IOC_SET_BPF` 迁移到按程序长度定容且可失败的 `try_for_bpf_program(...)?`——memcg `memory.max` 拒绝现以 ENOMEM 返回用户态，不再内核 panic；`JITMem::Drop` 的 `virt_2_phys().expect` 一并去 panic 化。
+- JIT 编译失败路径按 uprobe.rs 既有模式 `Box::from_raw` 归还所有权，触发 `memcg_free_uncharge`，消除非缺页拒绝的滞留计费（与 #4 关联项）。
+- `IdentPageMapper::create`/`map_phys`/`ident_pt_alloc` → `kexec.rs::init_pgtable` 链（`kexec_load` 系统调用可达）的 `unwrap()` 分配点改 `Result`/ENOMEM，翻译失败归还已计费页帧。
+- `BioRequest::new_read/new_write/new_flush` 与 `DmaBuffer::alloc_bytes/alloc_pages` 的 `.expect()` panic 包装删除（调用点唯一，迁移 `try_new_flush()?`）。
+- 全仓记账 allocator 后端 `.expect()/.unwrap()` 分配点整改表（9 处修、10 组逐项排除论证）见 issue #34 评论。
+- `make kernel ARCH=x86_64` 与 `ARCH=riscv64` 通过；记账拒绝返回 ENOMEM 而非 panic 以 shipped 源码切片的 host 单测验证（新旧行为对照，见 issue #34 评论）。
+
+### 未做
+
+- `dma_alloc_pages_raw`/`E1000EBuffer::new` 的 `.expect`：被外部 crate virtio-drivers `Hal::dma_alloc`（无 Result 签名）与 smoltcp token 接口锁死，DragonOS 侧无法本质传播；属"panic 与全局 OOM handler 同档"的遗留面，整改表已定界，待 fork 上游或 bounce-pool 预取方案另卡处理。
+
+## issue #28 — memcg 锁序与中断纪律倒置修复
+
+- `memcg_free_uncharge` 两段式：持 `PAGE_OWNERS`（irqsave）仅把连续同归属
+  页帧摘取进 `FREE_RUN_BATCH=8` 栈批（锁内零分配、零嵌套），放锁后逐段
+  `uncharge_css`。消除原实现的 PAGE_OWNERS→MEMORY_CHARGE_LOCK 嵌套边
+  （与 charge 侧顺序使用两锁的方向相反）。
+- memcg 锁族全部获取点统一 `lock_irqsave()`：`PAGE_OWNERS` 3 处（init /
+  `record_frame_owners` / free 摘取循环）、`MEMORY_CHARGE_LOCK` 4 处、
+  `MemoryCss::inner`/`flags` 39 处、`PENDING_MAX_OOM` 2 处——硬中断的帧
+  释放路径可达整条 charge 锁链，IRQ-on 持有者等于把同 CPU 重入非重入
+  CAS 自旋的死锁窗口留给下一次驱动释放。
+- 与进程侧锁（rq_lock/freezer task_lock/pi_lock/task_lock）无嵌套边：
+  `try_charge` 的 `wakeup_claim_thread` 调用点在事务块之外、freezer/OOM
+  链不含 memcg 锁（全序图与逐交叉点论证：`kernel/src/cgroup/LOCK_ORDER.md`）。
+- 验证：`make kernel ARCH=x86_64` 通过；`take_owner_runs` 纯函数宿主
+  单测 6 例全绿（摘取归并/缝隙/钳制/满批续扫收敛/边界不越批）。
+
 ---
 
 ## issue #35：io.max 对异步回写逃逸的修复落地说明

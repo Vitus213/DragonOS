@@ -50,6 +50,7 @@ impl Scheduler for IdleScheduler {
         _rq: &mut super::CpuRunQueue,
         _pcb: alloc::sync::Arc<crate::process::ProcessControlBlock>,
         _queued: bool,
+        _user_tick: bool,
     ) {
         // Nothing to do
     }

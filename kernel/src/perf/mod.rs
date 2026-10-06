@@ -103,16 +103,7 @@ pub struct JITMem {
 }
 
 impl JITMem {
-    pub fn new() -> Self {
-        let (paddr, page_count) =
-            unsafe { allocate_page_frames(PageFrameCount::new(1)) }.expect("JITMem alloc failed");
-        Self {
-            virt_addr: unsafe { MMArch::phys_2_virt(paddr) }.unwrap(),
-            page_count,
-        }
-    }
-
-    /// Allocate enough executable memory for rbpf's current x86_64 emitter.
+    /// 为一段 eBPF 程序分配足够放下其 JIT 产物的可执行内存。
     ///
     /// Each eBPF instruction expands to less than 128 bytes in that emitter;
     /// the one-page minimum also covers its fixed prologue and epilogue. Keep
@@ -170,8 +161,14 @@ impl DerefMut for JITMem {
 
 impl Drop for JITMem {
     fn drop(&mut self) {
+        // 该虚拟地址由本结构分配时的 direct-map 翻译得到；若反向翻译失败
+        // （仅可能发生在映射被外部破坏的畸形状态下），静默泄漏页帧而不是
+        // 在析构路径 panic——Drop 无法向 kprobe/tracepoint 的 ioctl 返回错误。
+        let Some(paddr) = (unsafe { MMArch::virt_2_phys(self.virt_addr) }) else {
+            log::error!("JITMem drop: virt_2_phys failed, leaking page frames");
+            return;
+        };
         unsafe {
-            let paddr = MMArch::virt_2_phys(self.virt_addr).expect("JITMem drop failed");
             deallocate_page_frames(PhysPageFrame::new(paddr), self.page_count);
         }
     }

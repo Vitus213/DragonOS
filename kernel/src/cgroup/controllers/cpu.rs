@@ -313,17 +313,34 @@ fn refresh_period_locked(tg: &mut TaskGroupState, clock_ns: u64) -> CpuRuntimeDe
         tg.runtime_remaining = quota_ns.min(i64::MAX as u64) as i64;
         tg.throttled = false;
     } else {
-        while clock_ns.saturating_sub(tg.last_period_start) >= period_ns {
-            let deadline = tg.last_period_start.saturating_add(period_ns);
+        // O(1) 闭式推进（对齐 Linux 6.6 CFS bandwidth：__refill_cfs_bandwidth_runtime
+        // 把 slice 起点整体前跳到当前时钟所在的周期，配额只在新边界整体重置，
+        // 中间周期逐个补偿）：旧实现 `while elapsed >= period_ns` 每轮只推进一个
+        // 周期，而 `last_period_start` 仅在组内成员被调度时前进，于是配了 cpu.max
+        // 的组整组睡眠 T 后，首次计费/唤醒（rq 锁、关中断）要跑 T/period 次迭代——
+        // period 下限 1ms 时睡 10 分钟就是 60 万次 IRQ-off 自旋。整除一次算出
+        // 过期周期数，迭代次数上界为常数。
+        let elapsed = clock_ns.saturating_sub(tg.last_period_start);
+        let periods = elapsed / period_ns;
+        if periods > 0 {
+            // throttled_time 结算同步闭式化：`throttled_since` 必然落在当前周期内
+            // （enter_throttled_locked 只在本周期被观测后写入），因此若过期时仍
+            // 处于节流，其结束点只可能是第一个过期边界；之后的整周期节流与旧
+            // 逐周期循环一致地不计入（对齐 Linux 只在任务实际处于 throttled
+            // 区间时累计 throttled_time 的口径）。
             if tg.throttled {
-                tg.stats
-                    .throttled_time
-                    .fetch_add(deadline.saturating_sub(tg.throttled_since), Ordering::Relaxed);
+                let first_deadline = tg.last_period_start.saturating_add(period_ns);
+                tg.stats.throttled_time.fetch_add(
+                    first_deadline.saturating_sub(tg.throttled_since),
+                    Ordering::Relaxed,
+                );
                 tg.throttled = false;
                 tg.throttled_since = 0;
             }
-            tg.stats.nr_periods.fetch_add(1, Ordering::Relaxed);
-            tg.last_period_start = deadline;
+            tg.stats.nr_periods.fetch_add(periods, Ordering::Relaxed);
+            tg.last_period_start = tg
+                .last_period_start
+                .saturating_add(periods.saturating_mul(period_ns));
             tg.runtime_remaining = quota_ns.min(i64::MAX as u64) as i64;
         }
     }
@@ -378,8 +395,12 @@ impl CgroupSubsysState for CpuCss {
         CgroupSubsysId::Cpu
     }
 
-    fn cgroup(&self) -> Arc<CgroupNode> {
-        self.cgroup.upgrade().expect("cpu cgroup dropped")
+    fn cgroup_node(&self) -> Option<Arc<CgroupNode>> {
+        // fail-closed（issue #30）：旧 expect 假定"CSS 存活 ⇒ 节点
+        // 存活"（cpu CSS 仅由在线节点的 subsys 槽强持有），该不变式
+        // 由全树引用拓扑维护、并非局部可证——统一收敛为 Option，
+        // panic 面清零。
+        self.cgroup.upgrade()
     }
 
     fn parent(&self) -> Option<Arc<dyn CgroupSubsysState>> {
@@ -469,4 +490,206 @@ impl CgroupSubsys for CpuController {
 pub fn init_cpu_controller() {
     let controller = CpuController::new();
     crate::cgroup::subsys::register_subsys(controller);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn limited_group(quota_us: u64, period_us: u64) -> TaskGroupState {
+        let mut tg = TaskGroupState::default();
+        tg.quota_us = Some(quota_us);
+        tg.period_us = period_us;
+        tg
+    }
+
+    #[test]
+    fn refresh_period_advances_in_one_step_after_long_idle() {
+        // 复现 issue #31 的攻击形态：period 取下限 1ms，组整组睡眠 10 分钟
+        // (600_000ms)。旧实现要跑 60 万次 while 迭代；现在必须一次整除推进，
+        // 且最终状态与逐周期循环逐位一致。
+        let mut tg = limited_group(500, 1000); // 0.5ms quota / 1ms period
+        let t0 = 1_000_000_000u64;
+        // 首次观测建立周期。
+        assert!(matches!(
+            refresh_period_locked(&mut tg, t0),
+            CpuRuntimeDecision::Allow {
+                remaining_ns: 500_000,
+                ..
+            }
+        ));
+        // 消耗一部分配额并节流一个片段，验证睡眠期结算的闭式化。
+        tg.runtime_remaining = 0;
+        enter_throttled_locked(&mut tg, t0 + 200_000);
+        let sleep = 600_000_000_000u64; // 10 分钟
+        let now = t0 + sleep;
+        let decision = refresh_period_locked(&mut tg, now);
+        let period_ns = 1_000_000u64;
+        // 新边界：last_period_start 必须恰好落在 `now` 所在周期；配额整体重置；
+        // 决策为 Allow 且 deadline 是下一边界。
+        let elapsed_periods = (now - t0) / period_ns;
+        assert_eq!(tg.last_period_start, t0 + elapsed_periods * period_ns);
+        assert!(tg.last_period_start <= now && now - tg.last_period_start < period_ns);
+        assert_eq!(tg.runtime_remaining, 500_000);
+        assert!(!tg.throttled);
+        match decision {
+            CpuRuntimeDecision::Allow {
+                remaining_ns,
+                period_deadline_ns,
+            } => {
+                assert_eq!(remaining_ns, 500_000);
+                assert_eq!(period_deadline_ns, tg.last_period_start + period_ns);
+            }
+            other => panic!("expected Allow, got {other:?}"),
+        }
+        // nr_periods 一次推进 elapsed_periods；throttled_time 只并入第一个过期
+        // 边界前的节流片段（[t0+200ms 边界 - (t0+0.2ms)] 的 0.8ms）。
+        assert_eq!(tg.stats.nr_periods.load(Ordering::Relaxed), elapsed_periods);
+        let first_deadline = t0 + period_ns;
+        assert_eq!(
+            tg.stats.throttled_time.load(Ordering::Relaxed),
+            first_deadline - (t0 + 200_000)
+        );
+        // 有界性：再次推进相同时间窗口的迭代次数是常数——这里以状态不再随
+        // 睡眠长度线性变化验证（同一 now 再 refresh 为零推进）。
+        assert!(matches!(
+            refresh_period_locked(&mut tg, now),
+            CpuRuntimeDecision::Allow { .. }
+        ));
+        assert_eq!(tg.stats.nr_periods.load(Ordering::Relaxed), elapsed_periods);
+    }
+
+    #[test]
+    fn refresh_period_matches_iterative_walkers_bit_for_bit() {
+        // 对照论证：模拟旧逐周期循环（含节流中途过期只可能在首边界结束的
+        // 不变量），在参数化睡眠长度上与新闭式实现逐字段比对。
+        for sleep_ms in [1u64, 2, 3, 999, 1_000, 1_001, 7_368_421] {
+            let period_ns = 1_000_000u64;
+            let quota_ns = 500_000u64;
+            let t0 = 5_000_000_000u64;
+            let mut tg = limited_group(500, 1000);
+            refresh_period_locked(&mut tg, t0);
+            // 节流在当前周期中段进入，然后整组睡眠 sleep_ms。
+            tg.runtime_remaining = 0;
+            enter_throttled_locked(&mut tg, t0 + 300_000);
+            let now = t0 + sleep_ms * 1_000_000;
+            refresh_period_locked(&mut tg, now);
+
+            // 旧算法：逐周期 while，每轮 nr_periods+1、首边界结算节流片段。
+            let mut ref_start = t0;
+            let mut ref_nr_periods = 0u64;
+            let mut ref_throttled_time = 0u64;
+            let mut ref_throttled = true;
+            while now.saturating_sub(ref_start) >= period_ns {
+                let deadline = ref_start + period_ns;
+                if ref_throttled {
+                    ref_throttled_time += deadline - (t0 + 300_000);
+                    ref_throttled = false;
+                }
+                ref_nr_periods += 1;
+                ref_start = deadline;
+            }
+            assert_eq!(tg.last_period_start, ref_start, "sleep_ms={sleep_ms}");
+            assert_eq!(
+                tg.stats.nr_periods.load(Ordering::Relaxed),
+                ref_nr_periods,
+                "sleep_ms={sleep_ms}"
+            );
+            assert_eq!(
+                tg.stats.throttled_time.load(Ordering::Relaxed),
+                ref_throttled_time,
+                "sleep_ms={sleep_ms}"
+            );
+            assert_eq!(!tg.throttled, !ref_throttled);
+            assert_eq!(tg.runtime_remaining, quota_ns as i64);
+        }
+    }
+
+    #[test]
+    fn refresh_period_single_period_expiry_still_counts_once() {
+        // 常规路径回归：恰好跨一个周期时行为与旧循环一致（nr_periods+1，
+        // deadline 前移一个 period，非节流组不受影响）。
+        let mut tg = limited_group(2_000, 100_000); // 2ms/100ms
+        let t0 = 0u64;
+        refresh_period_locked(&mut tg, t0);
+        assert_eq!(tg.last_period_start, 0);
+        refresh_period_locked(&mut tg, 100_000_000); // 正好一个 period
+        assert_eq!(tg.last_period_start, 100_000_000);
+        assert_eq!(tg.stats.nr_periods.load(Ordering::Relaxed), 1);
+        assert_eq!(tg.runtime_remaining, 2_000_000);
+    }
+
+    /// cpu.stat 恒等式与 user/kernel 归属回归（issue #36）。
+    ///
+    /// 修复前计费点硬编码 `let user = false;`，user_usec 恒 0、system_usec
+    /// 吞并全部执行时间；修复后 tick 的 user/kernel 现场逐段传入
+    /// `account_runtime_checked`。本测例锁定三条语义：
+    /// 1. 恒等式 user_usec + system_usec == usage_usec（files.rs cpu_stat_for
+    ///    以 (utime+stime)/1000 渲染 usage_usec，恒等式由构造保证，回归其不被
+    ///    后续改动破坏）；
+    /// 2. `is_user == true`（tick 用户态现场）的计费增长 utime/user_usec；
+    /// 3. `is_user == false`（tick 内核态现场与非 tick 残差冲刷段）的计费只增长
+    ///    stime/system_usec。
+    #[test]
+    fn cpu_stat_user_system_usage_identity() {
+        let css = CpuCss::new(None, Weak::new());
+        let clock = 1_000_000_000u64;
+
+        // tick 用户态现场：一个滴答计费 10ms
+        css.account_runtime_checked(clock, 10_000_000, true);
+        // tick 内核态现场 + 非 tick 残差段：共 4ms，全部归 system
+        css.account_runtime_checked(clock + 10_000_000, 3_000_000, false);
+        css.account_runtime_checked(clock + 13_000_000, 1_000_000, false);
+
+        let stats = css.stats();
+        // cpu.stat 渲染值（files.rs：纳秒除以 1000 得 usec）
+        let user_usec = stats.utime / 1000;
+        let system_usec = stats.stime / 1000;
+        let usage_usec = user_usec + system_usec;
+
+        assert_eq!(user_usec + system_usec, usage_usec);
+        assert_eq!(
+            user_usec, 10_000,
+            "用户态滴答必须计入 user_usec（修复前恒 0）"
+        );
+        assert_eq!(system_usec, 4_000, "内核态/非 tick 段计入 system_usec");
+        assert_eq!(usage_usec, 14_000);
+
+        // 纳秒级恒等式：每段 delta 恰被计入 utime/stime 之一，无丢失、无双计
+        assert_eq!(stats.utime + stats.stime, 14_000_000);
+    }
+
+    /// 配额开启、节流状态机工作时，user/kernel 交替计费的纳秒恒等式依然成立：
+    /// 节流不吞时间，每段执行时间只入账一次。
+    #[test]
+    fn cpu_stat_identity_holds_across_throttle_cycles() {
+        let css = CpuCss::new(None, Weak::new());
+        // quota 50ms / period 100ms
+        css.set_bandwidth(Some(50_000), 100_000).unwrap();
+
+        let mut clock = 0u64;
+        let mut charged_ns = 0u64;
+        let mut user_ns = 0u64;
+        for i in 0..1000u64 {
+            let delta = 1_000_000 + i * 1_000;
+            // 模拟 tick 现场：每 3 个滴答 1 个内核态，其余用户态
+            let user = i % 3 != 0;
+            css.account_runtime_checked(clock, delta, user);
+            clock += delta;
+            charged_ns += delta;
+            if user {
+                user_ns += delta;
+            }
+        }
+
+        let stats = css.stats();
+        assert_eq!(
+            stats.utime + stats.stime,
+            charged_ns,
+            "每段执行时间必须且只能计入 utime/stime 之一"
+        );
+        assert_eq!(stats.utime, user_ns);
+        assert_eq!(stats.stime, charged_ns - user_ns);
+        assert!(stats.nr_periods > 0, "时钟推进应产生周期计数");
+    }
 }

@@ -140,12 +140,18 @@ impl PidsCgroupState {
     }
 
     /// 释放一个任务的层级计数。
+    ///
+    /// 全部递减走饱和路径：pids 计数与任务配对在正确语义下非零，但一旦
+    /// 任何失配（历史缺陷、重复释放）发生，裸 `fetch_sub` 会把
+    /// `pids.current`/`pids.events` 依赖的计数翻转成 `usize::MAX`，
+    /// try_charge/can_attach 从此恒 EAGAIN——整个 cgroup 永久无法 fork。
+    /// 饱和停在 0 把损害限制为计数偏低（下次正常 charge 即可恢复）。
     pub fn uncharge(&self) {
-        self.local_counter.fetch_sub(1, Ordering::AcqRel);
-        self.subtree_counter.fetch_sub(1, Ordering::AcqRel);
+        crate::cgroup::core::saturating_sub(&self.local_counter);
+        crate::cgroup::core::saturating_sub(&self.subtree_counter);
         for ancestor in self.ancestors() {
             Self::with_state(&ancestor, |state| {
-                state.subtree_counter.fetch_sub(1, Ordering::AcqRel);
+                crate::cgroup::core::saturating_sub(&state.subtree_counter);
             });
         }
     }
@@ -177,8 +183,10 @@ impl CgroupSubsysState for PidsCgroupState {
         CgroupSubsysId::Pids
     }
 
-    fn cgroup(&self) -> Arc<CgroupNode> {
-        self.cgroup.upgrade().expect("pids cgroup dropped")
+    fn cgroup_node(&self) -> Option<Arc<CgroupNode>> {
+        // fail-closed（issue #30）：与 subsys trait 一致，节点已随
+        // rmdir 拆除时返回 None，绝不 panic。
+        self.cgroup.upgrade()
     }
 
     fn parent(&self) -> Option<Arc<dyn CgroupSubsysState>> {
@@ -283,4 +291,46 @@ fn pids_current_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemE
 
 fn pids_events_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemError> {
     Ok(format!("max {}\n", pids_state(css)?.events_max()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 单次计数失配（重复 uncharge）不得把 pids.current 翻转为
+    /// usize::MAX。修复前 `fetch_sub` 从 0 减 1 溢出为极大值，
+    /// try_charge/can_attach 从此恒 EAGAIN——整个 cgroup 永久无法
+    /// fork（issue #29 SOP-3 的组级雪崩）。饱和递减停在 0。
+    #[test]
+    fn over_uncharge_saturates_and_keeps_fork_gate_open() {
+        let state = PidsCgroupState::new(Weak::new());
+        state.set_max(Some(1));
+
+        // charge → uncharge → 再 uncharge（模拟双移/重复释放的失配）。
+        state.charge_unchecked();
+        state.uncharge();
+        state.uncharge();
+
+        assert_eq!(state.local_current(), 0);
+        assert_eq!(state.subtree_current(), 0);
+        // 关键回归：计数未翻转为 usize::MAX，try_charge/cgroup_can_fork_in
+        // 的门槛判定 `local_current().saturating_add(1) > max` 仍然放行
+        // （修复前 local_current 溢出后该判定恒 EAGAIN）。
+        let fork_gate_ok = state.local_current().saturating_add(1) <= state.get_max().unwrap();
+        assert!(fork_gate_ok);
+        assert!(state.can_attach(1).is_ok());
+    }
+
+    #[test]
+    fn charge_uncharge_pairs_track_counts() {
+        let state = PidsCgroupState::new(Weak::new());
+        state.charge_unchecked();
+        state.charge_unchecked();
+        assert_eq!(state.local_current(), 2);
+        assert_eq!(state.subtree_current(), 2);
+        state.uncharge();
+        assert_eq!(state.local_current(), 1);
+        state.uncharge();
+        assert_eq!(state.local_current(), 0);
+    }
 }

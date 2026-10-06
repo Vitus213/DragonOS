@@ -76,7 +76,9 @@ pub fn machine_kexec_prepare(kimage: Rc<SpinLock<Kimage>>) -> Result<(), SystemE
 }
 
 pub fn init_pgtable(kimage: Rc<SpinLock<Kimage>>) -> Result<(), SystemError> {
-    let pgd = ident_pt_alloc();
+    // 恒等页表根页走记账分配：当前任务组 memory.max 拒绝或物理耗尽时
+    // 返回 ENOMEM 给 kexec_load 调用者，而不是 panic。
+    let pgd = ident_pt_alloc()?;
     kimage.lock().pgd = pgd;
 
     unsafe extern "C" {

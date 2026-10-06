@@ -75,19 +75,14 @@ unsafe impl Send for DmaBuffer {}
 unsafe impl Sync for DmaBuffer {}
 
 impl DmaBuffer {
-    pub fn alloc_bytes(size: usize, options: DmaAllocOptions) -> Self {
-        Self::try_alloc_bytes(size, options).expect("dma alloc bytes failed")
-    }
-
-    /// Allocate a physically contiguous DMA buffer without turning memory
-    /// pressure or invalid sizing into a kernel panic.
+    /// 分配物理连续的 DMA 缓冲；memory.max 拒绝/物理耗尽/尺寸非法都以
+    /// `Result` 传播，不 panic。
+    ///
+    /// 本模块不提供会 panic 的 `alloc_bytes`/`alloc_pages` 包装：其底层
+    /// `LockedFrameAllocator::allocate` 会被 memcg 计费拒绝，任何可失败
+    /// 分配入口都必须让调用方处理 ENOMEM。
     pub fn try_alloc_bytes(size: usize, options: DmaAllocOptions) -> Result<Self, SystemError> {
         dma_allocator().try_alloc_bytes(size, options)
-    }
-
-    #[allow(dead_code)]
-    pub fn alloc_pages(pages: usize, options: DmaAllocOptions) -> Self {
-        Self::try_alloc_pages(pages, options).expect("dma alloc pages failed")
     }
 
     #[allow(dead_code)]

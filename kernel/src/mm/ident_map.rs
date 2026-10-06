@@ -39,11 +39,20 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> IdentPageMapper<Arch, F> {
         };
     }
 
-    pub unsafe fn create(mut allocator: F) -> Self {
-        let table_paddr = allocator.allocate_one().unwrap();
-        let table_vaddr = Arch::phys_2_virt(table_paddr).unwrap();
-        Arch::write_bytes(table_vaddr, 0, Arch::PAGE_SIZE);
-        return Self::new(table_paddr, allocator);
+    /// 创建恒等页表根页。
+    ///
+    /// 分配走记账页帧分配器：当前任务组的 memory.max 拒绝或物理耗尽都会
+    /// 返回 None，必须作为可传播错误上送（kexec_load 路径），不能 panic。
+    pub unsafe fn create(mut allocator: F) -> Result<Self, SystemError> {
+        let Some(table_paddr) = allocator.allocate_one() else {
+            return Err(SystemError::ENOMEM);
+        };
+        let Some(table_vaddr) = (unsafe { Arch::phys_2_virt(table_paddr) }) else {
+            unsafe { allocator.free_one(table_paddr) };
+            return Err(SystemError::ENOMEM);
+        };
+        unsafe { Arch::write_bytes(table_vaddr, 0, Arch::PAGE_SIZE) };
+        Ok(Self::new(table_paddr, allocator))
     }
 
     pub fn paddr(&self) -> PhysAddr {
@@ -104,8 +113,12 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> IdentPageMapper<Arch, F> {
                         SystemError::ENOMEM
                     })?;
 
-                    // 清空这个页帧
-                    MMArch::write_bytes(MMArch::phys_2_virt(frame).unwrap(), 0, MMArch::PAGE_SIZE);
+                    // 清空这个页帧；direct-map 翻译失败时归还已计费页帧
+                    let Some(next_table_vaddr) = (unsafe { MMArch::phys_2_virt(frame) }) else {
+                        unsafe { allocator.free_one(frame) };
+                        return Err(SystemError::ENOMEM);
+                    };
+                    unsafe { MMArch::write_bytes(next_table_vaddr, 0, MMArch::PAGE_SIZE) };
                     // 设置页表项的flags
                     let flags: EntryFlags<Arch> = EntryFlags::new_page_table(false);
 
@@ -123,10 +136,10 @@ impl<Arch: MemoryManagementArch, F: FrameAllocator> IdentPageMapper<Arch, F> {
     }
 }
 
-pub fn ident_pt_alloc() -> usize {
+pub fn ident_pt_alloc() -> Result<usize, SystemError> {
     let new_imapper: IdentPageMapper<MMArch, LockedFrameAllocator> =
-        unsafe { IdentPageMapper::create(LockedFrameAllocator) };
-    new_imapper.paddr().data()
+        unsafe { IdentPageMapper::create(LockedFrameAllocator) }?;
+    Ok(new_imapper.paddr().data())
 }
 
 pub fn ident_map_page(table_paddr: usize, virt: usize, phys: usize) -> Result<(), SystemError> {

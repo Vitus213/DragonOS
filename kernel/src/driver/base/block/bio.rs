@@ -44,13 +44,10 @@ struct InnerBioRequest {
 type BioCompleteCallback = Box<dyn Fn(Result<usize, SystemError>) + Send + Sync>;
 
 impl BioRequest {
-    /// 创建一个读请求
-    pub fn new_read(lba_start: BlockId, count: usize) -> Arc<Self> {
-        Self::try_new_read(lba_start, count).expect("bio read allocation failed")
-    }
-
-    /// Create a read request without panicking when the DMA buffer cannot be
-    /// allocated or the request size overflows.
+    /// 创建一个读请求。
+    ///
+    /// DMA 缓冲走记账页帧分配器，当前任务组 memory.max 拒绝或物理耗尽时
+    /// 以 ENOMEM 失败传播，而不是 panic；请求长度溢出同样返回错误。
     pub fn try_new_read(lba_start: BlockId, count: usize) -> Result<Arc<Self>, SystemError> {
         let len = Self::validate_request(lba_start, count)?;
         let buffer = DmaBuffer::try_alloc_bytes(len, Default::default())?;
@@ -70,13 +67,8 @@ impl BioRequest {
         }))
     }
 
-    /// 创建一个写请求
-    pub fn new_write(lba_start: BlockId, count: usize, data: &[u8]) -> Arc<Self> {
-        Self::try_new_write(lba_start, count, data).expect("bio write allocation failed")
-    }
-
-    /// Create a write request with exact-length validation and fallible DMA
-    /// allocation. A mismatched payload is never silently truncated or padded.
+    /// 创建一个写请求，带精确长度校验与可失败的 DMA 分配。
+    /// 载荷长度不匹配时绝不静默截断或补齐；分配失败以 ENOMEM 传播。
     pub fn try_new_write(
         lba_start: BlockId,
         count: usize,
@@ -105,14 +97,14 @@ impl BioRequest {
         }))
     }
 
-    /// Create a new flush request.
-    pub fn new_flush() -> Arc<Self> {
-        Arc::new(Self {
+    /// 创建一个 flush 请求。缓冲走记账分配，拒绝时返回 ENOMEM，不 panic。
+    pub fn try_new_flush() -> Result<Arc<Self>, SystemError> {
+        Ok(Arc::new(Self {
             inner: SpinLock::new(InnerBioRequest {
                 bio_type: BioType::Flush,
                 lba_start: 0,
                 count: 0,
-                buffer: DmaBuffer::alloc_bytes(1, Default::default()),
+                buffer: DmaBuffer::try_alloc_bytes(1, Default::default())?,
                 state: BioState::Init,
                 completion: Arc::new(Completion::new()),
                 result: None,
@@ -120,7 +112,7 @@ impl BioRequest {
                 token: None,
                 stats_submit_cycle: 0,
             }),
-        })
+        }))
     }
 
     /// 标记为已提交，设置token
