@@ -32,6 +32,7 @@ pub(super) enum CgroupCoreFile {
     MemoryMax,
     MemoryEvents,
     MemoryStat,
+    MemoryOomGroup,
     MemorySwapCurrent,
     MemorySwapPeak,
     MemorySwapHigh,
@@ -144,7 +145,7 @@ const CPU_FILE_SPECS: [CgroupFileSpec; 2] = [
     },
 ];
 
-const MEMORY_FILE_SPECS: [CgroupFileSpec; 13] = [
+const MEMORY_FILE_SPECS: [CgroupFileSpec; 14] = [
     CgroupFileSpec {
         name: "memory.current",
         ty: CgroupCoreFile::MemoryCurrent,
@@ -200,6 +201,13 @@ const MEMORY_FILE_SPECS: [CgroupFileSpec; 13] = [
         init: b"",
         mode: 0o444,
         visibility: CgroupFileVisibility::All,
+    },
+    CgroupFileSpec {
+        name: "memory.oom.group",
+        ty: CgroupCoreFile::MemoryOomGroup,
+        init: b"0\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
     },
     CgroupFileSpec {
         name: "memory.swap.current",
@@ -416,6 +424,9 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         CgroupCoreFile::MemoryMax => memory_bytes(cgroup, |memory| encode_max_u64(memory.max())),
         CgroupCoreFile::MemoryEvents => memory_bytes(cgroup, |memory| memory.events().into_bytes()),
         CgroupCoreFile::MemoryStat => memory_bytes(cgroup, |memory| memory.stat().into_bytes()),
+        CgroupCoreFile::MemoryOomGroup => memory_bytes(cgroup, |memory| {
+            format!("{}\n", memory.oom_group() as u8).into_bytes()
+        }),
         CgroupCoreFile::MemorySwapCurrent => memory_bytes(cgroup, |memory| {
             format!("{}\n", memory.swap_current()).into_bytes()
         }),
@@ -468,10 +479,16 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         }
     }
 }
+/// 写 cgroup.type 的入口。全程持有 cgroup_accounting_lock：
+/// 类型变更的 vet→写入必须与任务迁移（write_procs/fork/exit）、
+/// mkdir/rmdir 串行，才能杜绝与并发迁移交错产生的非法层级组合
+/// （如 threaded 子树内含域控制器任务）。set_cgroup_type 的
+/// "调用者须持锁"不变量在此处满足。
 pub(super) fn write_type_file(
     cgroup: &Arc<CgroupNode>,
     input: &str,
 ) -> Result<Vec<u8>, SystemError> {
+    let _accounting_guard = crate::cgroup::core::cgroup_accounting_lock().lock();
     cgroup.set_cgroup_type(input)?;
     Ok(format!("{}\n", cgroup.cgroup_type_name()).into_bytes())
 }
@@ -527,6 +544,11 @@ pub(super) fn write_controller_file(
                 _ => unreachable!(),
             }
             Ok(encode_max_u64(value))
+        }
+        CgroupCoreFile::MemoryOomGroup => {
+            let enabled = crate::cgroup::controllers::memory::parse_oom_group_value(input)?;
+            cgroup.set_memory_oom_group(enabled)?;
+            Ok(format!("{}\n", enabled as u8).into_bytes())
         }
         CgroupCoreFile::PidsMax => {
             let new_limit = parse_pids_max(input)?;

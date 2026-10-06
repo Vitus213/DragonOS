@@ -32,7 +32,8 @@
 | cpu | `cpu.stat` | real | `throttled_usec/nr_throttled/nr_periods` 在节流/恢复路径累计；`usage_usec/user_usec/system_usec` 按 tick 的 user/kernel 现场分类计费（issue #36） |
 | memory | `memory.current/peak` | real | `MemoryCss::try_charge/uncharge` + 每帧归属（PAGE_OWNERS） |
 | memory | `memory.min/low/high/max` | real | min/low 存储 + 回收权重占位；high 缺页路径有界节流；max 事务式祖先链检查，拒绝走 `oom::scoped_out_of_memory` |
-| memory | `memory.events` / `memory.stat` | real | high/max 事件计数；RSS 分项统计 |
+| memory | `memory.oom.group` | real | 0/1 读写（NotOnRoot，对齐 Linux `CFTYPE_NOT_ON_ROOT`）；置位后 `memory.max` 越限 OOM 依 Linux `mem_cgroup_get_oom_group` 沿 victim CSS 链取至越限域为止最高置位层，清理其子树全部 killable 任务并递增 `oom_group_kill`（issue #37） |
+| memory | `memory.events` / `memory.stat` | real | high/max/oom/oom_kill/oom_group_kill 事件计数；RSS 分项统计。`low` 依 Linux 语义仅在回收器识别 per-memcg 保护（`mem_cgroup_below_low` → MEMCG_LOW）时递增；本内核无 per-memcg LRU/回收目标（复用全局回收器，见下方边界条目），`low` 恒为 0 属如实降档，非缺陷遗漏 |
 | memory | `memory.swap.*` | stub | swap 未实现，接口占位（与边界声明一致） |
 | io | `io.max` | real | 100ms slice 周期结算 token 桶；GenDisk/ext4 适配器/MBR 扫描全部分发路径前置限速；归属经 `blkcg::current_io_cgroup`（脏属主/预读发起者覆写优先，否则执行任务） |
 | io | `io.stat` | real | 完成时按归属 cgroup 记账（提交时捕获或 `blkcg::set_io_owner` 覆写解析；异步回写按脏属主） |
