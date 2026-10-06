@@ -67,3 +67,23 @@ Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 1
 - 验证：`make kernel ARCH=x86_64` 通过（worktree@aa81b900 基线）；裁决
   函数宿主切片单测 4 例全绿；旧行为复现模型（缺陷 3 断言全命中）与修复后
   收敛/幂等模型（8 场景断言）见 issue #32 步骤评论。
+
+## issue #33 — cgroup.type 与 cpuset.cpus 半序列化收口
+
+- `write_type_file` 入口全程持 `cgroup_accounting_lock`；`set_cgroup_type`
+  的 vet→写入（subtree_task_count/域控制器/父类型读改写）与迁移、
+  mkdir/rmdir 串行，杜绝"threaded 子树含域控制器任务"等非法组合固化；
+  函数头落"调用者须持锁"不变量注释 + `debug_assert!` 锁纪律自检。
+- `CpusetCss::set_cpus` 的 commit→validate→apply→回滚全程持
+  `cgroup_accounting_lock`（对齐 can_attach 既有锁内语义与 Linux
+  cgroup_mutex 下的 cpuset 变更）；任务不得恰在 validate 与 apply
+  之间迁入/迁出。回滚重放失败不再 `let _ =` 吞错误，`log::error!`
+  上报"部分任务未回到旧策略"。
+- cpuset 交集写入（apply/fork/attach）移入目标任务 `pi_lock` 临界区：
+  新增 `PiProtected::narrow_cpus_allowed` + `ProcessManager::
+  set_cpus_allowed_and`，与 `sched_setaffinity` 对 cpus_allowed 的
+  读改写线性化互斥；空交集 EINVAL 不改 affinity、由调用方上报。锁序
+  `accounting → pi_lock → rq_lock` 与全部既有持锁链一致，无反向边。
+- 验证：`make kernel ARCH=x86_64` 通过；6 个 cfg(test) 单测随树编译
+  （交集语义/提交门控/串行化）；逻辑切片宿主实测全绿（kernel libtest
+  本机不可运行的定界见 issue #33）。
