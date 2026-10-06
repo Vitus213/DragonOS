@@ -66,13 +66,14 @@ use crate::{
     arch::MMArch,
     cgroup::{
         controllers::memory::{ChargeToken, MemoryCss},
+        core::CgroupNode,
         subsys::{CgroupSubsysId, CgroupSubsysState},
     },
     libs::spinlock::SpinLock,
     mm::{
         allocator::page_frame::PageFrameCount, page::PageReclaimer, MemoryManagementArch, PhysAddr,
     },
-    process::ProcessManager,
+    process::{ProcessManager, RawPid},
     time::{sleep::nanosleep, PosixTimeSpec},
 };
 
