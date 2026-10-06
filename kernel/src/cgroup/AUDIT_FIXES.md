@@ -47,3 +47,45 @@ Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 1
   链不含 memcg 锁（全序图与逐交叉点论证：`kernel/src/cgroup/LOCK_ORDER.md`）。
 - 验证：`make kernel ARCH=x86_64` 通过；`take_owner_runs` 纯函数宿主
   单测 6 例全绿（摘取归并/缝隙/钳制/满批续扫收敛/边界不越批）。
+
+## issue #39 · cgroup.max.depth / cgroup.max.descendants 与递归链定界
+
+### Linux 6.6 实码语义对照（v6.6 `kernel/cgroup/cgroup.c`，经 v4.14 同码交叉验证）
+
+- 文件归属：`cgroup.max.descendants` / `cgroup.max.depth` 是 `cgroup_base_files[]`
+  的成员（cgroup.c:5237-5246），两个条目均无 `CFTYPE_NOT_ON_ROOT` 标志 ⇒
+  默认层级下**每个 cgroup（含 root 与非 root）都有这两个读写 knob**，约束各自子树。
+- 默认值：`init_cgroup_housekeeping()` 将 `max_descendants` 与 `max_depth` 均初始化为
+  `INT_MAX`（cgroup.c:2000-2001）；`Documentation/admin-guide/cgroup-v2.rst`（"cgroup.max.depth:
+  A read-write single value files. The default is max"）确认默认 max。issue 背景中的
+  "默认 max.depth=64、max.descendants=1000"与 6.6 实码不符，本卡按实码取 max。
+- 读写语义：show（cgroup.c:3527-3537、3570-3580）打印 `max` 或十进制整数；
+  write（cgroup.c:3540-3568、3583-3608）接受 `max` 或整数，负值返回 `-ERANGE`，
+  非数字由 `kstrtoint` 报错（EINVAL）。
+- mkdir 越限检查：`cgroup_mkdir()`（cgroup.c:5722）在 `cgroup_lock` 内调用
+  `cgroup_check_hierarchy_limits(parent)`（cgroup.c:5699-5718）：自 parent 向 root 逐层，
+  新子组的相对深度 `level` 从 1 起算；任一层 `nr_descendants >= max_descendants`
+  （cgroup.c:5708）或 `level > max_depth`（cgroup.c:5711）即失败。越限 errno 实码为
+  **`-EAGAIN`**（cgroup.c:5736-5737）——不是 EMLINK；本卡按"以实码为准"引用 EAGAIN。
+- 计数器维护：创建时（cgroup.c:5645-5649）对 parent 及其全部祖先（不含自身）
+  `nr_descendants++`；rmdir（`cgroup_destroy_locked`，cgroup.c:5930-5932）对 parent 及
+  其祖先 `nr_descendants--`、`nr_dying_descendants++`；dying cgroup 彻底释放
+  （cgroup.c:5425-5427）时 `nr_dying_descendants--`。DragonOS 的 rmdir 要求组内无子组、
+  无任务且同步彻底删除（无 dying 态），因此只镜像 `nr_descendants` 的增删；
+  dying 计数在 DragonOS 没有对应物，此处显式声明省略。
+
+### DragonOS 落地（本卡）
+
+- `CgroupNode` 新增 `nr_descendants`/`max_depth`/`max_descendants`（AtomicUsize，
+  `usize::MAX` 即 "max"）；`create_child` 在 accounting lock 内做 parent→root 逐层检查
+  （纯函数 seam `hierarchy_limits_breach`，越限 `EAGAIN_OR_EWOULDBLOCK`），成功后沿同链
+  `nr_descendants+1`；`remove_child` 成功路径 `-1`。
+- `cgroup2/files.rs` 暴露 `cgroup.max.depth` / `cgroup.max.descendants`（root 与全部子组
+  均可见，mode 0644；`max` ↔ `usize::MAX`，负值 `ERANGE`，非法值 `EINVAL`）。
+- 递归链定界：`collect_subtree_tasks`（mm/memcg.rs）、freezer 的
+  `freeze_tasks↔propagate_parent_freezing` / `unfreeze_tasks↔retract_parent_freezing`
+  互递归与 `update_ancestor_counts` 上溯递归、`has_threaded_descendant`（cgroup/core.rs）、
+  `MemoryCss::uncharge_chain`（controllers/memory.rs）全部改为迭代遍历。
+  cpuset / io / pids / `add_task` 的祖先链与 `prepare_device_snapshots` 的子树遍历
+  原本已是迭代式，核查后保持不变。递归深度消耗栈的路径清零；层级深度由 knobs
+  显式定界（Linux 语义：默认 max）。
