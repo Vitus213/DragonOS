@@ -10,8 +10,8 @@ use system_error::SystemError;
 
 use crate::{
     cgroup::{
-        cgroup_accounting_lock, cgroup_common_ancestor, cgroup_migrate_vet_dst_with_src,
-        cgroup_root, CgroupNode,
+        cgroup_accounting_lock, cgroup_common_ancestor, cgroup_migrate_execute,
+        cgroup_migrate_vet_dst_with_src, cgroup_root, CgroupNode,
     },
     filesystem::vfs::{
         file::{FileFlags, FilePrivateData},
@@ -557,25 +557,12 @@ impl Cgroup2Inode {
             return Err(SystemError::ESRCH);
         }
         cgroup_migrate_vet_dst_with_src(&src, cgroup, to_move.len())?;
-
-        for id in crate::cgroup::subsys::CgroupSubsysId::all() {
-            if let Some(css) = cgroup.css(*id) {
-                css.can_attach(&to_move)?;
-            }
-        }
-
-        for task in &to_move {
-            task.set_task_cgroup_node(cgroup.clone());
-            // 换组点直接调用 freezer 迁移调整（对应 Linux 在
-            // css_set_move_task() 后调用 cgroup_freezer_migrate_task）：
-            // 按目标组状态冻结或解冻，并迁移/清理源组计数与 wakeable。
-            crate::cgroup::controllers::freezer::cgroup_freezer_migrate_task(task, &src, cgroup);
-        }
-        for id in crate::cgroup::subsys::CgroupSubsysId::all() {
-            if let Some(css) = cgroup.css(*id) {
-                css.attach(&to_move);
-            }
-        }
+        // 迁移事务（对应 Linux 6.6 cgroup_migrate_execute）：逐控制器
+        // can_attach 对整组预演，任一失败则 cancel_attach 回退全部预演
+        // 效果；只有预演全部通过才在提交点统一换组。旧实现逐任务提交、
+        // 中途失败不回退，会留下半迁移线程组（issue #38，收编旧 #20）。
+        // 消费的是上面锁内复核后的存活快照，退出判定唯一、不重复实现。
+        cgroup_migrate_execute(&src, cgroup, &to_move)?;
         Ok(buf.len())
     }
 

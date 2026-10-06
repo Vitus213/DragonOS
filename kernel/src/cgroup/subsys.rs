@@ -164,15 +164,26 @@ pub trait CgroupSubsysState: Debug + Send + Sync {
     /// exit 回调
     fn exit(&self, _task: &Arc<ProcessControlBlock>) {}
 
-    /// 任务迁移前检查
+    /// 任务迁移检查（可失败，对应 Linux `cgroup_subsys->can_attach`）。
+    ///
+    /// 迁移事务的预演阶段：控制器可为 taskset 整组预取迁移效果（如 pids
+    /// 预搬层级计数）。整组要么全迁、要么全不动——本钩子对组内任一任务
+    /// 失败时，已施加给前序任务的效果必须在这里就地回退（对照 Linux
+    /// `pids_try_charge` 的 revert 循环）；事务核心只对已完整执行过的
+    /// can_attach 逐个调用 cancel_attach。
     fn can_attach(&self, _tasks: &[Arc<ProcessControlBlock>]) -> Result<(), SystemError> {
         Ok(())
     }
 
-    /// 任务迁移取消回调
+    /// 任务迁移取消回调（对应 Linux `cgroup_subsys->cancel_attach`）。
+    ///
+    /// 仅在某个控制器的 can_attach 失败后，由迁移事务对已完整执行过
+    /// can_attach 的前序控制器逐个调用，回退其预演的效果。
     fn cancel_attach(&self, _tasks: &[Arc<ProcessControlBlock>]) {}
 
-    /// 任务迁移完成回调
+    /// 任务迁移完成回调（不可失败，对应 Linux `cgroup_subsys->attach`）。
+    ///
+    /// 仅在迁移事务提交（任务归属已切换）之后调用。
     fn attach(&self, _tasks: &[Arc<ProcessControlBlock>]) {}
 
     /// 用于类型转换的 Any trait

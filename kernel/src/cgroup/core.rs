@@ -682,23 +682,6 @@ impl CgroupNode {
         }
     }
 
-    /// 在 cgroup 迁移时转移层级 pids 计数。
-    ///
-    /// Linux 将迁移视为组织操作，不受 `pids.max` 阻塞；因此目标计数
-    /// 必须无条件增加，不能在更新任务归属后再执行可能失败的 charge。
-    pub fn transfer_pids_charge(src: &Arc<CgroupNode>, dst: &Arc<CgroupNode>, count: usize) {
-        src.uncharge_pids(count);
-        if let Some(css) = dst.css(CgroupSubsysId::Pids) {
-            if let Some(state) = css
-                .as_any()
-                .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
-            {
-                for _ in 0..count {
-                    state.charge_unchecked();
-                }
-            }
-        }
-    }
     pub fn set_pids_max(&self, max: Option<usize>) -> Result<(), SystemError> {
         let css = self.css(CgroupSubsysId::Pids).ok_or(SystemError::ENOENT)?;
         let state = css
@@ -1513,6 +1496,99 @@ pub fn cgroup_migrate_vet_dst_with_src(
 ) -> Result<(), SystemError> {
     // pids.max constrains fork/clone, not organizational migration.
     cgroup_migrate_vet_dst(dst)
+}
+
+/// 迁移事务预演：逐控制器对整组 `to_move` 执行 `can_attach`。
+///
+/// 对应 Linux 6.6 `cgroup_migrate_execute` 的预演段：控制器可在此为整组
+/// 预取迁移效果（如 pids 预搬层级计数）；任一控制器失败即中止，并对已
+/// 完整执行过 `can_attach` 的前序控制器按相同顺序逐个调用
+/// `cancel_attach` 回退预演效果——任务归属、控制器状态与各级 pids 计数
+/// 回到迁移前。这正是旧实现缺失、导致多线程组「第 2 个任务的可失败钩子
+/// 失败时第 1 个任务不回退、同进程线程分属两组」缺陷（issue #38，收编
+/// 旧 #20）的修复点。
+///
+/// 与 Linux 的回退顺序差异及原因：Linux 遍历 `mgctx->ss_mask` 至失败位
+/// break（按 ssid 升序回退前序控制器）；本实现 can_attach 失败时任务
+/// 尚未换组（提交在调用方），cancel 按 `task_cgroup_node()` 读源组即可，
+/// 升序与逆序在数学上互逆等价，故沿用与遍历一致的升序。
+///
+/// 成功时返回已完整执行过 can_attach 的控制器集合，供提交后逐个
+/// `attach` 收尾；失败时返回原始错误，预演效果已全部回退。
+pub fn cgroup_migrate_precheck(
+    dst: &Arc<CgroupNode>,
+    to_move: &[Arc<crate::process::ProcessControlBlock>],
+) -> Result<Vec<Arc<dyn CgroupSubsysState>>, SystemError> {
+    let mut executed: Vec<Arc<dyn CgroupSubsysState>> = Vec::new();
+    for id in CgroupSubsysId::all() {
+        let Some(css) = dst.css(*id) else {
+            continue;
+        };
+        if let Err(error) = css.can_attach(to_move) {
+            // 失败中止：回退前序控制器的预演效果（对应 Linux
+            // cgroup_migrate_execute 的 out_cancel_attach 分支）。
+            for prev in &executed {
+                prev.cancel_attach(to_move);
+            }
+            return Err(error);
+        }
+        executed.push(css);
+    }
+    Ok(executed)
+}
+
+/// 迁移事务提交点：整组统一切换任务归属，并在换组点施加 freezer 调整。
+///
+/// 只在预演（`cgroup_migrate_precheck`）全部通过后调用，不可失败。
+/// `set_task_cgroup_node` 只搬成员表与 css 引用（对应 Linux
+/// `css_set_move_task()`；pids 层级计数已由 pids `can_attach` 预搬），
+/// 换组点上直接调用 `cgroup_freezer_migrate_task`（对应 Linux 在
+/// css_set_move_task 后的同名调用：按目标组状态冻结或解冻，并迁移/
+/// 清理源组计数与 wakeable；freezer 的效果只在提交点施加，预演阶段
+/// 失败时不会触碰 freezer 状态，天然无半冻结残留）。
+pub fn cgroup_migrate_commit(
+    src: &Arc<CgroupNode>,
+    dst: &Arc<CgroupNode>,
+    to_move: &[Arc<crate::process::ProcessControlBlock>],
+) {
+    for task in to_move {
+        task.set_task_cgroup_node(dst.clone());
+        crate::cgroup::controllers::freezer::cgroup_freezer_migrate_task(task, src, dst);
+    }
+}
+
+/// 迁移事务：把 `to_move`（同一线程组）从 `src` 原子地迁入 `dst`。
+///
+/// 对应 Linux 6.6 `cgroup_migrate_execute` 全流程：先整组预演
+/// （`cgroup_migrate_precheck`，任一控制器失败即按 Linux 语义对前序
+/// 控制器逐个 `cancel_attach` 回退预演效果并传播错误），预演全部通过
+/// 才进入不可失败的提交点（`cgroup_migrate_commit`），最后对已执行过
+/// can_attach 的控制器逐个 `attach` 收尾。
+///
+/// 调用方必须持有 `cgroup_accounting_lock`（与 `rmdir`、fork 计费点
+/// 串行化，保证 `src` 在事务内不会消亡）与线程组变更锁
+/// （`cgroup_threadgroup_change_begin` 的对应物，见 `inode.rs`），
+/// 且 `to_move` 中的任务在锁序保证下不会在预演与提交之间退出。
+/// 目标合法性 vet（`cgroup_migrate_vet_dst`）由调用方在事务前执行
+/// （对应 Linux `cgroup_attach_task` 先 vet_dst 再 `cgroup_migrate`）。
+pub fn cgroup_migrate_execute(
+    src: &Arc<CgroupNode>,
+    dst: &Arc<CgroupNode>,
+    to_move: &[Arc<crate::process::ProcessControlBlock>],
+) -> Result<(), SystemError> {
+    if to_move.is_empty() {
+        return Ok(());
+    }
+    // 预演阶段：可失败；失败时已施加的预演效果（如 pids 预搬计数）
+    // 全部回退，组成员与各级计数保持迁移前状态。
+    let executed = cgroup_migrate_precheck(dst, to_move)?;
+    // 提交阶段：不可失败，整组统一换组。
+    cgroup_migrate_commit(src, dst, to_move);
+    // 收尾：通知控制器迁移完成（不可失败）。
+    for css in &executed {
+        css.attach(to_move);
+    }
+    Ok(())
 }
 
 #[allow(dead_code)]

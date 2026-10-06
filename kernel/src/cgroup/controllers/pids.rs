@@ -156,25 +156,66 @@ impl PidsCgroupState {
         }
     }
 
-    pub fn can_attach(&self, count: usize) -> Result<(), SystemError> {
-        if self
-            .get_max()
-            .is_some_and(|max| self.local_current().saturating_add(count) > max)
-        {
-            return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    /// 把 `count` 个任务的层级 pids 计数从 `src` 组搬入本组（forward=true），
+    /// 或反向搬回（forward=false）。
+    ///
+    /// 对应 Linux 6.6 `pids_can_attach` 的 `pids_charge(dst)+pids_uncharge(src)`
+    /// 与 `pids_cancel_attach` 的反向搬运。迁移是组织操作，Linux 允许迁入后
+    /// 暂时超过 `pids.max`，只有 fork/clone 受限，因此这里无条件搬运、不做
+    /// max 检查（max 检查只属于 `try_charge`/fork 路径）。
+    ///
+    /// 源组 pids 状态缺失时整体不动作并返回 `false`，调用方无需按前缀回退；
+    /// 调用方必须持有 `cgroup_accounting_lock`，与 rmdir/冻结请求串行化。
+    pub fn transfer_for_migration(&self, src: &CgroupNode, count: usize, forward: bool) -> bool {
+        if count == 0 {
+            return true;
         }
-        for ancestor in self.ancestors() {
-            let exceeded = Self::with_state(&ancestor, |state| {
-                state
-                    .get_max()
-                    .is_some_and(|max| state.subtree_current().saturating_add(count) > max)
-            })
-            .unwrap_or(false);
-            if exceeded {
-                return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+        let Some(src_css) = src.css(CgroupSubsysId::Pids) else {
+            return false;
+        };
+        let Some(src_state) = src_css.as_any().downcast_ref::<Self>() else {
+            return false;
+        };
+        for _ in 0..count {
+            if forward {
+                self.charge_unchecked();
+                src_state.uncharge();
+            } else {
+                self.uncharge();
+                src_state.charge_unchecked();
+            }
+        }
+        true
+    }
+
+    /// 迁移预演核心：逐任务把层级计数从 `srcs[i]` 搬入本组。
+    ///
+    /// 整组要么全预演成功、要么全部撤销：第 `idx` 个任务的源组 pids
+    /// 状态缺失（异常拓扑）时，先把已施加于前 `idx` 个任务的搬运逐一
+    /// 反向撤销（与 Linux `pids_try_charge` 失败时的 revert 循环同构），
+    /// 再返回错误；因此失败方无需迁移事务再为本控制器调用
+    /// cancel_attach。抽出为不依赖任务对象的形状（源组数组），使其可在
+    /// 宿主单测中直接构造层级计数验证（issue #38）。
+    pub fn precharge_migration(&self, srcs: &[Arc<CgroupNode>]) -> Result<(), SystemError> {
+        for (idx, src) in srcs.iter().enumerate() {
+            if !self.transfer_for_migration(src, 1, true) {
+                for prev in &srcs[..idx] {
+                    self.transfer_for_migration(prev, 1, false);
+                }
+                return Err(SystemError::ENOENT);
             }
         }
         Ok(())
+    }
+
+    /// 迁移回退核心：把预搬入本组的层级计数逐任务搬回各自旧组。
+    ///
+    /// 对应 Linux 6.6 `pids_cancel_attach`；与 `precharge_migration` 严格
+    /// 互逆（搬运顺序不影响原子性：每对操作各自闭合）。
+    pub fn revert_migration(&self, srcs: &[Arc<CgroupNode>]) {
+        for src in srcs {
+            self.transfer_for_migration(src, 1, false);
+        }
     }
 }
 
@@ -202,6 +243,27 @@ impl CgroupSubsysState for PidsCgroupState {
 
     fn set_flags(&self, flags: CssFlags) {
         *self.flags.lock() = flags;
+    }
+
+    /// 迁移预演：逐任务把层级 pids 计数从任务旧组搬入本组
+    /// （委托 `precharge_migration`）。
+    ///
+    /// 对应 Linux 6.6 `pids_can_attach`。提交点尚未到达，任务归属仍为
+    /// 旧组，逐任务 `task_cgroup_node()` 取源，与 Linux 在 can_attach
+    /// 与 cancel_attach 时刻重读 `task_css(task, PID)` 的行为一致。
+    fn can_attach(&self, tasks: &[Arc<ProcessControlBlock>]) -> Result<(), SystemError> {
+        let srcs: Vec<Arc<CgroupNode>> = tasks.iter().map(|task| task.task_cgroup_node()).collect();
+        self.precharge_migration(&srcs)
+    }
+
+    /// 迁移失败回退：把预搬入本组的层级 pids 计数逐任务搬回旧组
+    /// （委托 `revert_migration`）。
+    ///
+    /// 对应 Linux 6.6 `pids_cancel_attach`；由迁移事务在后续控制器的
+    /// can_attach 失败时对已完整执行过 can_attach 的前序控制器调用。
+    fn cancel_attach(&self, tasks: &[Arc<ProcessControlBlock>]) {
+        let srcs: Vec<Arc<CgroupNode>> = tasks.iter().map(|task| task.task_cgroup_node()).collect();
+        self.revert_migration(&srcs);
     }
 
     fn as_any(&self) -> &dyn core::any::Any {
@@ -299,8 +361,12 @@ mod tests {
 
     /// 单次计数失配（重复 uncharge）不得把 pids.current 翻转为
     /// usize::MAX。修复前 `fetch_sub` 从 0 减 1 溢出为极大值，
-    /// try_charge/can_attach 从此恒 EAGAIN——整个 cgroup 永久无法
+    /// try_charge 从此恒 EAGAIN——整个 cgroup 永久无法
     /// fork（issue #29 SOP-3 的组级雪崩）。饱和递减停在 0。
+    /// （issue #38 收编后，原 `can_attach(count)` 预检函数已删除：
+    /// Linux 6.6 语义下组织迁移不受 pids.max 阻塞，计数搬运改由
+    /// trait can_attach/cancel_attach 事务钩子无条件执行，fork 门槛
+    /// 判定即下方 saturating_add 表达式。）
     #[test]
     fn over_uncharge_saturates_and_keeps_fork_gate_open() {
         let state = PidsCgroupState::new(Weak::new());
@@ -318,7 +384,6 @@ mod tests {
         // （修复前 local_current 溢出后该判定恒 EAGAIN）。
         let fork_gate_ok = state.local_current().saturating_add(1) <= state.get_max().unwrap();
         assert!(fork_gate_ok);
-        assert!(state.can_attach(1).is_ok());
     }
 
     #[test]
