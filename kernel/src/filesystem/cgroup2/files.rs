@@ -20,6 +20,8 @@ pub(super) enum CgroupCoreFile {
     SubtreeControl,
     Events,
     Type,
+    MaxDepth,
+    MaxDescendants,
     Freeze,
     CpuStat,
     CpuWeight,
@@ -73,7 +75,21 @@ impl CgroupFileSpec {
     }
 }
 
-const BASE_FILE_SPECS: [CgroupFileSpec; 4] = [
+const BASE_FILE_SPECS: [CgroupFileSpec; 6] = [
+    CgroupFileSpec {
+        name: "cgroup.max.descendants",
+        ty: CgroupCoreFile::MaxDescendants,
+        init: b"max\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::All,
+    },
+    CgroupFileSpec {
+        name: "cgroup.max.depth",
+        ty: CgroupCoreFile::MaxDepth,
+        init: b"max\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::All,
+    },
     CgroupFileSpec {
         name: "cgroup.procs",
         ty: CgroupCoreFile::Procs,
@@ -316,7 +332,6 @@ const IO_FILE_SPECS: [CgroupFileSpec; 3] = [
     },
 ];
 
-
 pub(super) fn desired_file_specs(cgroup: &Arc<CgroupNode>) -> Vec<CgroupFileSpec> {
     let mut specs = Vec::new();
     push_visible_specs(&mut specs, cgroup, &BASE_FILE_SPECS);
@@ -395,15 +410,17 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
             format!("populated {}\nfrozen {}\n", populated, frozen).into_bytes()
         }
         CgroupCoreFile::Type => format!("{}\n", cgroup.cgroup_type_name()).into_bytes(),
-        CgroupCoreFile::Freeze => format!(
-            "{}\n",
-            if cgroup.self_freeze_requested() { 1 } else { 0 }
-        )
-        .into_bytes(),
+        // cgroup.max.depth / cgroup.max.descendants（#39）：Linux show 语义，
+        // usize::MAX 打印 "max"，否则十进制。
+        CgroupCoreFile::MaxDepth => encode_hierarchy_limit(cgroup.max_depth()),
+        CgroupCoreFile::MaxDescendants => encode_hierarchy_limit(cgroup.max_descendants()),
+        CgroupCoreFile::Freeze => {
+            format!("{}\n", if cgroup.self_freeze_requested() { 1 } else { 0 }).into_bytes()
+        }
         CgroupCoreFile::CpuStat => cpu_stat_for(cgroup),
-        CgroupCoreFile::CpuWeight => cpu_bytes(cgroup, |cpu| {
-            format!("{}\n", cpu.shares()).into_bytes()
-        }),
+        CgroupCoreFile::CpuWeight => {
+            cpu_bytes(cgroup, |cpu| format!("{}\n", cpu.shares()).into_bytes())
+        }
         CgroupCoreFile::CpuMax => cpu_bytes(cgroup, |cpu| {
             let (quota, period) = cpu.bandwidth();
             encode_cpu_max(quota, period)
@@ -411,15 +428,15 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         CgroupCoreFile::MemoryCurrent => memory_bytes(cgroup, |memory| {
             format!("{}\n", memory.current()).into_bytes()
         }),
-        CgroupCoreFile::MemoryPeak => memory_bytes(cgroup, |memory| {
-            format!("{}\n", memory.peak()).into_bytes()
-        }),
+        CgroupCoreFile::MemoryPeak => {
+            memory_bytes(cgroup, |memory| format!("{}\n", memory.peak()).into_bytes())
+        }
         CgroupCoreFile::MemoryMin => {
             memory_bytes(cgroup, |memory| encode_zero_or_value(memory.min()))
         }
         CgroupCoreFile::MemoryLow => {
             memory_bytes(cgroup, |memory| encode_zero_or_value(memory.low()))
-        },
+        }
         CgroupCoreFile::MemoryHigh => memory_bytes(cgroup, |memory| encode_max_u64(memory.high())),
         CgroupCoreFile::MemoryMax => memory_bytes(cgroup, |memory| encode_max_u64(memory.max())),
         CgroupCoreFile::MemoryEvents => memory_bytes(cgroup, |memory| memory.events().into_bytes()),
@@ -443,10 +460,17 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         CgroupCoreFile::PidsCurrent => format!("{}\n", cgroup.pids_current_count()).into_bytes(),
         CgroupCoreFile::PidsMax => encode_pids_max(cgroup.pids_max()),
         CgroupCoreFile::PidsEvents => format!("max {}\n", cgroup.pids_events_max()).into_bytes(),
-        CgroupCoreFile::CpusetCpus | CgroupCoreFile::CpusetCpusEffective | CgroupCoreFile::CpusetMems => {
+        CgroupCoreFile::CpusetCpus
+        | CgroupCoreFile::CpusetCpusEffective
+        | CgroupCoreFile::CpusetMems => {
             let css = cgroup.css(crate::cgroup::subsys::CgroupSubsysId::Cpuset);
-            let Some(css) = css else { return b"\n".to_vec(); };
-            let Some(cpuset) = css.as_any().downcast_ref::<crate::cgroup::controllers::cpuset::CpusetCss>() else {
+            let Some(css) = css else {
+                return b"\n".to_vec();
+            };
+            let Some(cpuset) = css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::cpuset::CpusetCss>()
+            else {
                 return b"\n".to_vec();
             };
             match ty {
@@ -576,14 +600,29 @@ pub(super) fn write_controller_file(
             Ok(output.into_bytes())
         }
         CgroupCoreFile::CpusetCpus | CgroupCoreFile::CpusetMems => {
-            let css = cgroup.css(crate::cgroup::subsys::CgroupSubsysId::Cpuset).ok_or(SystemError::ENOENT)?;
-            let cpuset = css.as_any().downcast_ref::<crate::cgroup::controllers::cpuset::CpusetCss>().ok_or(SystemError::EINVAL)?;
+            let css = cgroup
+                .css(crate::cgroup::subsys::CgroupSubsysId::Cpuset)
+                .ok_or(SystemError::ENOENT)?;
+            let cpuset = css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::cpuset::CpusetCss>()
+                .ok_or(SystemError::EINVAL)?;
             match ty {
                 CgroupCoreFile::CpusetCpus => cpuset.set_cpus(input)?,
                 CgroupCoreFile::CpusetMems => cpuset.set_mems(input)?,
                 _ => unreachable!(),
             }
             Ok(input.trim().as_bytes().to_vec())
+        }
+        // cgroup.max.depth / cgroup.max.descendants 写入（#39）：Linux write
+        // 语义——"max" 复位为 usize::MAX，负值 ERANGE，非法值 EINVAL。
+        CgroupCoreFile::MaxDepth | CgroupCoreFile::MaxDescendants => {
+            let value = parse_hierarchy_limit(input)?;
+            match ty {
+                CgroupCoreFile::MaxDepth => cgroup.set_max_depth(value),
+                _ => cgroup.set_max_descendants(value),
+            }
+            Ok(encode_hierarchy_limit(value))
         }
         CgroupCoreFile::Controllers
         | CgroupCoreFile::Events
@@ -643,7 +682,8 @@ fn validate_enable_controller(cgroup: &Arc<CgroupNode>, name: &str) -> Result<()
         && (cgroup.in_threaded_subtree()
             || matches!(
                 cgroup.cgroup_type(),
-                crate::cgroup::core::CgroupType::Threaded | crate::cgroup::core::CgroupType::DomainThreaded
+                crate::cgroup::core::CgroupType::Threaded
+                    | crate::cgroup::core::CgroupType::DomainThreaded
             ))
     {
         // Linux cgroup_vet_subtree_control_enable()：thread root
@@ -702,6 +742,86 @@ fn encode_controller_list(items: &[String]) -> Vec<u8> {
     line.into_bytes()
 }
 
+fn encode_hierarchy_limit(value: usize) -> Vec<u8> {
+    // 对齐 Linux cgroup_max_depth_show/cgroup_max_descendants_show：
+    // 无限制打印 "max"，否则十进制整数。usize::MAX 即内部 "max" 表示。
+    if value == usize::MAX {
+        b"max\n".to_vec()
+    } else {
+        format!("{}\n", value).into_bytes()
+    }
+}
+
+fn parse_hierarchy_limit(input: &str) -> Result<usize, SystemError> {
+    // 对齐 Linux cgroup_max_*_write（v6.6 cgroup.c:3540/3583）：strstrip 后
+    // "max" ⇒ INT_MAX，否则 `kstrtoint(buf, 0, &int)`——base 0（十进制/
+    // 0x 十六进制/0 八进制），格式错 EINVAL，数值溢出 int 范围 ERANGE，
+    // 显式负值同样 ERANGE。DragonOS 以 usize::MAX 表示无限制，可表达
+    // 上界钳到 i32::MAX（超过它在 Linux 上就是 ERANGE，同码拒绝）。
+    let trimmed = input.trim();
+    if trimmed == "max" {
+        return Ok(usize::MAX);
+    }
+    // kstrtoint 的符号处理：'+' 前缀直接跳过；'-' 解析成功且值为负 ⇒
+    // `depth < 0` ⇒ ERANGE（"-0" 数值为 0，Linux 接受，同样落到下方
+    // 钳制路径）。溢出（Err(true)）与负值同为 ERANGE，格式非法 ⇒ EINVAL。
+    let unsigned = if let Some(rest) = trimmed.strip_prefix('+') {
+        rest
+    } else {
+        trimmed
+    };
+    let (negative, magnitude_text) = match unsigned.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, unsigned),
+    };
+    let magnitude = parse_kstrtoint_radix(magnitude_text).map_err(|overflow| {
+        if overflow {
+            SystemError::ERANGE
+        } else {
+            SystemError::EINVAL
+        }
+    })?;
+    if negative && magnitude != 0 {
+        return Err(SystemError::ERANGE);
+    }
+    if magnitude > i32::MAX as u64 {
+        return Err(SystemError::ERANGE);
+    }
+    // Linux 以 INT_MAX 兼作 "max" 哨兵：写 2147483647 后 show 打印 "max"。
+    // 等价映射到内部 usize::MAX，保持可观测行为一致。
+    if magnitude == i32::MAX as u64 {
+        return Ok(usize::MAX);
+    }
+    usize::try_from(magnitude).map_err(|_| SystemError::ERANGE)
+}
+
+/// `kstrtoint(buf, 0, …)` 的非负分支：base 0 前缀（0x/0X ⇒ 16 进制，
+/// 0 ⇒ 8 进制，其余 ⇒ 10 进制）。返回 `Result<u64, bool>`——Err(true)
+/// 表示数字合法但超出 u64（对应 Linux 溢出 ERANGE），Err(false) 表示
+/// 格式非法（EINVAL）。
+fn parse_kstrtoint_radix(text: &str) -> Result<u64, bool> {
+    let (digits, radix) =
+        if let Some(rest) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+            (rest, 16)
+        } else if let Some(rest) = text.strip_prefix('0') {
+            // 前导 0 ⇒ 八进制；裸 "0"（去前缀后为空）值即 0。
+            if rest.is_empty() {
+                return Ok(0);
+            }
+            (rest, 8)
+        } else {
+            (text, 10)
+        };
+    // core::num::ParseIntErrorKind 是 unstable 特性项，内核构建不可用：
+    // 先做格式校验（非空且逐字符为该 radix 的合法数字），不合法直接
+    // EINVAL；格式合法而 from_str_radix 仍失败 ⇒ 数值超出 u64（溢出，
+    // 对应 Linux kstrtoint 的 ERANGE 路径）。
+    if digits.is_empty() || !digits.chars().all(|c| c.is_digit(radix)) {
+        return Err(false);
+    }
+    u64::from_str_radix(digits, radix).map_err(|_| true)
+}
+
 fn encode_pids_max(limit: Option<usize>) -> Vec<u8> {
     match limit {
         Some(v) => format!("{}\n", v).into_bytes(),
@@ -730,7 +850,6 @@ fn encode_zero_or_value(value: Option<u64>) -> Vec<u8> {
         Some(v) => format!("{}\n", v).into_bytes(),
         None => b"0\n".to_vec(),
     }
-
 }
 fn parse_max_u64(input: &str) -> Result<Option<u64>, SystemError> {
     let trimmed = input.trim();
@@ -822,4 +941,38 @@ fn memory_swap_events() -> Vec<u8> {
 
 fn is_populated(cgroup: &Arc<CgroupNode>) -> bool {
     cgroup.has_tasks() || cgroup.subtree_task_counter().load(Ordering::Acquire) > 0
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn knob_encode_decode_matches_linux_show_write() {
+        // show（v6.6 cgroup.c:3527/3570）：usize::MAX ⇒ "max"，否则十进制。
+        assert_eq!(encode_hierarchy_limit(usize::MAX), b"max\n".to_vec());
+        assert_eq!(encode_hierarchy_limit(64), b"64\n".to_vec());
+        // write（cgroup.c:3540/3583）："max" ⇒ 无限制；kstrtoint base 0：
+        // 0x ⇒ 16 进制、前导 0 ⇒ 8 进制。
+        assert_eq!(parse_hierarchy_limit("max\n"), Ok(usize::MAX));
+        assert_eq!(parse_hierarchy_limit("  64 "), Ok(64));
+        assert_eq!(parse_hierarchy_limit("0x10"), Ok(16));
+        assert_eq!(parse_hierarchy_limit("010"), Ok(8));
+        // 显式负值 ERANGE（"-0" 数值为 0，Linux 接受）。
+        assert_eq!(parse_hierarchy_limit("-1"), Err(SystemError::ERANGE));
+        assert_eq!(parse_hierarchy_limit("-0"), Ok(0));
+        // 格式非法 EINVAL；超出 int 可表达范围 ERANGE；
+        // Linux 的 INT_MAX 哨兵等价映射回 "max"。
+        assert_eq!(parse_hierarchy_limit("abc"), Err(SystemError::EINVAL));
+        assert_eq!(
+            parse_hierarchy_limit("2147483648"),
+            Err(SystemError::ERANGE)
+        );
+        assert_eq!(parse_hierarchy_limit("2147483647"), Ok(usize::MAX));
+        // 合法数字但超出 u64：溢出（ERANGE）而非格式错（EINVAL）。
+        assert_eq!(
+            parse_hierarchy_limit("18446744073709551616"),
+            Err(SystemError::ERANGE)
+        );
+    }
 }

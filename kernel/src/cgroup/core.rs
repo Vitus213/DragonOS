@@ -126,11 +126,17 @@ fn is_threaded_type(ty: CgroupType) -> bool {
 }
 
 fn has_threaded_descendant(node: &CgroupNode) -> bool {
-    node.children().into_iter().any(|child| {
-        is_threaded_type(child.cgroup_type())
+    // 迭代式 worklist 遍历（#39 递归定界）：深树下不再按深度消耗内核栈。
+    let mut pending: Vec<Arc<CgroupNode>> = node.children();
+    while let Some(child) = pending.pop() {
+        if is_threaded_type(child.cgroup_type())
             || child.cgroup_type() == CgroupType::DomainThreaded
-            || has_threaded_descendant(&child)
-    })
+        {
+            return true;
+        }
+        pending.extend(child.children());
+    }
+    false
 }
 
 fn refresh_domain_state(node: &CgroupNode) {
@@ -140,6 +146,56 @@ fn refresh_domain_state(node: &CgroupNode) {
     if node.cgroup_type() == CgroupType::DomainThreaded && !has_threaded_descendant(node) {
         *node.type_state.write() = CgroupType::Domain;
     }
+}
+
+/// mkdir 层级限制检查所需的单层快照（对应 Linux 6.6 `cgroup_check_hierarchy_limits`
+/// 每层读取的三个字段，v6.6 cgroup.c:5699-5718）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HierarchyLimitInput {
+    /// 该层已有的子树可见后代总数
+    pub nr_descendants: usize,
+    /// 该层的 cgroup.max.depth（usize::MAX == "max"）
+    pub max_depth: usize,
+    /// 该层的 cgroup.max.descendants（usize::MAX == "max"）
+    pub max_descendants: usize,
+}
+
+/// 层级越限的种类（两者在 Linux 里共用同一 errno，区分仅为日志/测试可读性）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HierarchyLimitBreach {
+    /// 新子组的相对深度超过某祖先的 max.depth
+    Depth,
+    /// 某祖先的 nr_descendants 已达其 max.descendants
+    Descendants,
+}
+
+/// `cgroup_mkdir` 越限判定的纯函数层（#39）：`chain` 自 parent 起向 root 排列，
+/// 新子组相对深度 level 从 1 起算，逐层先查后代数、再查深度，与 Linux
+/// v6.6 cgroup.c:5706-5713 的循环顺序一致；越限调用方返回 EAGAIN
+/// （cgroup.c:5736-5737，非 EMLINK）。usize::MAX 默认值天然放行（对齐
+/// `init_cgroup_housekeeping` 的 INT_MAX，cgroup.c:2000-2001）。
+pub fn hierarchy_limits_breach(chain: &[HierarchyLimitInput]) -> Option<HierarchyLimitBreach> {
+    for (index, node) in chain.iter().enumerate() {
+        let level = index + 1;
+        if node.nr_descendants >= node.max_descendants {
+            return Some(HierarchyLimitBreach::Descendants);
+        }
+        if level > node.max_depth {
+            return Some(HierarchyLimitBreach::Depth);
+        }
+    }
+    None
+}
+
+/// mkdir 事务入口（#39）：`create_child` 在 accounting lock 内调用本函数，
+/// 越限即返回 Linux `cgroup_mkdir` 同款 errno——`-EAGAIN`
+/// （v6.6 cgroup.c:5736-5737 实码，非 EMLINK）。单独成函数是为了让
+/// "越限 ⇒ 预期 errno"可被单元测试直接断言。
+pub fn check_hierarchy_limits_for_mkdir(chain: &[HierarchyLimitInput]) -> Result<(), SystemError> {
+    if hierarchy_limits_breach(chain).is_some() {
+        return Err(SystemError::EAGAIN_OR_EWOULDBLOCK);
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -158,6 +214,15 @@ pub struct CgroupNode {
     css_set: Arc<CssSetToken>,
     /// 全局任务计数（pids 控制器用）
     subtree_task_counter: AtomicUsize,
+    /// 子树可见后代总数（对应 Linux `cgrp->nr_descendants`，v6.6 cgroup.c
+    /// 沿祖先链增删；DragonOS rmdir 同步彻底删除、无 dying 态，
+    /// 故无 nr_dying_descendants 对应物，见 AUDIT_FIXES.md issue #39 节）
+    nr_descendants: AtomicUsize,
+    /// `cgroup.max.depth`：本节点之下允许的最大下降深度
+    /// （usize::MAX == "max"，对齐 Linux init_cgroup_housekeeping 的 INT_MAX 默认）
+    max_depth: AtomicUsize,
+    /// `cgroup.max.descendants`：本节点之下允许的最大后代数（usize::MAX == "max"）
+    max_descendants: AtomicUsize,
     device_bpf: RwLock<DeviceBpfState>,
 }
 
@@ -189,6 +254,9 @@ impl CgroupNode {
             type_state: RwLock::new(CgroupType::Domain),
             css_set: CssSetToken::new(1),
             subtree_task_counter: AtomicUsize::new(0),
+            nr_descendants: AtomicUsize::new(0),
+            max_depth: AtomicUsize::new(usize::MAX),
+            max_descendants: AtomicUsize::new(usize::MAX),
             device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
     }
@@ -213,6 +281,9 @@ impl CgroupNode {
             type_state: RwLock::new(type_state),
             css_set: CssSetToken::new(id),
             subtree_task_counter: AtomicUsize::new(0),
+            nr_descendants: AtomicUsize::new(0),
+            max_depth: AtomicUsize::new(usize::MAX),
+            max_descendants: AtomicUsize::new(usize::MAX),
             device_bpf: RwLock::new(DeviceBpfState::empty()),
         })
     }
@@ -431,18 +502,89 @@ impl CgroupNode {
         *self.subtree_control.write() = controllers;
     }
 
+    // ==================== 层级限制 knobs（cgroup.max.depth / cgroup.max.descendants）====================
+
+    /// 子树可见后代总数（对应 Linux `cgrp->nr_descendants`）
+    pub fn nr_descendants(&self) -> usize {
+        self.nr_descendants.load(Ordering::Acquire)
+    }
+
+    /// 读取本节点 `cgroup.max.depth`（usize::MAX == "max"）
+    pub fn max_depth(&self) -> usize {
+        self.max_depth.load(Ordering::Acquire)
+    }
+
+    /// 写入本节点 `cgroup.max.depth`
+    pub fn set_max_depth(&self, value: usize) {
+        self.max_depth.store(value, Ordering::Release);
+    }
+
+    /// 读取本节点 `cgroup.max.descendants`（usize::MAX == "max"）
+    pub fn max_descendants(&self) -> usize {
+        self.max_descendants.load(Ordering::Acquire)
+    }
+
+    /// 写入本节点 `cgroup.max.descendants`
+    pub fn set_max_descendants(&self, value: usize) {
+        self.max_descendants.store(value, Ordering::Release);
+    }
+
+    /// 收集**含自身在内**向 root 的逐层限制快照（mkdir 检查链，对齐
+    /// `cgroup_check_hierarchy_limits` 的 `for (cgroup = parent; ...)` 走向：
+    /// parent 是链上第 1 层，即新子组的相对深度 level=1）。
+    /// 只在 mkdir/rmdir 事务（structure+accounting 锁内）调用，无分配压力。
+    fn hierarchy_limit_chain_to_root(&self) -> Vec<HierarchyLimitInput> {
+        let mut chain = vec![HierarchyLimitInput {
+            nr_descendants: self.nr_descendants(),
+            max_depth: self.max_depth(),
+            max_descendants: self.max_descendants(),
+        }];
+        let mut current = self.parent();
+        while let Some(node) = current {
+            chain.push(HierarchyLimitInput {
+                nr_descendants: node.nr_descendants(),
+                max_depth: node.max_depth(),
+                max_descendants: node.max_descendants(),
+            });
+            current = node.parent();
+        }
+        chain
+    }
+
+    /// 后代挂接/摘除的祖先链计数（对应 v6.6 cgroup.c:5645-5649 创建路径与
+    /// cgroup.c:5930-5932 销毁路径的 `nr_descendants` 部分；DragonOS 无
+    /// dying 态，省略 `nr_dying_descendants`，见 AUDIT_FIXES.md）。
+    /// 与 Linux 一致，作用于**该节点自身及其全部祖先**（不含新子组自己），
+    /// 调用者持 accounting lock，mkdir 检查与计数同临界区、无窗口。
+    fn shift_descendant_counters(&self, added: bool) {
+        if added {
+            self.nr_descendants.fetch_add(1, Ordering::AcqRel);
+        } else {
+            // 与 #29 的 pids/subtree 计数一致走共享 saturating_sub：单次
+            // 失配不翻转 usize::MAX，rmdir 全部在 accounting 锁内，饱和
+            // 语义仅作纵深防御。
+            saturating_sub(&self.nr_descendants);
+        }
+        let mut current = self.parent();
+        while let Some(node) = current {
+            if added {
+                node.nr_descendants.fetch_add(1, Ordering::AcqRel);
+            } else {
+                saturating_sub(&node.nr_descendants);
+            }
+            current = node.parent();
+        }
+    }
 
     pub fn subtree_task_counter(&self) -> &AtomicUsize {
         &self.subtree_task_counter
     }
-
     pub fn subtree_task_count(&self) -> usize {
         self.tasks
             .read()
             .len()
             .saturating_add(self.subtree_task_counter.load(Ordering::Acquire))
     }
-
 
     pub fn is_ancestor_of(self: &Arc<Self>, other: &Arc<Self>) -> bool {
         if Arc::ptr_eq(self, other) {
@@ -461,7 +603,7 @@ impl CgroupNode {
     }
 
     // ==================== Pids 控制器辅助方法 ====================
-    
+
     /// 获取 pids.max（通过 css 访问）
     pub fn pids_max(&self) -> Option<usize> {
         self.css(CgroupSubsysId::Pids).and_then(|css| {
@@ -496,8 +638,10 @@ impl CgroupNode {
     /// 增加 pids.events max（fork 失败时调用）
     pub fn inc_pids_events_max(&self) {
         if let Some(css) = self.css(CgroupSubsysId::Pids) {
-            if let Some(state) = css.as_any()
-                .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>() {
+            if let Some(state) = css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::pids::PidsCgroupState>()
+            {
                 state.inc_events_max();
             }
         }
@@ -542,11 +686,7 @@ impl CgroupNode {
     ///
     /// Linux 将迁移视为组织操作，不受 `pids.max` 阻塞；因此目标计数
     /// 必须无条件增加，不能在更新任务归属后再执行可能失败的 charge。
-    pub fn transfer_pids_charge(
-        src: &Arc<CgroupNode>,
-        dst: &Arc<CgroupNode>,
-        count: usize,
-    ) {
+    pub fn transfer_pids_charge(src: &Arc<CgroupNode>, dst: &Arc<CgroupNode>, count: usize) {
         src.uncharge_pids(count);
         if let Some(css) = dst.css(CgroupSubsysId::Pids) {
             if let Some(state) = css
@@ -559,10 +699,7 @@ impl CgroupNode {
             }
         }
     }
-    pub fn set_pids_max(
-        &self,
-        max: Option<usize>,
-    ) -> Result<(), SystemError> {
+    pub fn set_pids_max(&self, max: Option<usize>) -> Result<(), SystemError> {
         let css = self.css(CgroupSubsysId::Pids).ok_or(SystemError::ENOENT)?;
         let state = css
             .as_any()
@@ -581,11 +718,7 @@ impl CgroupNode {
         state.set_shares(weight)
     }
 
-    pub fn set_cpu_max(
-        &self,
-        quota: Option<u64>,
-        period_us: u64,
-    ) -> Result<(), SystemError> {
+    pub fn set_cpu_max(&self, quota: Option<u64>, period_us: u64) -> Result<(), SystemError> {
         let css = self.css(CgroupSubsysId::Cpu).ok_or(SystemError::ENOENT)?;
         let state = css
             .as_any()
@@ -598,7 +731,9 @@ impl CgroupNode {
         &self,
         f: impl FnOnce(&crate::cgroup::controllers::memory::MemoryCss) -> Result<R, SystemError>,
     ) -> Result<R, SystemError> {
-        let css = self.css(CgroupSubsysId::Memory).ok_or(SystemError::ENOENT)?;
+        let css = self
+            .css(CgroupSubsysId::Memory)
+            .ok_or(SystemError::ENOENT)?;
         let state = css
             .as_any()
             .downcast_ref::<crate::cgroup::controllers::memory::MemoryCss>()
@@ -645,7 +780,6 @@ impl CgroupNode {
             .unwrap_or((None, 100_000))
     }
 
-
     /// Apply the complete effective chain to one device operation. Linux does
     /// not short-circuit this chain when a program denies access.
     pub fn allows_device_access(&self, access: DeviceAccess) -> bool {
@@ -658,7 +792,6 @@ impl CgroupNode {
         }
         allowed
     }
-
 
     /// Get whether this cgroup itself requested freezing, for cgroup.freeze.
     /// 获取有效冻结请求（包括祖先传播的请求）。
@@ -684,12 +817,14 @@ impl CgroupNode {
             }
         }
         false
-
     }
     /// 设置 freeze 请求
     pub fn set_freeze_requested(&self, freeze: bool) {
         if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
-            if let Some(freezer) = freezer_css.as_any().downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>() {
+            if let Some(freezer) = freezer_css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>(
+            ) {
                 let _ = freezer.set_freeze_requested(freeze);
             }
         }
@@ -702,8 +837,8 @@ impl CgroupNode {
         if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
             if let Some(freezer) = freezer_css
                 .as_any()
-                .downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>()
-            {
+                .downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>(
+            ) {
                 return freezer.is_frozen();
             }
         }
@@ -781,10 +916,16 @@ impl CgroupRoot {
             return Ok(existing.clone());
         }
 
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         // Freeze requests and CSS publication share the accounting lock so a
         // child cannot miss an ancestor freeze racing with mkdir.
         let _accounting_guard = cgroup_accounting_lock().lock();
+        // cgroup.max.depth / cgroup.max.descendants 越限检查（#39）：与 Linux
+        // cgroup_mkdir 在 cgroup_lock 内调用 cgroup_check_hierarchy_limits
+        // 相同，本卡在 accounting lock 内先验 parent→root 的逐层限额，
+        // 越限返回 EAGAIN（v6.6 cgroup.c:5736-5737 实码，非 EMLINK）。
+        // 检查通过后才消耗 id、发布节点，失败路径零副作用。
+        check_hierarchy_limits_for_mkdir(&parent.hierarchy_limit_chain_to_root())?;
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let child = CgroupNode::new_child(id, name.to_string(), parent);
         Self::initialize_css(&child, Some(parent))?;
         child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();
@@ -792,7 +933,9 @@ impl CgroupRoot {
             .children
             .write()
             .insert(name.to_string(), child.clone());
-
+        // 检查通过、节点已发布：沿祖先链登记后代计数（对齐 v6.6
+        // cgroup.c:5645-5649 创建路径）。
+        parent.shift_descendant_counters(true);
         self.all_nodes.lock().insert(id, child.clone());
         Ok(child)
     }
@@ -840,6 +983,11 @@ impl CgroupRoot {
 
         let removed_child = parent.children.write().remove_entry(name);
         let removed = self.all_nodes.lock().remove(&child.id());
+        // 子节点已从 children 表与在线注册表摘除（同一 accounting 临界区内）：
+        // 沿祖先链（含 parent 自身，不含被删子组）归还后代计数，对齐
+        // v6.6 cgroup.c:5930-5932 销毁路径的 nr_descendants--（DragonOS 无
+        // dying 态，省略 nr_dying_descendants++，见 AUDIT_FIXES.md）。
+        parent.shift_descendant_counters(false);
         // 最后一个 threaded 子节点移除后，父节点需要从 DomainThreaded 回退到
         // Domain（对应 Linux cgroup_rmwb 之后的域状态重算），否则 cgroup.type
         // 卡在 "domain threaded"，后续 mkdir 会继承错误的类型。
@@ -1509,6 +1657,154 @@ mod tests {
         saturating_sub(&counter);
         saturating_sub(&counter);
         assert_eq!(counter.load(Ordering::Acquire), 0);
+    }
+
+    // ==================== #39 cgroup.max.depth / cgroup.max.descendants ====================
+
+    fn unlimited_layer() -> HierarchyLimitInput {
+        HierarchyLimitInput {
+            nr_descendants: 0,
+            max_depth: usize::MAX,
+            max_descendants: usize::MAX,
+        }
+    }
+
+    #[test]
+    fn hierarchy_limits_default_max_admits_arbitrary_depth() {
+        // 默认（对齐 Linux init_cgroup_housekeeping 的 INT_MAX）：任意深度放行。
+        let chain = vec![unlimited_layer(); 512];
+        assert_eq!(hierarchy_limits_breach(&chain), None);
+    }
+
+    #[test]
+    fn hierarchy_limits_breach_on_max_depth() {
+        // root max_depth=2：新子组在 root 之下的下降深度 = 链上该层的
+        // index+1。parent→root 两级链（下降深度 2）合法；三级链（深度 3）越限。
+        let mut root = unlimited_layer();
+        root.max_depth = 2;
+        let ok = vec![unlimited_layer(), root];
+        assert_eq!(hierarchy_limits_breach(&ok), None);
+        let too_deep = vec![unlimited_layer(), unlimited_layer(), root];
+        assert_eq!(
+            hierarchy_limits_breach(&too_deep),
+            Some(HierarchyLimitBreach::Depth)
+        );
+    }
+
+    #[test]
+    fn hierarchy_limits_breach_on_max_descendants() {
+        // 某祖先 nr_descendants 已达 max_descendants ⇒ Descendants 越限，
+        // 与 Linux `nr_descendants >= max_descendants` 的 >= 边界一致。
+        let mut tight = unlimited_layer();
+        tight.nr_descendants = 1000;
+        tight.max_descendants = 1000;
+        let chain = vec![unlimited_layer(), tight];
+        assert_eq!(
+            hierarchy_limits_breach(&chain),
+            Some(HierarchyLimitBreach::Descendants)
+        );
+        let room = HierarchyLimitInput {
+            nr_descendants: 999,
+            ..tight
+        };
+        assert_eq!(hierarchy_limits_breach(&[unlimited_layer(), room]), None);
+    }
+
+    #[test]
+    fn hierarchy_limit_violation_maps_to_eagain_like_linux_mkdir() {
+        // SOP：超深 mkdir 返回预期 errno。Linux v6.6 cgroup.c:5736-5737 对
+        // cgroup_check_hierarchy_limits 失败返回 -EAGAIN；本卡 create_child
+        // 经同一 gate 返回 EAGAIN_OR_EWOULDBLOCK（值 11 == EAGAIN）。
+        let mut root = unlimited_layer();
+        root.max_depth = 1;
+        assert_eq!(
+            check_hierarchy_limits_for_mkdir(&[unlimited_layer(), root]),
+            Err(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        );
+        // 未越限（parent 自身 max_depth=1，深度恰为 1）放行。
+        let mut parent = unlimited_layer();
+        parent.max_depth = 1;
+        assert_eq!(check_hierarchy_limits_for_mkdir(&[parent]), Ok(()));
+    }
+
+    #[test]
+    fn mkdir_transaction_enforces_max_depth_with_eagain() {
+        // SOP：超深 mkdir 返回预期 errno（Linux v6.6 cgroup.c:5736 EAGAIN）。
+        // root max_depth=2：第 3 层失败且零副作用——children 表不含新名、
+        // nr_descendants 不动。
+        let root_obj = CgroupRoot::new();
+        let root = root_obj.root();
+        root.set_max_depth(2);
+        let a = root_obj.create_child(&root, "a").expect("depth 1 ok");
+        let b = root_obj.create_child(&a, "b").expect("depth 2 ok");
+        assert_eq!(
+            root_obj.create_child(&b, "c").err(),
+            Some(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        );
+        assert!(b.children_names().is_empty());
+        assert_eq!(root.nr_descendants(), 2);
+        assert_eq!(a.nr_descendants(), 1);
+        // 复位 max 后同层 mkdir 放行（写路径 "max" 语义的节点侧对应）。
+        root.set_max_depth(usize::MAX);
+        assert!(root_obj.create_child(&b, "c").is_ok());
+    }
+
+    #[test]
+    fn mkdir_enforces_max_descendants_and_rmdir_restores_budget() {
+        // root max_descendants=3：第 4 个后代 EAGAIN；rmdir 沿祖先链归还
+        // 计数（cgroup.c:5930-5932）后 mkdir 重新放行。
+        let root_obj = CgroupRoot::new();
+        let root = root_obj.root();
+        root.set_max_descendants(3);
+        let a = root_obj.create_child(&root, "a").expect("1");
+        let _b = root_obj.create_child(&root, "b").expect("2");
+        let c = root_obj.create_child(&root, "c").expect("3");
+        assert_eq!(root.nr_descendants(), 3);
+        assert_eq!(
+            root_obj.create_child(&root, "d").err(),
+            Some(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        );
+        // 嵌套孙组同样占用祖先预算：a 之下建子组时 root 已 3/3 ⇒ EAGAIN。
+        assert_eq!(
+            root_obj.create_child(&a, "x").err(),
+            Some(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        );
+        root_obj.remove_child(&root, "c", &c).expect("rmdir c");
+        assert_eq!(root.nr_descendants(), 2);
+        let d = root_obj.create_child(&root, "d").expect("budget freed");
+        assert_eq!(root.nr_descendants(), 3);
+        // rmdir 不存在的名字不减计数。
+        let missing = CgroupNode::new_child(999, "ghost".to_string(), &a);
+        assert!(root_obj.remove_child(&root, "d", &missing).is_err());
+        assert_eq!(root.nr_descendants(), 3);
+        root_obj.remove_child(&root, "d", &d).expect("cleanup d");
+        assert_eq!(a.nr_descendants(), 0);
+    }
+
+    #[test]
+    fn nested_ancestor_limits_are_enforced_per_subtree() {
+        // Linux 语义：knobs 约束各自子树、检查链自 parent 向 root 逐层。
+        // 中间层 a max_depth=1：a 之下第 2 层孙组 EAGAIN，即使 root 不限。
+        let root_obj = CgroupRoot::new();
+        let root = root_obj.root();
+        let a = root_obj.create_child(&root, "a").expect("a");
+        let b = root_obj.create_child(&a, "b").expect("b (a 的第 1 层)");
+        a.set_max_depth(1);
+        assert_eq!(
+            root_obj.create_child(&b, "c").err(),
+            Some(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        );
+        // root 的兄弟预算（max_descendants=2，当前 root 已有 2 个后代）：
+        // a 之下新增孙组不影响 root 的 direct children 数，但占用
+        // root.nr_descendants —— 收紧 root 预算后立即拦截。
+        a.set_max_depth(usize::MAX);
+        assert!(root_obj.create_child(&b, "c").is_ok());
+        assert_eq!(root.nr_descendants(), 3);
+        root.set_max_descendants(2);
+        assert_eq!(
+            root_obj.create_child(&b, "d").err(),
+            Some(SystemError::EAGAIN_OR_EWOULDBLOCK)
+        );
     }
 
     /// 类型 vet→写入在 accounting 锁内串行后，与迁移方（write_procs/

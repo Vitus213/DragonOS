@@ -140,49 +140,61 @@ impl FreezerCss {
         let Some(cgroup) = self.cgroup.upgrade() else {
             return false;
         };
-        self.freeze_requested()
-            && self.nr_frozen_total() == cgroup.subtree_task_count()
-
+        self.freeze_requested() && self.nr_frozen_total() == cgroup.subtree_task_count()
     }
     /// 冻结本组任务并向全部后代传播 FREEZING_PARENT。
     /// 调用者必须持有 cgroup_accounting_lock，且本组 mask 刚从 0 变为非 0。
+    ///
+    /// #39 递归定界：旧实现 `freeze_tasks ↔ propagate_parent_freezing`
+    /// 沿树深互递归，超深树按深度消耗内核栈；改为显式 worklist，语义
+    /// 逐点保持——子组 mask 原为 0 才置 FREEZING_PARENT、冻结本组并继续
+    /// 其子树（即原 `propagate_parent_freezing` 的 `old != 0` 短路）。
     fn freeze_tasks(&self, cgroup: &Arc<CgroupNode>) -> Result<(), SystemError> {
-        for pid in cgroup.tasks() {
-            if let Some(task) = ProcessManager::find(pid) {
-                self.freeze_task(&task)?;
-            }
-        }
-        for child in cgroup.children() {
+        self.freeze_group_tasks(cgroup)?;
+        let mut pending: Vec<Arc<CgroupNode>> = cgroup.children();
+        while let Some(child) = pending.pop() {
             let Some(css) = child.css(CgroupSubsysId::Freezer) else {
                 continue;
             };
             let Some(child_freezer) = css.as_any().downcast_ref::<FreezerCss>() else {
                 continue;
             };
-            child_freezer.propagate_parent_freezing();
+            if child_freezer.mark_parent_freezing() {
+                // 原 `let _ = self.freeze_tasks(...)`：子组错误只截断其自身
+                // 子树的继续下探，不回抛给传播循环——逐点保持。
+                if child_freezer.freeze_group_tasks(&child).is_ok() {
+                    pending.extend(child.children());
+                }
+            }
         }
         Ok(())
     }
 
-    /// 祖先发起冻结：置 FREEZING_PARENT 并冻结本子树。
-    fn propagate_parent_freezing(&self) {
-        let old = self.freeze_mask.fetch_or(FREEZING_PARENT, Ordering::AcqRel);
-        if old != 0 {
-            return;
+    /// 冻结单个组内的直属任务（后代由调用方 worklist 继续处理）。
+    fn freeze_group_tasks(&self, cgroup: &Arc<CgroupNode>) -> Result<(), SystemError> {
+        for pid in cgroup.tasks() {
+            if let Some(task) = ProcessManager::find(pid) {
+                self.freeze_task(&task)?;
+            }
         }
-        let Some(cgroup) = self.cgroup.upgrade() else {
-            return;
-        };
-        let _ = self.freeze_tasks(&cgroup);
+        Ok(())
     }
 
+    /// 置 FREEZING_PARENT；返回 mask 是否原为 0（首次进入冻结请求态）。
+    fn mark_parent_freezing(&self) -> bool {
+        let old = self.freeze_mask.fetch_or(FREEZING_PARENT, Ordering::AcqRel);
+        old == 0
+    }
 
     /// Request the scheduler to enter the refrigerator at a safe boundary.
     ///
     /// 锁序：task_lock（freezer）→ pi_lock（任务）。pi_lock 与 wakeup() 串行化
     /// FROZEN 置位与唤醒检查，关闭“冻结途中被唤醒逃逸”的窗口。
     fn freeze_task(&self, task: &Arc<ProcessControlBlock>) -> Result<(), SystemError> {
-        if task.flags().intersects(ProcessFlags::KTHREAD | ProcessFlags::NOFREEZE) {
+        if task
+            .flags()
+            .intersects(ProcessFlags::KTHREAD | ProcessFlags::NOFREEZE)
+        {
             return Ok(());
         }
 
@@ -221,39 +233,51 @@ impl FreezerCss {
 
     /// 解冻本组任务并向后代清除 FREEZING_PARENT（SELF 仍在的后代保持冻结）。
     /// 调用者必须持有 cgroup_accounting_lock，且本组 mask 刚变为 0。
+    ///
+    /// #39 递归定界：旧实现 `unfreeze_tasks ↔ retract_parent_freezing`
+    /// 沿树深互递归；改为显式 worklist，逐点保持原短路语义——仅当子组
+    /// 的 FREEZING_PARENT 被清除后不再有任何冻结请求（原判定
+    /// `old & (SELF|PARENT) == PARENT`）才解冻该组并继续下传。
     fn unfreeze_tasks(&self, cgroup: &Arc<CgroupNode>) -> Result<(), SystemError> {
-        for pid in cgroup.tasks() {
-            if let Some(task) = ProcessManager::find(pid) {
-                self.unfreeze_task(&task)?;
-            }
-        }
-        for child in cgroup.children() {
+        self.unfreeze_group_tasks(cgroup)?;
+        let mut pending: Vec<Arc<CgroupNode>> = cgroup.children();
+        while let Some(child) = pending.pop() {
             let Some(css) = child.css(CgroupSubsysId::Freezer) else {
                 continue;
             };
             let Some(child_freezer) = css.as_any().downcast_ref::<FreezerCss>() else {
                 continue;
             };
-            child_freezer.retract_parent_freezing();
+            if child_freezer.retract_parent_freezing() {
+                // 同冻结侧：解冻错误不回抛，仅截断该子树继续下探。
+                if child_freezer.unfreeze_group_tasks(&child).is_ok() {
+                    pending.extend(child.children());
+                }
+            }
         }
         Ok(())
     }
 
-    /// 祖先解冻：清除 FREEZING_PARENT；若本组不再有任何冻结请求则解冻本子树。
-    fn retract_parent_freezing(&self) {
+    /// 解冻单个组内的直属任务（后代由调用方 worklist 继续处理）。
+    fn unfreeze_group_tasks(&self, cgroup: &Arc<CgroupNode>) -> Result<(), SystemError> {
+        for pid in cgroup.tasks() {
+            if let Some(task) = ProcessManager::find(pid) {
+                self.unfreeze_task(&task)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 祖先解冻：清除 FREEZING_PARENT；返回 true 表示本组冻结请求就此
+    /// 消失（SELF 不在场、PARENT 被撤），调用方应解冻本组并继续下传；
+    /// false 表示 SELF 仍在或本来就没冻结，状态不变（对应原
+    /// `retract_parent_freezing` 的 early-return）。
+    fn retract_parent_freezing(&self) -> bool {
         let old = self
             .freeze_mask
             .fetch_and(!FREEZING_PARENT, Ordering::AcqRel);
-        if old & (FREEZING_SELF | FREEZING_PARENT) != FREEZING_PARENT {
-            // SELF 仍在（本组自己要求冻结）或本来就没冻结：状态不变。
-            return;
-        }
-        let Some(cgroup) = self.cgroup.upgrade() else {
-            return;
-        };
-        let _ = self.unfreeze_tasks(&cgroup);
+        old & (FREEZING_SELF | FREEZING_PARENT) == FREEZING_PARENT
     }
-
 
     /// Clear freezer flags and wake tasks blocked by the refrigerator or with
     /// a wakeup saved while frozen (Linux saved-wakeup semantics).
@@ -273,8 +297,9 @@ impl FreezerCss {
             let (was_wakeable, saved_wakeup) = {
                 let _pi = task.sched_info().pi_lock_irqsave();
                 let saved_wakeup = task.flags().contains(ProcessFlags::WAKE_PENDING);
-                task.flags()
-                    .remove(ProcessFlags::FROZEN | ProcessFlags::FREEZING | ProcessFlags::WAKE_PENDING);
+                task.flags().remove(
+                    ProcessFlags::FROZEN | ProcessFlags::FREEZING | ProcessFlags::WAKE_PENDING,
+                );
                 let pid = task.raw_pid();
                 (self.take_wakeable(pid), saved_wakeup)
             };
@@ -321,27 +346,30 @@ impl FreezerCss {
         let Some(cgroup) = self.cgroup.upgrade() else {
             return;
         };
-        let Some(parent) = cgroup.parent() else {
-            return;
-        };
-        if let Some(css) = parent.css(CgroupSubsysId::Freezer) {
-            if let Some(parent_css) = css.as_any().downcast_ref::<FreezerCss>() {
-                if delta > 0 {
-                    parent_css
-                        .nr_frozen_descendants
-                        .fetch_add(delta as usize, Ordering::AcqRel);
-                } else {
-                    parent_css
-                        .nr_frozen_descendants
-                        .fetch_update(
-                            Ordering::AcqRel,
-                            Ordering::Acquire,
-                            |count| Some(count.saturating_sub((-delta) as usize)),
-                        )
-                        .ok();
-                }
-                parent_css.update_ancestor_counts(delta);
+        // #39 递归定界：上溯祖先链的尾递归改为循环。逐级累加/回退
+        // 冻结后代计数，访问序与更新点和原递归实现逐次相同；
+        // CSS 缺失时同样停止（对应原 `if let` 不再下传）。
+        let mut current = cgroup.parent();
+        while let Some(node) = current {
+            let Some(css) = node.css(CgroupSubsysId::Freezer) else {
+                break;
+            };
+            let Some(parent_css) = css.as_any().downcast_ref::<FreezerCss>() else {
+                break;
+            };
+            if delta > 0 {
+                parent_css
+                    .nr_frozen_descendants
+                    .fetch_add(delta as usize, Ordering::AcqRel);
+            } else {
+                parent_css
+                    .nr_frozen_descendants
+                    .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                        Some(count.saturating_sub((-delta) as usize))
+                    })
+                    .ok();
             }
+            current = node.parent();
         }
     }
 }
@@ -372,10 +400,7 @@ impl CgroupSubsysState for FreezerCss {
         *self.flags.lock() = flags;
     }
 
-    fn can_attach(
-        &self,
-        _tasks: &[Arc<ProcessControlBlock>],
-    ) -> Result<(), SystemError> {
+    fn can_attach(&self, _tasks: &[Arc<ProcessControlBlock>]) -> Result<(), SystemError> {
         // Linux 6.6 的 freezer 对迁移没有任何限制（无 can_attach 回调）：
         // 任务换组时的冻结/解冻调整由迁移核心在换组点直接调用
         // cgroup_freezer_migrate_task() 完成。
@@ -504,7 +529,10 @@ pub fn __refrigerator(task: &Arc<ProcessControlBlock>) -> bool {
         return false;
     }
 
-    if task.flags().intersects(ProcessFlags::KTHREAD | ProcessFlags::NOFREEZE) {
+    if task
+        .flags()
+        .intersects(ProcessFlags::KTHREAD | ProcessFlags::NOFREEZE)
+    {
         task.flags().remove(ProcessFlags::FREEZING);
         return false;
     }
@@ -585,10 +613,7 @@ fn thaw_wake(task: &Arc<ProcessControlBlock>) {
     // 此时入队会与其 dequeue 路径竞争，造成 runnable 任务掉出运行队列。
     task.sched_info().wait_until_not_running();
 
-    let was_uninterruptible = matches!(
-        task.sched_info().state(),
-        ProcessState::Blocked(false)
-    );
+    let was_uninterruptible = matches!(task.sched_info().state(), ProcessState::Blocked(false));
     if !task.sched_info().state().is_blocked() {
         return;
     }
@@ -605,12 +630,7 @@ fn thaw_wake(task: &Arc<ProcessControlBlock>) {
     task.sched_info().set_state(ProcessState::Runnable);
     if *task.sched_info().on_rq.lock_irqsave() == OnRq::None {
         if let Some(cpu) = task.sched_info().on_cpu() {
-            enqueue_task_on_cpu(
-                task,
-                cpu,
-                WakeupFlags::empty(),
-                was_uninterruptible,
-            );
+            enqueue_task_on_cpu(task, cpu, WakeupFlags::empty(), was_uninterruptible);
         }
     }
 }
@@ -635,7 +655,10 @@ pub fn cgroup_freezer_migrate_task(
     dst: &Arc<CgroupNode>,
 ) {
     // 内核线程不允许冻结（对应 Linux 的 PF_KTHREAD 检查）。
-    if task.flags().intersects(ProcessFlags::KTHREAD | ProcessFlags::NOFREEZE) {
+    if task
+        .flags()
+        .intersects(ProcessFlags::KTHREAD | ProcessFlags::NOFREEZE)
+    {
         return;
     }
 
