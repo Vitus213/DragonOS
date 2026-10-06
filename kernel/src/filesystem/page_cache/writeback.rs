@@ -1077,7 +1077,14 @@ impl PageCacheBackend for AsyncPageCacheBackend {
         let inode = self.inode.clone();
         let page = page.clone();
         let waiter_cb = waiter.clone();
+        // 归属在调用方（调度者）上下文解析：调用点要么是发起缺页/预读的任
+        // 务，要么是已安装脏主覆写的回写/预读工作线程（`current_io_cgroup`
+        // 覆写优先），因此这一跳工作线程不会丢失 I/O 归属。
+        let io_owner = super::current_block_io_owner();
         let work = Work::new(move || {
+            let _owner_guard = io_owner
+                .as_ref()
+                .map(|owner| crate::driver::base::block::blkcg::set_io_owner(owner.clone()));
             let inode = match inode.upgrade() {
                 Some(inode) => inode,
                 None => {
@@ -1099,7 +1106,14 @@ impl PageCacheBackend for AsyncPageCacheBackend {
         let inode = self.inode.clone();
         let page = page.clone();
         let waiter_cb = waiter.clone();
+        // 同 `read_page_async`：单页异步写回派发（如脏页直写路径）在调用方
+        // 解析归属，`pagecache-wb` 工作线程内安装覆写，落盘字节按脏属主排队
+        // 并计入其 io.stat，而不是恒为零限速的根组工作线程。
+        let io_owner = super::current_block_io_owner();
         let work = Work::new(move || {
+            let _owner_guard = io_owner
+                .as_ref()
+                .map(|owner| crate::driver::base::block::blkcg::set_io_owner(owner.clone()));
             let inode = match inode.upgrade() {
                 Some(inode) => inode,
                 None => {

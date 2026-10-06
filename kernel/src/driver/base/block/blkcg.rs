@@ -117,23 +117,6 @@ pub fn account_io_for(cgroup: &Arc<CgroupNode>, device: DeviceNumber, write: boo
     account_io(cgroup, io_device_key(device), write, bytes);
 }
 
-/// Throttle an explicit cgroup (and its ancestors) before dispatch.
-///
-/// For callers which already hold the owner identity and do not run under a
-/// [`set_io_owner`] override; device numbers are converted with the same key
-/// rule as every other enforcement point.
-pub fn throttle_for(
-    cgroup: &Arc<CgroupNode>,
-    device: DeviceNumber,
-    write: bool,
-    bytes: usize,
-) -> Result<(), SystemError> {
-    if !any_io_limits_configured() {
-        return Ok(());
-    }
-    throttle_io(cgroup, io_device_key(device), write, bytes)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
