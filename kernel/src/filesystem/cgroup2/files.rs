@@ -32,6 +32,7 @@ pub(super) enum CgroupCoreFile {
     MemoryMax,
     MemoryEvents,
     MemoryStat,
+    MemoryOomGroup,
     MemorySwapCurrent,
     MemorySwapPeak,
     MemorySwapHigh,
@@ -144,7 +145,7 @@ const CPU_FILE_SPECS: [CgroupFileSpec; 2] = [
     },
 ];
 
-const MEMORY_FILE_SPECS: [CgroupFileSpec; 13] = [
+const MEMORY_FILE_SPECS: [CgroupFileSpec; 14] = [
     CgroupFileSpec {
         name: "memory.current",
         ty: CgroupCoreFile::MemoryCurrent,
@@ -200,6 +201,13 @@ const MEMORY_FILE_SPECS: [CgroupFileSpec; 13] = [
         init: b"",
         mode: 0o444,
         visibility: CgroupFileVisibility::All,
+    },
+    CgroupFileSpec {
+        name: "memory.oom.group",
+        ty: CgroupCoreFile::MemoryOomGroup,
+        init: b"0\n",
+        mode: 0o644,
+        visibility: CgroupFileVisibility::NotOnRoot,
     },
     CgroupFileSpec {
         name: "memory.swap.current",
@@ -416,6 +424,9 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         CgroupCoreFile::MemoryMax => memory_bytes(cgroup, |memory| encode_max_u64(memory.max())),
         CgroupCoreFile::MemoryEvents => memory_bytes(cgroup, |memory| memory.events().into_bytes()),
         CgroupCoreFile::MemoryStat => memory_bytes(cgroup, |memory| memory.stat().into_bytes()),
+        CgroupCoreFile::MemoryOomGroup => memory_bytes(cgroup, |memory| {
+            format!("{}\n", memory.oom_group() as u8).into_bytes()
+        }),
         CgroupCoreFile::MemorySwapCurrent => memory_bytes(cgroup, |memory| {
             format!("{}\n", memory.swap_current()).into_bytes()
         }),
@@ -527,6 +538,11 @@ pub(super) fn write_controller_file(
                 _ => unreachable!(),
             }
             Ok(encode_max_u64(value))
+        }
+        CgroupCoreFile::MemoryOomGroup => {
+            let enabled = crate::cgroup::controllers::memory::parse_oom_group_value(input)?;
+            cgroup.set_memory_oom_group(enabled)?;
+            Ok(format!("{}\n", enabled as u8).into_bytes())
         }
         CgroupCoreFile::PidsMax => {
             let new_limit = parse_pids_max(input)?;

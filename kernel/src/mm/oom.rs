@@ -92,7 +92,7 @@ struct OomCandidate {
     oom_score_adj: i16,
 }
 
-const OOM_SCORE_ADJ_MIN: i16 = -1000;
+pub(crate) const OOM_SCORE_ADJ_MIN: i16 = -1000;
 
 /// scoped OOM「触发者不可杀且组内无可杀受害者」时的等待上界（毫秒）。
 /// Linux `mem_cgroup_oom_synchronize()` 是无界 TASK_KILLABLE 等待；
@@ -593,6 +593,7 @@ fn out_of_memory_loop(
     scope: Option<&Arc<CgroupNode>>,
     select: &mut dyn FnMut() -> Option<OomCandidate>,
     no_victim: &mut dyn FnMut(u64) -> OomOutcome,
+    on_kill: &mut dyn FnMut(Option<RawPid>),
 ) -> OomOutcome {
     loop {
         if current_is_killed_or_exiting() {
@@ -626,6 +627,7 @@ fn out_of_memory_loop(
             Ok(killed_tgid) => {
                 if let Some(killed_tgid) = killed_tgid {
                     count_oom_kill();
+                    on_kill(Some(killed_tgid));
                     error!(
                         "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}",
                         ctx.trigger_pid,
@@ -676,17 +678,23 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
     if let Some(outcome) = super::memcg::drain_pending_memcg_oom(ctx) {
         return outcome;
     }
-    out_of_memory_loop(ctx, None, &mut select_victim, &mut |generation| {
-        finish_selection_for(generation);
-        error!(
-            "oom: no victim for trigger pid={} tgid={} addr={:#x} ip={:#x}",
-            ctx.trigger_pid,
-            ctx.trigger_tgid,
-            ctx.fault_address.data(),
-            ctx.fault_ip
-        );
-        OomOutcome::NoVictim
-    })
+    out_of_memory_loop(
+        ctx,
+        None,
+        &mut select_victim,
+        &mut |generation| {
+            finish_selection_for(generation);
+            error!(
+                "oom: no victim for trigger pid={} tgid={} addr={:#x} ip={:#x}",
+                ctx.trigger_pid,
+                ctx.trigger_tgid,
+                ctx.fault_address.data(),
+                ctx.fault_ip
+            );
+            OomOutcome::NoVictim
+        },
+        &mut |_| {},
+    )
 }
 
 /// Cgroup-scoped OOM（`memory.max`，issue #27）：受害者只能来自越限子树。
@@ -700,12 +708,19 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
 ///    组外任务（含 pid 复用者、组外 mm 共享者）绝不会被击杀。
 ///
 /// 组内选不出受害者时**绝不**逃逸为全局选择（[`scoped_no_victim`]）。
-pub fn scoped_out_of_memory(ctx: OomContext, scope: Arc<CgroupNode>) -> OomOutcome {
+/// `on_kill` 每次成功击杀携受害者 tgid 回调一次（issue #37），让 memcg
+/// 调用方计 `oom_kill` 事件并执行 `memory.oom.group` 的组子树清理。
+pub fn scoped_out_of_memory(
+    ctx: OomContext,
+    scope: Arc<CgroupNode>,
+    on_kill: &mut dyn FnMut(Option<RawPid>),
+) -> OomOutcome {
     out_of_memory_loop(
         ctx,
         Some(&scope),
         &mut || select_scoped_victim(&scope),
         &mut |generation| scoped_no_victim(ctx, &scope, generation),
+        on_kill,
     )
 }
 

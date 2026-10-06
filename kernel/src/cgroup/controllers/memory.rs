@@ -2,7 +2,8 @@
 ///
 /// 实现 cgroup v2 内存控制，包括：
 /// - memory.current/peak/min/low/high/max：用量与限额
-/// - memory.events：OOM/low/high/max/oom_kill 事件计数
+/// - memory.events：low/high/max/oom/oom_kill/oom_group_kill 事件计数
+/// - memory.oom.group：0/1；置位时 memory.max 越限 OOM 清理整组子树
 /// - memory.stat：详细统计信息
 /// - memory.swap.current/max/peak/events：swap 用量与限额
 ///
@@ -541,6 +542,57 @@ impl MemoryCss {
         )
     }
 
+    /// 读取 memory.oom.group（Linux: `memcg->oom_group`）
+    pub fn oom_group(&self) -> bool {
+        self.inner.lock_irqsave().oom_group
+    }
+
+    /// 设置 memory.oom.group（Linux: `memory_oom_group_write`）
+    pub fn set_oom_group(&self, enabled: bool) -> Result<(), SystemError> {
+        self.inner.lock_irqsave().oom_group = enabled;
+        Ok(())
+    }
+
+    /// `memory.oom.group` 事件计数。对应 Linux 的 MEMCG_OOM_GROUP_KILL：
+    /// 一次越限 OOM 触发整组清理时递增一次（而不是每个被杀任务一次）。
+    pub(crate) fn note_memcg_oom_group_kill(&self) {
+        self.inner
+            .lock_irqsave()
+            .events
+            .oom_group_kill
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 对应 Linux `mem_cgroup_get_oom_group` 的层级遍历：从 victim 的 memory
+    /// CSS 沿父链向上，直到（并包含）OOM 域 CSS `domain` 为止，返回路径上
+    /// **最高一层**置位 `memory.oom.group` 的 CSS；没有任何一层置位则返回
+    /// `None`。若 victim 的链在到达 `domain` 前就终止（victim 已迁出越限
+    /// 子树），与 Linux 相同忽略 `memory.oom.group`，避免误杀域外任务。
+    /// 根 CSS 在 cgroup2 文件面上不暴露 memory.oom.group（NotOnRoot），
+    /// 因此遍历域内的置位者必然属于用户子树。
+    pub(crate) fn find_oom_group(
+        victim: &Arc<dyn CgroupSubsysState>,
+        domain: &Arc<dyn CgroupSubsysState>,
+    ) -> Option<Arc<dyn CgroupSubsysState>> {
+        let mut found: Option<Arc<dyn CgroupSubsysState>> = None;
+        let mut current = Some(victim.clone());
+        while let Some(css) = current {
+            if css
+                .as_any()
+                .downcast_ref::<MemoryCss>()
+                .is_some_and(|memcg| memcg.oom_group())
+            {
+                // 持续向上覆盖，留下的即最高层置位者。
+                found = Some(css.clone());
+            }
+            if Arc::ptr_eq(&css, domain) {
+                return found;
+            }
+            current = css.parent();
+        }
+        None
+    }
+
     /// 读取 memory.stat（简化版）
     pub fn stat(&self) -> String {
         let inner = self.inner.lock_irqsave();
@@ -706,6 +758,10 @@ impl CgroupSubsys for MemoryController {
             CfType::new("memory.stat")
                 .with_read(memory_stat_read)
                 .with_flags(CfTypeFlags::new()),
+            CfType::new("memory.oom.group")
+                .with_read(memory_oom_group_read)
+                .with_write(memory_oom_group_write)
+                .with_flags(CfTypeFlags::new()),
         ]
     }
 }
@@ -830,6 +886,33 @@ fn memory_max_write(css: &Arc<dyn CgroupSubsysState>, buf: &str) -> Result<(), S
         Some(trimmed.parse::<u64>().map_err(|_| SystemError::EINVAL)?)
     };
     mem.set_max(bytes)
+}
+
+/// 解析 memory.oom.group 的写入值。对应 Linux
+/// `memory_oom_group_write`：`kstrtoint` 后仅接受 0/1，其它一律 -EINVAL。
+pub fn parse_oom_group_value(buf: &str) -> Result<bool, SystemError> {
+    match buf.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(SystemError::EINVAL),
+    }
+}
+
+fn memory_oom_group_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemError> {
+    let mem = css
+        .as_any()
+        .downcast_ref::<MemoryCss>()
+        .ok_or(SystemError::EINVAL)?;
+    Ok(format!("{}\n", mem.oom_group() as u8))
+}
+
+fn memory_oom_group_write(css: &Arc<dyn CgroupSubsysState>, buf: &str) -> Result<(), SystemError> {
+    let mem = css
+        .as_any()
+        .downcast_ref::<MemoryCss>()
+        .ok_or(SystemError::EINVAL)?;
+    let enabled = parse_oom_group_value(buf)?;
+    mem.set_oom_group(enabled)
 }
 
 fn memory_events_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemError> {
