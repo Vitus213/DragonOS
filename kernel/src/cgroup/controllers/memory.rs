@@ -2,7 +2,8 @@
 ///
 /// 实现 cgroup v2 内存控制，包括：
 /// - memory.current/peak/min/low/high/max：用量与限额
-/// - memory.events：OOM/low/high/max/oom_kill 事件计数
+/// - memory.events：low/high/max/oom/oom_kill/oom_group_kill 事件计数
+/// - memory.oom.group：0/1；置位时 memory.max 越限 OOM 清理整组子树
 /// - memory.stat：详细统计信息
 /// - memory.swap.current/max/peak/events：swap 用量与限额
 ///
@@ -541,6 +542,17 @@ impl MemoryCss {
         )
     }
 
+    /// 读取 memory.oom.group（Linux: `memcg->oom_group`）
+    pub fn oom_group(&self) -> bool {
+        self.inner.lock_irqsave().oom_group
+    }
+
+    /// 设置 memory.oom.group（Linux: `memory_oom_group_write`）
+    pub fn set_oom_group(&self, enabled: bool) -> Result<(), SystemError> {
+        self.inner.lock_irqsave().oom_group = enabled;
+        Ok(())
+    }
+
     /// 读取 memory.stat（简化版）
     pub fn stat(&self) -> String {
         let inner = self.inner.lock_irqsave();
@@ -706,6 +718,10 @@ impl CgroupSubsys for MemoryController {
             CfType::new("memory.stat")
                 .with_read(memory_stat_read)
                 .with_flags(CfTypeFlags::new()),
+            CfType::new("memory.oom.group")
+                .with_read(memory_oom_group_read)
+                .with_write(memory_oom_group_write)
+                .with_flags(CfTypeFlags::new()),
         ]
     }
 }
@@ -830,6 +846,33 @@ fn memory_max_write(css: &Arc<dyn CgroupSubsysState>, buf: &str) -> Result<(), S
         Some(trimmed.parse::<u64>().map_err(|_| SystemError::EINVAL)?)
     };
     mem.set_max(bytes)
+}
+
+/// 解析 memory.oom.group 的写入值。对应 Linux
+/// `memory_oom_group_write`：`kstrtoint` 后仅接受 0/1，其它一律 -EINVAL。
+pub fn parse_oom_group_value(buf: &str) -> Result<bool, SystemError> {
+    match buf.trim() {
+        "0" => Ok(false),
+        "1" => Ok(true),
+        _ => Err(SystemError::EINVAL),
+    }
+}
+
+fn memory_oom_group_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemError> {
+    let mem = css
+        .as_any()
+        .downcast_ref::<MemoryCss>()
+        .ok_or(SystemError::EINVAL)?;
+    Ok(format!("{}\n", mem.oom_group() as u8))
+}
+
+fn memory_oom_group_write(css: &Arc<dyn CgroupSubsysState>, buf: &str) -> Result<(), SystemError> {
+    let mem = css
+        .as_any()
+        .downcast_ref::<MemoryCss>()
+        .ok_or(SystemError::EINVAL)?;
+    let enabled = parse_oom_group_value(buf)?;
+    mem.set_oom_group(enabled)
 }
 
 fn memory_events_read(css: &Arc<dyn CgroupSubsysState>) -> Result<String, SystemError> {

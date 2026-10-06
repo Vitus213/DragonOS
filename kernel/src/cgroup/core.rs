@@ -614,6 +614,12 @@ impl CgroupNode {
     pub fn set_memory_swap_max(&self, value: Option<u64>) -> Result<(), SystemError> {
         self.with_memory_css(|state| state.set_swap_max(value))
     }
+
+    /// 设置 memory.oom.group（Linux: `memory_oom_group_write` 的节点侧入口）
+    pub fn set_memory_oom_group(&self, enabled: bool) -> Result<(), SystemError> {
+        self.with_memory_css(|state| state.set_oom_group(enabled))
+    }
+
     pub fn cpu_bandwidth(&self) -> (Option<u64>, u64) {
         self.css(CgroupSubsysId::Cpu)
             .and_then(|css| {
