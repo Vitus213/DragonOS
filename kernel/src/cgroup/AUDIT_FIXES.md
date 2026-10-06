@@ -47,3 +47,23 @@ Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 1
   链不含 memcg 锁（全序图与逐交叉点论证：`kernel/src/cgroup/LOCK_ORDER.md`）。
 - 验证：`make kernel ARCH=x86_64` 通过；`take_owner_runs` 纯函数宿主
   单测 6 例全绿（摘取归并/缝隙/钳制/满批续扫收敛/边界不越批）。
+
+## issue #32 — __refrigerator 信号逃逸（计数虚增 + FROZEN 残留吞唤醒）
+
+- `__refrigerator()` 引入纯裁决 `classify_refrigerator_entry()`：FROZEN 位、
+  nr_frozen_tasks、wakeable 登记三者只在裁决完成的转移里于同一 pi_lock
+  临界区一落账——Runnable→EnterBlocked（转冰箱阻塞态+登记 wakeable）、
+  Blocked→EnterInPlace（状态原样、唤醒归原事件）、Stopped/Exited→Defer
+  （不置位不计数，FREEZING 留待下轮收敛）。旧实现对已睡眠任务先置 FROZEN、
+  无条件计数并返回 true 而状态不动，随后被 `signal_pending_state` 抬回
+  Runnable：计数虚增使 `is_frozen()` 谎报冻结完成，残留 FROZEN 把之后
+  每次 wakeup 吞成 WAKE_PENDING 挂死到解冻。
+- 冻结态不可被信号恢复（Linux TASK_FROZEN 无唤醒位的等价收口）三守卫：
+  `__schedule()` signal_wake 加 `!FROZEN`；`undo_mark_sleep()` 对
+  Blocked+FROZEN 改置 WAKE_PENDING 暂存（不再抬回 Runnable）；wakeup()
+  原有 FROZEN 暂存语义保持不变，由解冻路径（unfreeze_task/迁移解冻）重放。
+- 计数不变式：FROZEN ⟺ 已计数 ⟺ 处于阻塞集合，构造性成立；解冻/迁移/exit
+  清理对"从未入冰箱的任务"幂等（dec 只随 FROZEN、标志全清、双次解冻早退）。
+- 验证：`make kernel ARCH=x86_64` 通过（worktree@aa81b900 基线）；裁决
+  函数宿主切片单测 4 例全绿；旧行为复现模型（缺陷 3 断言全命中）与修复后
+  收敛/幂等模型（8 场景断言）见 issue #32 步骤评论。
