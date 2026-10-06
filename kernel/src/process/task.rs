@@ -144,6 +144,12 @@ pub struct ProcessControlBlock {
     pub(super) nsproxy: RcuOptionArcSlot<NsProxy>,
     /// The cgroup (v2) this task belongs to.
     pub(super) task_cgroup: RwLock<TaskCgroupRef>,
+    /// Linux `current->blkcg_css` 的对应物：任务级块 I/O 归属覆写。内核侧
+    /// 派发者（pagecache 回写/预读工作线程、回收线程）在处理"别人"的脏页时
+    /// 安装它，使 io.max 限速与 io.stat 记账跟随 I/O 的真实属主，而不是恰好
+    /// 跑这段代码的工作线程。`None` 表示"用 `task_cgroup`"。
+    /// 经 RCU 发布：完成路径可能在别的上下文替换它时读取。
+    pub(super) blkcg_owner: RcuOptionArcSlot<CgroupNode>,
 
     pub(super) sem_undo: SpinLock<Option<SemUndoAttachment>>,
 
@@ -555,6 +561,7 @@ impl ProcessControlBlock {
                 preempt_count,
                 pagefault_disabled,
                 rcu_read_depth,
+                blkcg_owner: RcuOptionArcSlot::new_none(),
                 srcu_task_state: SpinLock::new(SrcuTaskState::new()),
                 tracepoint_srcu_depth: AtomicUsize::new(0),
                 srcu_callback_domain: AtomicU64::new(0),
@@ -2078,6 +2085,24 @@ impl ProcessControlBlock {
 
     pub fn task_cgroup_node(&self) -> Arc<CgroupNode> {
         self.task_cgroup.read().node()
+    }
+    /// 读取本任务的块 I/O 归属覆写（Linux `cur->blkcg_css` 的对应物）。
+    /// `None` 表示块限速与 io.stat 记账使用 `task_cgroup`。
+    pub fn blkcg_owner_override(&self) -> Option<Arc<CgroupNode>> {
+        self.blkcg_owner.load()
+    }
+
+    /// 安装/清除块 I/O 归属覆写，返回旧值以便嵌套恢复。
+    ///
+    /// 只在派发上下文的入口处成对使用（见 `blkcg::set_io_owner`），因此同一
+    /// 任务内不会有两个写者竞争这个槽位；跨任务的读侧由 RCU 保证生命周期。
+    pub fn set_blkcg_owner_override(
+        &self,
+        owner: Option<Arc<CgroupNode>>,
+    ) -> Option<Arc<CgroupNode>> {
+        let previous = self.blkcg_owner.load();
+        self.blkcg_owner.store_deferred(owner);
+        previous
     }
 
     /// Set the cgroup node that this task belongs to.

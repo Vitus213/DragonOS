@@ -744,6 +744,24 @@ impl Drop for PageDirtyReservation {
     }
 }
 
+/// Resolve the block-I/O owner identity of the calling task context.
+///
+/// Used at two kinds of submission points: when a front-end writer publishes
+/// dirty bytes (Linux records this implicitly in `set_page_dirty()` by binding
+/// the folio to the writeback of the dirtying task's blkcg), and when an async
+/// read is scheduled on behalf of the current task. In both cases the identity
+/// must be sampled before any lock or worker handoff, because the task that
+/// eventually dispatches the I/O belongs to a different cgroup. `None` means
+/// "no owner is known" (early boot before the scheduler is up, or a test
+/// fixture that publishes dirty pages directly) and keeps the historical
+/// behaviour of attributing the I/O to the dispatching task.
+fn current_block_io_owner() -> Option<Arc<crate::cgroup::CgroupNode>> {
+    if !crate::process::ProcessManager::initialized() {
+        return None;
+    }
+    Some(crate::driver::base::block::blkcg::current_io_cgroup())
+}
+
 /// A fallibly admitted remote write against one exact attached cache entry.
 ///
 /// The entry pin prevents truncate/invalidate from replacing this incarnation.
@@ -761,6 +779,7 @@ pub(crate) struct PreparedRemotePageDirty {
 
 impl PreparedRemotePageDirty {
     pub(crate) fn publish_before_copy(&mut self, page_locked: &InnerPage) {
+        let dirty_owner = current_block_io_owner();
         let mut inner = self.cache.inner.lock();
         let current = inner
             .get_entry(self.page_index)
@@ -776,6 +795,7 @@ impl PreparedRemotePageDirty {
             self.page_index,
             &current,
             &mut self.reservation,
+            dirty_owner,
         );
     }
 }
@@ -922,6 +942,13 @@ struct PageEntry {
     /// Identity of the current (or most recently completed) Writeback
     /// incarnation. It is published under `InnerPageCache::inner`.
     writeback_incarnation: AtomicU64,
+    /// 脏数据归属：最后一次把本页发布为 Dirty 的任务所属 cgroup。这是 Linux
+    /// `folio->wb_head`/`inode_switch_wbs()`（脏页绑定到写入者的 bdi_writeback）
+    /// 在本项目里的等价物：回写工作线程派发这些数据时必须按脏属主做 io.max
+    /// 限速与 io.stat 记账，而不是按"恰好跑回写的内核线程"（永远属于根组）。
+    /// 与 `dirty_incarnation` 一样由 `InnerPageCache::inner` 串行化：写入只
+    /// 发生在脏发布路径，读取只发生在回写认领路径，二者都持 `inner`。
+    dirty_owner: SpinLock<Option<Arc<crate::cgroup::CgroupNode>>>,
     accounting: AtomicU8,
     accounted_unevictable: AtomicBool,
     active_users: AtomicUsize,
@@ -1229,6 +1256,7 @@ impl PageCacheManager {
             // Retention admission may fail.  Obtain it before copying bytes
             // or exposing either page flag, so a rejected dirty merge cannot
             // leave data/PG_DIRTY visible without dirty-set ownership.
+            let dirty_owner = current_block_io_owner();
             let mut reservation = keep_dirty.then(|| cache.prepare_page_dirty()).transpose()?;
 
             // `prepare_page_dirty()` takes `inner` while this exact page is
@@ -1267,6 +1295,7 @@ impl PageCacheManager {
                     page_index,
                     &current,
                     reservation,
+                    dirty_owner,
                 );
             }
 
@@ -1328,6 +1357,7 @@ impl PageCacheManager {
             // precondition. Do it before PG_DIRTY becomes visible; the
             // reservation is then consumed in the page->inner critical
             // section below.
+            let dirty_owner = current_block_io_owner();
             let mut reservation = cache.prepare_page_dirty()?;
             let mut page_locked = page.write();
             let mut inner = cache.inner.lock();
@@ -1356,6 +1386,7 @@ impl PageCacheManager {
                         page_index,
                         &current,
                         &mut reservation,
+                        dirty_owner,
                     );
                     return Ok(retain_transition
                         .then(|| publication.into_transition(cache.instance_id, &current)));
@@ -1569,6 +1600,7 @@ impl PageEntry {
             dirty_incarnation: AtomicU64::new(0),
             dirty_transition_kind: AtomicU8::new(0),
             writeback_tag: AtomicU64::new(0),
+            dirty_owner: SpinLock::new(None),
             writeback_incarnation: AtomicU64::new(0),
             accounting: AtomicU8::new(PageEntryAccounting::Unaccounted as u8),
             accounted_unevictable: AtomicBool::new(false),
@@ -2702,11 +2734,18 @@ impl PageCache {
         let entry_clone = entry.clone();
         let page = entry.page.clone();
 
+        // 预读的归属在调度者上下文解析（此刻还是发起读的那个任务），工作线程
+        // 执行时再安装覆写，使 io.max 排队与 io.stat 记账跟随发起任务，而不是
+        // 恰好跑预读的 `pagecache-io`/`events` 内核线程（永远在根组）。
+        let io_owner = current_block_io_owner();
         let work_state = Mutex::new(Some(domain_io));
         let work = Work::new(move || {
             let Some(_domain_io) = work_state.lock().take() else {
                 return;
             };
+            let _owner_guard = io_owner
+                .as_ref()
+                .map(|owner| crate::driver::base::block::blkcg::set_io_owner(owner.clone()));
             let read_len = if let Some(backend) = backend.as_ref() {
                 backend.read_page_async(page_index, &page).wait()
             } else if let Some(inode) = inode.as_ref().and_then(|inode| inode.upgrade()) {
@@ -3136,10 +3175,17 @@ impl PageCache {
         dirty_pages: &mut BTreeSet<usize>,
         page_index: usize,
         entry: &Arc<PageEntry>,
+        dirty_owner: Option<Arc<crate::cgroup::CgroupNode>>,
     ) -> PageCacheDirtyPublication {
         let old_state = entry.state();
         let transition = entry.begin_front_dirty_transition(page_index, old_state);
         dirty_pages.insert(page_index);
+        // Only a new dirty lifetime re-binds the owner: a write merged into an
+        // already-dirty page must keep the bytes attributed to the writer that
+        // started this incarnation, so one dirty lifetime is one owner.
+        if matches!(transition, PageCacheDirtyPublication::Started { .. }) {
+            *entry.dirty_owner.lock() = dirty_owner;
+        }
         if old_state != PageState::Writeback {
             entry.account_state_transition(old_state, PageState::Dirty);
             entry.set_state(PageState::Dirty);
@@ -3157,12 +3203,13 @@ impl PageCache {
         page_index: usize,
         entry: &Arc<PageEntry>,
         reservation: &mut PageDirtyReservation,
+        dirty_owner: Option<Arc<crate::cgroup::CgroupNode>>,
     ) -> PageCacheDirtyPublication {
         assert!(reservation.active);
         assert!(inner.dirty_preparations != 0);
         inner.dirty_preparations -= 1;
         reservation.active = false;
-        Self::publish_front_dirty_locked(&mut inner.dirty_pages, page_index, entry)
+        Self::publish_front_dirty_locked(&mut inner.dirty_pages, page_index, entry, dirty_owner)
     }
 
     fn validate_page_locked_entry(
@@ -3175,6 +3222,19 @@ impl PageCache {
         Ok(())
     }
 
+    /// 读取某页当前脏生命周期的块 I/O 归属（见 `PageEntry::dirty_owner`）。
+    /// 页回收等内核侧单页派发路径在写回前调用它安装 `blkcg::set_io_owner`
+    /// 覆写；必须在 `inner` 下读取，与脏发布路径串行化。
+    pub(crate) fn dirty_io_owner(
+        &self,
+        page_index: usize,
+    ) -> Option<Arc<crate::cgroup::CgroupNode>> {
+        let inner = self.inner.lock();
+        inner
+            .get_entry(page_index)
+            .and_then(|entry| entry.dirty_owner.lock().clone())
+    }
+
     /// Mark a page dirty while the caller retains that exact page's write
     /// lock, then return the exact front-end incarnation when it started one.
     /// A future filesystem ticket bridge must retain `Started` rather than
@@ -3184,6 +3244,7 @@ impl PageCache {
         page_index: usize,
         page_locked: &InnerPage,
     ) -> Result<Option<PageCacheDirtyTransition>, SystemError> {
+        let dirty_owner = current_block_io_owner();
         let mut guard = self.inner.lock();
         self.ensure_dirty_retention_locked(&mut guard)?;
         let Some(entry) = guard.get_entry(page_index) else {
@@ -3192,8 +3253,12 @@ impl PageCache {
             return Ok(None);
         };
         Self::validate_page_locked_entry(&entry, page_locked)?;
-        let publication =
-            Self::publish_front_dirty_locked(&mut guard.dirty_pages, page_index, &entry);
+        let publication = Self::publish_front_dirty_locked(
+            &mut guard.dirty_pages,
+            page_index,
+            &entry,
+            dirty_owner,
+        );
         Ok(Some(publication.into_transition(self.instance_id, &entry)))
     }
 
@@ -3204,6 +3269,7 @@ impl PageCache {
         page_index: usize,
         page_locked: &InnerPage,
     ) -> Result<(), SystemError> {
+        let dirty_owner = current_block_io_owner();
         let mut guard = self.inner.lock();
         self.ensure_dirty_retention_locked(&mut guard)?;
         let Some(entry) = guard.get_entry(page_index) else {
@@ -3212,7 +3278,12 @@ impl PageCache {
             return Ok(());
         };
         Self::validate_page_locked_entry(&entry, page_locked)?;
-        let _ = Self::publish_front_dirty_locked(&mut guard.dirty_pages, page_index, &entry);
+        let _ = Self::publish_front_dirty_locked(
+            &mut guard.dirty_pages,
+            page_index,
+            &entry,
+            dirty_owner,
+        );
         Ok(())
     }
 
@@ -3222,6 +3293,7 @@ impl PageCache {
         reservation: &mut PageDirtyReservation,
         page_locked: &InnerPage,
     ) -> Result<Option<PageCacheDirtyTransition>, SystemError> {
+        let dirty_owner = current_block_io_owner();
         let mut guard = self.inner.lock();
         let Some(entry) = guard.get_entry(page_index) else {
             assert!(reservation.active);
@@ -3233,8 +3305,13 @@ impl PageCache {
             return Ok(None);
         };
         Self::validate_page_locked_entry(&entry, page_locked)?;
-        let publication =
-            Self::publish_prepared_front_dirty_locked(&mut guard, page_index, &entry, reservation);
+        let publication = Self::publish_prepared_front_dirty_locked(
+            &mut guard,
+            page_index,
+            &entry,
+            reservation,
+            dirty_owner,
+        );
         Ok(Some(publication.into_transition(self.instance_id, &entry)))
     }
 
@@ -3244,6 +3321,7 @@ impl PageCache {
         reservation: &mut PageDirtyReservation,
         page_locked: &InnerPage,
     ) -> Result<(), SystemError> {
+        let dirty_owner = current_block_io_owner();
         let mut guard = self.inner.lock();
         let Some(entry) = guard.get_entry(page_index) else {
             assert!(reservation.active);
@@ -3255,8 +3333,13 @@ impl PageCache {
             return Ok(());
         };
         Self::validate_page_locked_entry(&entry, page_locked)?;
-        let _ =
-            Self::publish_prepared_front_dirty_locked(&mut guard, page_index, &entry, reservation);
+        let _ = Self::publish_prepared_front_dirty_locked(
+            &mut guard,
+            page_index,
+            &entry,
+            reservation,
+            dirty_owner,
+        );
         Ok(())
     }
 
@@ -3700,6 +3783,7 @@ impl PageCache {
         // Retention is the one PageCache-local fallible precondition. If a
         // later local validation fails, its Drop leaves no hidden dirty
         // lifetime behind and the caller's own RAII reservation can roll back.
+        let dirty_owner = current_block_io_owner();
         let mut dirty_reservation = self.prepare_page_dirty()?;
         let mut page_guard = item.entry.page.write();
 
@@ -3724,6 +3808,7 @@ impl PageCache {
             item.page_index,
             &current,
             &mut dirty_reservation,
+            dirty_owner,
         );
         // A `Started` transition temporarily clones `current.entry`. The
         // callback may drop it immediately, but this cannot be the final
@@ -3777,6 +3862,7 @@ impl PageCache {
 
         let _ = volatile_read!(buf[0]);
         let _ = volatile_read!(buf[buf.len() - 1]);
+        let dirty_owner = current_block_io_owner();
         let mut dirty_reservation = match expected {
             PageCacheExpectedDirtyTransition::Start => Some(self.prepare_page_dirty()?),
             PageCacheExpectedDirtyTransition::Merge(_) => None,
@@ -3820,10 +3906,14 @@ impl PageCache {
                 item.page_index,
                 &current,
                 reservation,
+                dirty_owner,
             ),
-            None => {
-                Self::publish_front_dirty_locked(&mut inner.dirty_pages, item.page_index, &current)
-            }
+            None => Self::publish_front_dirty_locked(
+                &mut inner.dirty_pages,
+                item.page_index,
+                &current,
+                dirty_owner,
+            ),
         };
         on_published(publication.into_transition(self.instance_id, &current));
         copies.rollback = false;

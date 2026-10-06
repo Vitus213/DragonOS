@@ -13,7 +13,7 @@
 - `pids`：`pids.max`、`pids.current`、`pids.events`；fork、退出和迁移执行层级计数，迁移不被 `pids.max` 阻塞。
 - `freezer`：`cgroup.freeze`、`cgroup.events` 和 scheduler refrigerator；queued/current/sleeping 任务的冻结标志、计数和解冻唤醒路径保持幂等。
 - `cpuset`：CPU/memory mask、继承后的 online-aware effective mask、fork/迁移/调度路径约束；affinity 与 effective mask 的空交集返回错误，不扩大用户请求。
-- `io`：`io.max`、`io.weight`、`io.stat`；所有实际块分发/提交路径（GenDisk 读写入口、ext4 适配器 read_block/read_blocks/write_block/write_blocks/submit_ext4_read、MBR 扫描）在设备调用前执行祖先限速，完成后统计；限速为 100ms slice 的周期结算 token 桶（对齐 cpu.max 的 `refresh_period_locked` 与 Linux blk-throttle 的 `throtl_slice`/`throtl_charge_bio`），等待发生在设备表锁之外；ext4 异步读在提交任务上下文限速并捕获 cgroup，由等待方按提交者记账；无任何 io.max 配置时全局计数器为零开销直通。
+- `io`：`io.max`、`io.weight`、`io.stat`；所有实际块分发/提交路径（GenDisk 读写入口、ext4 适配器 read_block/read_blocks/write_block/write_blocks/submit_ext4_read、MBR 扫描）在设备调用前执行祖先限速，完成后统计；限速为 100ms slice 的周期结算 token 桶（对齐 cpu.max 的 `refresh_period_locked` 与 Linux blk-throttle 的 `throtl_slice`/`throtl_charge_bio`），等待发生在设备表锁之外；归属解析集中在 `blkcg::current_io_cgroup`：优先任务级覆写（Linux `kthread_associate_blkcg()` 的等价物 `blkcg::set_io_owner`），否则任务自身 cgroup。异步回写按脏属主归属——页发布为 Dirty 时在写者上下文捕获 cgroup 存入 `PageEntry::dirty_owner`（Linux `inode_switch_wbs()` 把脏页绑定到写者所在 bdi_writeback 的等价物），回写批次认领时聚合出归属、提交派发前安装覆写，因此容器 buffered write 落盘对脏主祖先链排队并计入其 io.stat；页回收单页写回按同一页归属安装覆写；异步读（page cache 预读 work、默认批量读兼容路径）与单页异步派发（`AsyncPageCacheBackend::read_page_async`/`write_page_async` 两跳工作线程）在调度者上下文解析归属、工作线程内安装覆写——后者的调用方既可能是缺页任务也可能是已装脏主覆写的回写线程，覆写沿派发链传递；ext4 原生异步读在提交任务上下文限速并捕获 cgroup，由等待方按提交者记账（`account_io_for`）；无任何 io.max 配置时全局计数器为零开销直通。
 - `cgroup.type`：实现 domain/threaded/domain threaded/domain invalid 的基础状态机；控制器 threaded/domain 组合校验。任务持有每个 cgroup 的 CSS-set token，迁移/fork/exit 维护 token 生命周期。
 
 控制器文件仍由 `filesystem/cgroup2/files.rs` 管理；CSS 的 `dfl_cftypes` 是扩展接口，不是当前文件系统路由的唯一入口。
@@ -35,8 +35,8 @@
 | memory | `memory.oom.group` | real | 0/1 读写（NotOnRoot，对齐 Linux `CFTYPE_NOT_ON_ROOT`）；置位后 `memory.max` 越限 OOM 依 Linux `mem_cgroup_get_oom_group` 沿 victim CSS 链取至越限域为止最高置位层，清理其子树全部 killable 任务并递增 `oom_group_kill`（issue #37） |
 | memory | `memory.events` / `memory.stat` | real | high/max/oom/oom_kill/oom_group_kill 事件计数；RSS 分项统计。`low` 依 Linux 语义仅在回收器识别 per-memcg 保护（`mem_cgroup_below_low` → MEMCG_LOW）时递增；本内核无 per-memcg LRU/回收目标（复用全局回收器，见下方边界条目），`low` 恒为 0 属如实降档，非缺陷遗漏 |
 | memory | `memory.swap.*` | stub | swap 未实现，接口占位（与边界声明一致） |
-| io | `io.max` | real | 100ms slice 周期结算 token 桶；GenDisk/ext4 适配器/MBR 扫描全部分发路径前置限速 |
-| io | `io.stat` | real | 完成时按提交任务捕获的 cgroup 记账 |
+| io | `io.max` | real | 100ms slice 周期结算 token 桶；GenDisk/ext4 适配器/MBR 扫描全部分发路径前置限速；归属经 `blkcg::current_io_cgroup`（脏属主/预读发起者覆写优先，否则执行任务） |
+| io | `io.stat` | real | 完成时按归属 cgroup 记账（提交时捕获或 `blkcg::set_io_owner` 覆写解析；异步回写按脏属主） |
 | io | `io.weight` | real | 权重存储（比例仲裁未接入派发排序） |
 | pids | `pids.max` / `pids.current` / `pids.events` | real | fork can_fork 拦截 + 层级计数 + max 事件 |
 | cpuset | `cpuset.cpus[.effective]` / `cpuset.mems` | real | 继承 + online-aware effective mask；affinity 空交集报错 |
@@ -48,7 +48,7 @@
 - fair/RT 支持边界：`cpu.max` 与 `cpu.weight` 只作用于 fair 调度类；SCHED_RT 任务不参与 CFS 带宽控制（与 Linux CFS bandwidth 仅约束 fair class 一致，RT 由独立的 rt bandwidth 机制管理——DragonOS 中为 `RealtimeScheduler` 的 rq 级 `rt.is_throttled()` 节流，不读 cpu 控制器状态）；`cpu.weight` 写入对非 fair 任务为 no-op；DL 调度类未实现。
 - memory 计费具备祖先 max 原子检查、每帧归属记录（释放方与计费方解耦）和 cgroup 范围 OOM（复用 oom.rs 状态机）；`memory.high` 节流与 `memory.max` OOM 都在缺页路径执行（限 x86_64，见下方架构边界条目），计费路径本身不睡眠不回收。与 Linux 6.6 的剩余差距：无 per-memcg LRU/回收目标（复用全局回收器）、无 charge 迁移（move_charge_at_immigrate）、无 memory.min/low 保护加权、无 swap 实际计费（swap.* 文件仅为接口占位）、slab 对象级记账并入页级计费（无 obj_cgroup）。
 - cgroup memory 执行路径的架构边界：`memcg_handle_over_high()` 与 `pagefault_out_of_memory()` 仅接入 x86_64 缺页路径（arch/x86_64/mm/fault.rs:371/661）。riscv64 计费、每帧归属与 memory.events 计数有效，memory.max 拒绝表现为分配入口同步 ENOMEM、memory.high 依赖后台回收线程，但无 high 节流与 scoped OOM：riscv64 尚无用户态缺页处理（`PAGE_FAULT_ENABLED=false`，trap 对用户态缺页 error+spin、内核态 panic）、无 irqentry_exit 返回环与信号递送（`do_signal_or_restart`=todo），OOM kill 的受害者释放无法收敛；恢复条件为完成 riscv64 缺页/信号/返回用户态移植（Linux 6.6 将 high 节流挂 resume_user_mode_work，返回用户态口径）。loongarch64 页帧分配器仍为 todo，计费未接入。
-- IO 限速在块设备分发前端以同步等待实现（提交任务睡眠到 slice 边界后重查），不是 Linux block layer 的延迟派发队列（throtl_service_queue/pending_timer）与 bio 层分层节流；超大单次传输按“每 slice 首个请求放行”保证前进；io.stat 在完成时记账，无 per-cpu rstat 聚合。
+- IO 限速在块设备分发前端以同步等待实现（提交任务睡眠到 slice 边界后重查），不是 Linux block layer 的延迟派发队列（throtl_service_queue/pending_timer）与 bio 层分层节流；超大单次传输按“每 slice 首个请求放行”保证前进；io.stat 在完成时记账，无 per-cpu rstat 聚合。归属边界的如实声明：异步回写/预读/回收写回及其工作线程内的单页异步再派发已按脏属主或发起者归属（`blkcg::set_io_owner` 任务级覆写，Linux `kthread_associate_blkcg()` 等价物，覆写沿派发链逐级捕获-传递），但混合归属的回写批次取首个已知脏主整批排队/记账（Linux 靠 bdi 拆分回写域天然同主，跨组比例仲裁属 io.weight 非目标）；ext4 journal 与超级块提交等元数据 I/O 由 `ext4_journal`/`ext4_complete` 内核线程派发，Linux 对应机制（`wbc_init_bio` 的元数据归属）要求 journal inode 级脏页记账，本轮未实现，其字节仍按线程归属（根组）；纯 flush/sync 派发（`GenDisk::sync`、`sync_file`、ext4 `flush`）携带 0 数据字节，按 `throttle_at` 的 bytes==0 短路不参与限速，与 Linux `blk-flush` 不计入 io.max 的语义一致；调度器就绪前发布的脏页与测试夹具直接插入的脏页无捕获归属，维持按派发任务归属的旧行为。
 - 本轮审计修复的明确范围：修正 `memory.min/low` 默认值、`cpu.max` quota 下界、freezer 生命周期/迁移/唤醒、memcg 内核分配绕过与 scoped OOM。以下审计项仍未实现，不能以“已支持”描述：`cpu.stat` 父级 rstat 层级聚合（user/system 现场分类已于 issue #36 落地）、`io.weight` 仲裁及 `io.stat` 层级聚合、cpuset 用户 affinity 在迁移后的独立恢复与 `cpuset.mems` NUMA 放置、`write_procs` 多控制器失败回滚；原因分别是块设备公平队列、任务 affinity 双掩码、NUMA 分配器和迁移事务尚未存在。
 - CSS-set token 是每个 cgroup 的稳定生命周期标识，不是 Linux 完整的跨 cgroup CSS 集合哈希去重；threaded 状态机覆盖基础文件语义，未实现完整 threaded domain CSS 传播。
 - freezer 已避免直接伪造唤醒已有 sleeper，但尚未覆盖 Linux job-control freezer 的全部信号/停机交互。
