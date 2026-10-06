@@ -144,3 +144,42 @@ Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 1
 - 验证：`make kernel ARCH=x86_64` 通过；6 个 cfg(test) 单测随树编译
   （交集语义/提交门控/串行化）；逻辑切片宿主实测全绿（kernel libtest
   本机不可运行的定界见 issue #33）。
+
+## issue #38 — write_procs 迁移事务化（cancel_attach 接入 + pids 计数预演-回退）
+
+- 缺陷：`inode.rs` 迁移路径逐控制器整组 `can_attach` 后进入**逐任务**提交
+  循环（`set_task_cgroup_node` + `cgroup_freezer_migrate_task`），提交/收尾
+  阶段任何中断或后续钩子失败都不回退已完成部分——同一线程组分属两组，
+  成员表/pids 计数/freezer 队列各劈一半；`subsys.rs` 的 `cancel_attach`
+  钩子从迁移路径永不调用（死代码）。基线把 pids 层级计数搬运内联在换组
+  点（`CgroupNode::transfer_pids_charge`），计数随逐任务循环逐个生效，
+  等价于"效果无回退路径"。Linux 6.6 `cgroup_migrate_execute` 是
+  all-or-none：预演段任一 subsys `can_attach(tset)` 失败即跳到
+  out_cancel_attach 对前序 subsys 调 `cancel_attach(tset)`（pids 的
+  预搬计数由 `pids_cancel_attach` 整批搬回），全部通过才
+  `css_set_move_task` 提交 + `attach`。
+- 整改：`core.rs` 新增 `cgroup_migrate_precheck`（逐控制器整组预演；
+  失败对已完整执行的前序控制器逐个 `cancel_attach` 后传播错误；成功返回
+  前序集合）与 `cgroup_migrate_commit`（提交点：整组切归属 + 换组点
+  freezer 迁移，不可失败）；`cgroup_migrate_execute` 串起
+  预演→提交→attach 三段，`write_procs` 尾部改调事务（vet 仍在调用方，
+  对齐 Linux `cgroup_attach_task` 先 vet_dst 再 migrate 的顺序）。
+  trait 签名不变；`subsys.rs` 仅钩子文档更新。
+- pids 计数改挂事务钩子：`can_attach` = `precharge_migration` 逐任务无条件
+  预搬层级计数（`pids_charge(dst)+pids_uncharge(src)`，对应 Linux
+  `pids_can_attach`；组织迁移不受 `pids.max` 阻塞），预演内部第 idx 个
+  任务源组缺 Pids css 时先自撤前 idx 个已施加的搬运再报错（Linux
+  `pids_try_charge` 失败 revert 循环同构）；`cancel_attach` =
+  `revert_migration` 与预演严格互逆。删除死代码
+  `PidsCgroupState::can_attach(count)`（与 Linux 相反的 max 门形态）与
+  `CgroupNode::transfer_pids_charge`；`task.rs::set_task_cgroup_node`
+  只搬成员表与 css 引用（对应 `css_set_move_task`），fork 路径计费不受影响。
+- 定性说明（与 Linux 一致的瞬态窗口）：预演成功到失败方触发 cancel 之间，
+  dst 各级计数已含预搬值、src 已扣减——该窗口与 Linux
+  `pids_can_attach`/`pids_cancel_attach` 之间的窗口同形，全程处于
+  `cgroup_accounting_lock` 临界区内，无观察者可见错位，无需额外加锁。
+- 验证：`make kernel ARCH=x86_64` 通过；在树 pids.rs 迁移事务单测
+  3 例（跨层级预搬-回退互逆 / 预演内前缀自撤 ENOENT / max 不阻塞组织
+  迁移）宿主切片执行全绿；失败回滚与半迁移对照的组成员/freezer 级证明
+  见 issue #38 评论的 before/after 取证用例（before 5 例复现基线缺陷、
+  after 6 例证明回滚，全绿）。

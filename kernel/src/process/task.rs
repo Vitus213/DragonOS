@@ -2124,11 +2124,13 @@ impl ProcessControlBlock {
 
         // Perform the migration without holding the task_cgroup lock; the caller
         // must hold cgroup_accounting_lock to guarantee that visible membership
-        // and pids charging switch together.
+        // switches atomically with the migration transaction.
+        // pids 层级计数的搬运不在这里：对应 Linux css_set_move_task 只搬
+        // css_set 引用，计数由迁移事务的 pids can_attach/cancel_attach
+        // 预演-回退（issue #38），fork 路径则经 charge_pids 计费。
         let pid = self.raw_pid();
         old.remove_task(pid);
         node.add_task(pid);
-        CgroupNode::transfer_pids_charge(&old, &node, 1);
 
         // Use a write lock to update task_cgroup.
         let mut task_cgroup = self.task_cgroup.write();
