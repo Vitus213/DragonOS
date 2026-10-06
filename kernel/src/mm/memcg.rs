@@ -17,6 +17,12 @@
 //!   of which task performs the free.  Task migration (`cgroup.procs`
 //!   write) therefore leaves existing charges with the old memcg and
 //!   only new charges follow the new css_set, matching Linux.
+//! - Ownership is recorded as a *weak* reference plus the owner CSS's
+//!   generation (`node_id`), not a strong `Arc`: a cgroup deleted via
+//!   rmdir must be reclaimable even while its pages are still alive
+//!   (issue #30).  Releasing a frame whose owner CSS is gone uncharges
+//!   nothing — `MemoryCss::css_offline` already rolled the residual
+//!   usage back off the ancestor chain at rmdir time.
 //! - The hook paths never sleep, shrink or kill: they can run under the
 //!   page-manager lock.  The sleeping parts — the `memory.high` throttle
 //!   and the `memory.max` OOM kill — run on the fault path
@@ -59,7 +65,7 @@ use system_error::SystemError;
 use crate::{
     arch::MMArch,
     cgroup::{
-        controllers::memory::MemoryCss,
+        controllers::memory::{ChargeToken, MemoryCss},
         core::CgroupNode,
         subsys::{CgroupSubsysId, CgroupSubsysState},
     },
@@ -83,21 +89,35 @@ const MEMORY_HIGH_MAX_ROUNDS: u32 = 8;
 /// accounting was unavailable (early boot, interrupt context, OOM-victim
 /// bypass) and are never uncharged.
 ///
+/// 归属记录是弱引用令牌（`ChargeToken`：`Weak<CSS>` + 代际号），不是
+/// 强 `Arc`（issue #30）：被 rmdir 的组的 MemoryCss 连同父链必须在
+/// 其最后一个强引用（在线节点 subsys 槽随 `clear_css` 释放）消失后
+/// 即可回收，即使它的页面还长期存活——旧实现每帧强 `Arc` 持有 CSS，
+/// 已删组泄漏正比于已删组数 × 页面存活期。令牌解析失败（CSS 已回收
+/// 或代际不符）时释页跳过结算：对应的 usage 已在 `css_offline` 结算
+/// 回祖先链，再扣即双扣。
+///
 /// 中断纪律（issue #28）：一律 `lock_irqsave()` 获取（获取点共 3 处，
 /// 均在本模块：init、alloc 侧 record、free 侧批摘取循环）；
 /// 临界区内只做槽位 take/填值与 `FREE_RUN_BATCH` 栈批写入，绝不获取
-/// 任何其他锁、绝不分配内存、绝不跨 `uncharge_css` 持有。页帧释放在
+/// 任何其他锁、绝不分配内存、绝不跨 `uncharge_token` 持有。页帧释放在
 /// 硬中断里可达，任何 IRQ-on 持有该锁的窗口都等于把同 CPU 重入死锁
 /// 留给下一次驱动释放。
-static PAGE_OWNERS: SpinLock<Option<Vec<Option<Arc<dyn CgroupSubsysState>>>>> = SpinLock::new(None);
+static PAGE_OWNERS: SpinLock<Option<Vec<Option<ChargeToken>>>> = SpinLock::new(None);
 
-/// Leaf memory CSS of the most recent charge refused by a `memory.max`
-/// limit.  The refusal is retained until the fault path consumes it;
-/// concurrent refusals are serialized instead of overwriting one another.
+/// Leaf memory CSS token of the most recent charge refused by a
+/// `memory.max` limit.  The refusal is retained until the fault path
+/// consumes it; concurrent refusals are serialized instead of
+/// overwriting one another.
+///
+/// issue #30：槽内存弱引用令牌而非强 `Arc<CSS>`——拒绝滞留多久都不
+/// 再钉住 CSS 与其父链；rmdir 时 `css_offline` 主动清除指向本 CSS 的
+/// 槽位（[`memcg_forget_css`]），排水侧对已回收/已拆除的令牌走
+/// fail-closed 分支，绝不再 `expect` panic。
 ///
 /// 中断纪律（issue #28）：与 memcg charge 锁族同级，一律 `lock_irqsave()`；
-/// 锁内只 clone/take 一个 `Option<Arc<dyn CgroupSubsysState>>`，零嵌套。
-static PENDING_MAX_OOM: SpinLock<Option<Arc<dyn CgroupSubsysState>>> = SpinLock::new(None);
+/// 锁内只 clone/take 一个 `Option<ChargeToken>`，零嵌套。
+static PENDING_MAX_OOM: SpinLock<Option<ChargeToken>> = SpinLock::new(None);
 
 /// Size the per-frame ownership map from the physical memory map.
 ///
@@ -120,7 +140,7 @@ pub fn memcg_page_owners_init() {
         return;
     }
 
-    let mut owners: Vec<Option<Arc<dyn CgroupSubsysState>>> = Vec::new();
+    let mut owners: Vec<Option<ChargeToken>> = Vec::new();
     if owners.try_reserve_exact(max_pfn).is_err() {
         log::warn!(
             "memcg: cannot reserve page ownership map for {} frames, accounting disabled",
@@ -177,7 +197,7 @@ pub fn memcg_alloc_charge(start: PhysAddr, pages: u64) -> Result<(), SystemError
 
     match memcg.try_charge(pages) {
         Ok(()) => {
-            record_frame_owners(start, pages, &css);
+            record_frame_owners(start, pages, &ChargeToken::new(&css));
             Ok(())
         }
         Err(err) => {
@@ -185,11 +205,17 @@ pub fn memcg_alloc_charge(start: PhysAddr, pages: u64) -> Result<(), SystemError
             // Later concurrent refusals are coalesced instead of replacing
             // the CSS that identified the active OOM scope.
             //
+            // 竞态协议（issue #30）：存入前先在本锁内复核 offline——
+            // `css_offline` 的拆除序列是"置 offline 位 → 取本锁清
+            // pending → 结算残量"。若本临界区排在清除之前，那次存入
+            // 会被清除带走；若排在之后，offline 位必然可见，本行放弃
+            // 存入——两种交错都不可能在 rmdir 之后留下悬挂 pending。
+            //
             // irqsave 纪律与 memcg 锁族一致（见模块头）：本锁只保护
             // pending 槽，绝不在此临界区获取其他锁。
             let mut pending = PENDING_MAX_OOM.lock_irqsave();
-            if pending.is_none() {
-                *pending = Some(css.clone());
+            if pending.is_none() && !memcg.is_offline() {
+                *pending = Some(ChargeToken::new(&css));
             }
             Err(err)
         }
@@ -205,7 +231,7 @@ pub fn memcg_alloc_charge(start: PhysAddr, pages: u64) -> Result<(), SystemError
 ///    摘取（`slot.take()`）合并成 runs 装入栈上批数组
 ///    （[`take_owner_runs`]）；临界区内零堆分配——分配可能经 slab 补帧
 ///    回调 `LockedFrameAllocator::allocate`/`free` 重进本锁；
-/// 2. 放锁之后逐段调用 [`uncharge_css`] 完成层级 uncharge 事务。
+/// 2. 放锁之后逐段调用 [`uncharge_token`] 完成层级 uncharge 事务。
 ///
 /// 为什么必须"先放锁、再 uncharge"：原实现在持 `PAGE_OWNERS` 期间调用
 /// `uncharge_css → MemoryCss::uncharge → MEMORY_CHARGE_LOCK`，新增了
@@ -229,20 +255,20 @@ pub fn memcg_free_uncharge(start: PhysAddr, pages: u64) {
     let end = first.saturating_add(pages as usize);
     let mut pos = first;
     loop {
-        let mut batch: [(Option<Arc<dyn CgroupSubsysState>>, u64); FREE_RUN_BATCH] =
+        let mut batch: [(Option<ChargeToken>, u64); FREE_RUN_BATCH] =
             core::array::from_fn(|_| (None, 0));
         let (used, resume) = {
             let mut guard = PAGE_OWNERS.lock_irqsave();
             let Some(map) = guard.as_mut() else {
                 return;
             };
-            take_owner_runs(map, pos, end, Arc::ptr_eq, &mut batch)
+            take_owner_runs(map, pos, end, ChargeToken::same_owner, &mut batch)
         };
         // 锁已释放：以下只获取 MEMORY_CHARGE_LOCK 锁族（irqsave），
         // 不再触碰 PAGE_OWNERS。
         for slot in batch.iter_mut().take(used) {
             if let Some(owner) = slot.0.take() {
-                uncharge_css(&owner, slot.1);
+                uncharge_token(&owner, slot.1);
             }
         }
         match resume {
@@ -320,16 +346,24 @@ where
     (count, None)
 }
 
-fn uncharge_css(css: &Arc<dyn CgroupSubsysState>, pages: u64) {
+/// 锁外结算一段归属：令牌解析成功才 uncharge。
+///
+/// `resolve()` 返回 `None`（CSS 已随 rmdir 回收）时跳过——该帧对应
+/// 的计费已在 `css_offline` 结算时回退给祖先链，再扣即双扣；这正是
+/// 弱引用归属与残余结算必须配对出现的原因（issue #30）。
+fn uncharge_token(token: &ChargeToken, pages: u64) {
     if pages == 0 {
         return;
     }
+    let Some(css) = token.resolve() else {
+        return;
+    };
     if let Some(memcg) = css.as_any().downcast_ref::<MemoryCss>() {
         memcg.uncharge(pages);
     }
 }
 
-fn record_frame_owners(start: PhysAddr, pages: u64, owner: &Arc<dyn CgroupSubsysState>) {
+fn record_frame_owners(start: PhysAddr, pages: u64, owner: &ChargeToken) {
     // irqsave 纪律与 free 侧一致（见模块头锁序节）：本临界区在硬中断
     // 可达的分配路径上（free 一定在 IRQ 下可达，allocate 的调用方如
     // 驱动 probe/DMA 同样可能在 IRQ-off 上下文），统一纪律消除同 CPU
@@ -345,6 +379,25 @@ fn record_frame_owners(start: PhysAddr, pages: u64, owner: &Arc<dyn CgroupSubsys
     let last = (first + pages as usize).min(map.len());
     for slot in &mut map[first..last] {
         *slot = Some(owner.clone());
+    }
+}
+
+/// rmdir 拆除点清除 pending OOM 槽（issue #30，`MemoryCss::css_offline`
+/// 调用）。
+///
+/// 比较判据用代际号 `node_id`：每个在线节点恰有一个 MemoryCss，节点
+/// id 在 `CgroupRoot` 内单调递增且永不复用，故 id 相等 ⇔ 槽内令牌与
+/// 本 CSS 同一，不存在跨代际误删；比 `Arc::ptr_eq` 更强的地方在于
+/// 令牌是弱引用，无法从 `&MemoryCss` 现场构造可比较的 `Arc`。
+/// 只清槽、不碰其他锁（irqsave 纪律见模块头）。
+pub fn memcg_forget_css(css: &MemoryCss) {
+    let node_id = css.node_id();
+    let mut pending = PENDING_MAX_OOM.lock_irqsave();
+    if pending
+        .as_ref()
+        .is_some_and(|token| token.node_id() == node_id)
+    {
+        *pending = None;
     }
 }
 
@@ -386,23 +439,42 @@ pub fn memcg_handle_over_high() {
 /// limit was exceeded.
 ///
 /// Returns `Some(outcome)` when the memcg OOM path acted (kill issued and
-/// memory released, or the current task is the victim); `None` lets the
-/// caller fall back to the global OOM path.
+/// memory released, or the current task is the victim; or the refusal is
+/// stale — see the fail-closed branches); `None` lets the caller fall
+/// back to the global OOM path.
+///
+/// fail-closed（issue #30）：pending 是弱引用令牌，指向的 CSS/节点可能
+/// 已被 rmdir 拆除。两条悬挂路径（令牌无法解析、越限 CSS 的节点归属
+/// 已注销）都丢弃 pending 并返回 `Retry`——缺页任务重试自己的分配，
+/// 其计费若仍被在线组拒绝会重新存入**该组自己**的 pending，下一轮
+/// 排水即正常作用域化；绝不会走旧实现的 `expect("cgroup node dropped")`
+/// panic 面。（"越限组无任务时 `return None` 落入全局误杀"由 #27 收口，
+/// 不在本卡范围。）
 pub(crate) fn drain_pending_memcg_oom(
     ctx: crate::mm::oom::OomContext,
 ) -> Option<crate::mm::oom::OomOutcome> {
     use crate::mm::oom::{self, OomOutcome};
 
     // irqsave 纪律（模块头锁序节）：PENDING_MAX_OOM 与 charge 锁族同级。
-    // 守卫在本语句末释放——随后的 find_max_exceeded 在无锁状态下获取
+    // 守卫在本语句末释放——随后的解析与遍历在无锁状态下获取
     // MemoryCss::inner，绝不构成 PENDING → inner 嵌套。
-    let leaf = PENDING_MAX_OOM.lock_irqsave().take()?;
+    let pending = PENDING_MAX_OOM.lock_irqsave().take()?;
+
+    // 令牌可能已随 CSS 回收而失效：拒绝的作用域不存在了，丢弃即可。
+    let Some(leaf) = pending.resolve() else {
+        return Some(OomOutcome::Retry);
+    };
 
     // The refusal may already have been relieved (a kill from another
     // charger, task exits, or a raised limit).
     let exceeded = find_max_exceeded(&leaf)?;
 
-    let pids = collect_subtree_tasks(&exceeded.cgroup());
+    // 越限 CSS 若在解析后被并发 rmdir：节点归属已注销，作用域消失，
+    // 与上面同样丢弃 pending 并让缺页任务重试。
+    let Some(node) = exceeded.cgroup_node() else {
+        return Some(OomOutcome::Retry);
+    };
+    let pids = collect_subtree_tasks(&node);
     if pids.is_empty() {
         return None;
     }

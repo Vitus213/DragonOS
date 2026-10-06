@@ -395,8 +395,12 @@ impl CgroupSubsysState for CpuCss {
         CgroupSubsysId::Cpu
     }
 
-    fn cgroup(&self) -> Arc<CgroupNode> {
-        self.cgroup.upgrade().expect("cpu cgroup dropped")
+    fn cgroup_node(&self) -> Option<Arc<CgroupNode>> {
+        // fail-closed（issue #30）：旧 expect 假定"CSS 存活 ⇒ 节点
+        // 存活"（cpu CSS 仅由在线节点的 subsys 槽强持有），该不变式
+        // 由全树引用拓扑维护、并非局部可证——统一收敛为 Option，
+        // panic 面清零。
+        self.cgroup.upgrade()
     }
 
     fn parent(&self) -> Option<Arc<dyn CgroupSubsysState>> {
