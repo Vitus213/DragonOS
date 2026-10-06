@@ -1274,6 +1274,23 @@ pub(super) struct ClaimedWritebackBatch {
     entries: Vec<(usize, Arc<PageEntry>, Arc<Page>)>,
     guards: Vec<WritebackGuard>,
     data: Vec<u8>,
+    /// 本批脏页的块 I/O 归属（脏发布时捕获的 cgroup，见
+    /// `PageEntry::dirty_owner`）。回写派发在提交前据此安装
+    /// `blkcg::set_io_owner` 覆写，使 io.max 限速与 io.stat 记账跟随脏属主
+    /// 而不是恰好执行回写的 `pagecache-wb` 工作线程。`None` 表示归属未知
+    /// （调度器就绪前的脏页、测试夹具直接插入的脏页），维持旧行为。
+    io_owner: Option<Arc<crate::cgroup::CgroupNode>>,
+}
+
+/// 聚合一批回写页的脏属主：取第一个已知归属。
+///
+/// Linux 按 bdi 拆分回写域，使一次派发天然同属一个 owner；本项目一个批次可能
+/// 混入多个 cgroup 的脏页。取首个归属保证批次内字节按同一 key 排队/记账
+/// （跨组比例仲裁是 io.weight 的非目标范围，见 CONTROLLER_FRAMEWORK.md 的
+/// 边界声明），全批无归属时返回 `None` 以维持"按派发任务归属"的旧行为。
+/// 泛型化只为让选择规则可在宿主机上单测；调用点始终是 `CgroupNode`。
+fn pick_batch_io_owner<T>(owners: impl Iterator<Item = Option<Arc<T>>>) -> Option<Arc<T>> {
+    owners.flatten().next()
 }
 
 #[derive(Clone, Copy)]
@@ -1551,7 +1568,7 @@ impl PageCacheManager {
                 .map_err(|_| SystemError::ENOMEM)?;
         }
 
-        let (first_index, descriptor, submission, writeback_incarnation) = {
+        let (first_index, descriptor, submission, writeback_incarnation, io_owner) = {
             let mut inner = cache.inner.lock();
             if let Some((required_index, required_entry, epoch)) = required_first {
                 let Some(current) = inner.pages.get(&required_index) else {
@@ -1764,11 +1781,20 @@ impl PageCacheManager {
                 ));
                 prepared.push((page_index, entry, page));
             }
+            // 归属在 `inner` 下聚合：脏属主的写入同样由 `inner` 串行化，
+            // 认领与发布不会交错；`flatten().next()` 惰性拉取，命中首个
+            // 已知归属即停，其余临时守卫随表达式立即释放。
+            let io_owner = pick_batch_io_owner(
+                prepared
+                    .iter()
+                    .map(|(_, entry, _)| entry.dirty_owner.lock().clone()),
+            );
             (
                 first_index,
                 claim_descriptor,
                 claim_submission,
                 writeback_incarnation,
+                io_owner,
             )
         };
 
@@ -1798,6 +1824,7 @@ impl PageCacheManager {
             entries: prepared,
             guards,
             data,
+            io_owner,
         }))
     }
 
@@ -1960,6 +1987,14 @@ impl PageCacheManager {
     pub(super) fn submit_writeback_batch(
         mut batch: ClaimedWritebackBatch,
     ) -> Result<WritebackSubmitOutcome, SystemError> {
+        // 回写派发按脏属主归属：在下方三个派发分支（token submission、
+        // legacy write_pages、直接 inode 写）之前安装覆写，`throttle_current_io`
+        // 与 ext4 提交时 `current_io_cgroup` 捕获都会解析到 owner；guard 在
+        // 本函数返回时释放，工作线程不会把归属泄漏给下一个批次。
+        let _owner_guard = batch
+            .io_owner
+            .as_ref()
+            .and_then(|owner| crate::driver::base::block::blkcg::try_set_io_owner(owner));
         let submission = batch.submission.take();
         let submission_cache = batch.cache.clone();
         let submission_epoch = batch.retry_writeback_tag;
@@ -4794,5 +4829,31 @@ impl PageCacheManager {
         Self::dispatch_writeback_incarnation_retries(&cache, &entry, completed_incarnation);
         drop(cache.detach_dirty_retention_if_idle());
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pick_batch_io_owner;
+    use alloc::sync::Arc;
+
+    /// 批次归属聚合规则：跳过无主脏页、取首个已知归属；全批无主时返回
+    /// `None`（维持按派发任务归属的旧行为，测试夹具直接插入的脏页即此情形）。
+    #[test]
+    fn batch_owner_is_first_known_owner_or_none() {
+        let first = Arc::new(1u32);
+        let second = Arc::new(2u32);
+
+        let owners = [Some(first.clone()), Some(second.clone())];
+        let picked = pick_batch_io_owner(owners.iter().cloned());
+        assert!(Arc::ptr_eq(&picked.unwrap(), &first));
+
+        let owners = [None, Some(second.clone())];
+        let picked = pick_batch_io_owner(owners.iter().cloned());
+        assert!(Arc::ptr_eq(&picked.unwrap(), &second));
+
+        let owners = [None, None];
+        assert!(pick_batch_io_owner(owners.iter().cloned()).is_none());
+        assert!(pick_batch_io_owner(core::iter::empty()).is_none());
     }
 }

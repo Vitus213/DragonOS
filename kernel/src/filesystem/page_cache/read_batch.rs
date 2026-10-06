@@ -343,7 +343,12 @@ pub(super) fn submit_default_read_batch<B: PageCacheBackend + ?Sized + 'static>(
     request: PageCacheReadBatchRequest,
     completion: PageCacheReadBatchCompletion,
 ) {
+    // 兼容路径的读页被派给 `events` 工作线程执行；归属必须在调度者（发起读
+    // 的任务）上下文解析，再在工作线程内安装覆写，否则 io.max 排队与
+    // io.stat 记账会落到恰好跑工作线程的内核任务上（根组）。
+    let io_owner = super::current_block_io_owner();
     let work = Work::new(move || {
+        let _owner_guard = io_owner.map(crate::driver::base::block::blkcg::set_io_owner);
         for offset in 0..request.page_count {
             let mut payload = [0u8; MMArch::PAGE_SIZE];
             let page_index = request.start_index + offset;

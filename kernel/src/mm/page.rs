@@ -859,6 +859,14 @@ impl PageReclaimer {
                 return;
             }
             guard.remove_flags(PageFlags::PG_DIRTY);
+            // 回收写回是"替脏属主派发"：认领成功后读回脏发布时捕获的归属
+            // cgroup，安装任务级覆写，使下方 write_page/write_direct 路径上的
+            // io.max 限速与 io.stat 记账按脏属主（及其祖先链）执行，而不是按
+            // 恰好运行回收的 `page_reclaim` 内核线程（永远属于根组）。guard
+            // 在本函数返回时释放。
+            let _io_owner_guard = page_cache
+                .dirty_io_owner(page_index)
+                .map(crate::driver::base::block::blkcg::set_io_owner);
             let data = unsafe {
                 core::slice::from_raw_parts(
                     MMArch::phys_2_virt(paddr).unwrap().data() as *const u8,
