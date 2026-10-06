@@ -553,6 +553,53 @@ impl MemoryCss {
         Ok(())
     }
 
+    /// `memory.oom.group` 事件计数。对应 Linux 的 MEMCG_OOM_GROUP_KILL：
+    /// 一次越限 OOM 触发整组清理时递增一次（而不是每个被杀任务一次）。
+    pub(crate) fn note_memcg_oom_group_kill(&self) {
+        self.inner
+            .lock_irqsave()
+            .events
+            .oom_group_kill
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 非 panic 版 cgroup 节点访问：oom.group 清理运行在缺页 OOM 路径，
+    /// 目标 CSS 的节点可能在扫描窗口内被并发 rmdir 掉，此时放弃本轮清理
+    /// 即可（任务计费仍由 CSS 强引用持有，语义无损）。
+    pub(crate) fn try_cgroup(&self) -> Option<Arc<CgroupNode>> {
+        self.cgroup.upgrade()
+    }
+
+    /// 对应 Linux `mem_cgroup_get_oom_group` 的层级遍历：从 victim 的 memory
+    /// CSS 沿父链向上，直到（并包含）OOM 域 CSS `domain` 为止，返回路径上
+    /// **最高一层**置位 `memory.oom.group` 的 CSS；没有任何一层置位则返回
+    /// `None`。若 victim 的链在到达 `domain` 前就终止（victim 已迁出越限
+    /// 子树），与 Linux 相同忽略 `memory.oom.group`，避免误杀域外任务。
+    /// 根 CSS 在 cgroup2 文件面上不暴露 memory.oom.group（NotOnRoot），
+    /// 因此遍历域内的置位者必然属于用户子树。
+    pub(crate) fn find_oom_group(
+        victim: &Arc<dyn CgroupSubsysState>,
+        domain: &Arc<dyn CgroupSubsysState>,
+    ) -> Option<Arc<dyn CgroupSubsysState>> {
+        let mut found: Option<Arc<dyn CgroupSubsysState>> = None;
+        let mut current = Some(victim.clone());
+        while let Some(css) = current {
+            if css
+                .as_any()
+                .downcast_ref::<MemoryCss>()
+                .is_some_and(|memcg| memcg.oom_group())
+            {
+                // 持续向上覆盖，留下的即最高层置位者。
+                found = Some(css.clone());
+            }
+            if Arc::ptr_eq(&css, domain) {
+                return found;
+            }
+            current = css.parent();
+        }
+        None
+    }
+
     /// 读取 memory.stat（简化版）
     pub fn stat(&self) -> String {
         let inner = self.inner.lock_irqsave();

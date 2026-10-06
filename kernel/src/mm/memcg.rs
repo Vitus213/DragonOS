@@ -436,7 +436,15 @@ pub fn memcg_handle_over_high() {
 
 /// Drain a pending `memory.max` OOM request through the `oom.rs` state
 /// machine, with victim selection scoped to the cgroup subtree whose
-/// limit was exceeded.
+/// limit was exceeded, plus the `memory.oom.group` subtree cleanup.
+///
+/// Linux flow mirrored here (`oom_kill.c::oom_kill_process`): first a
+/// single victim is chosen and killed inside the offending subtree; then
+/// `mem_cgroup_get_oom_group` walks the victim's memory CSS chain up to
+/// the OOM domain and, if any level on that chain has
+/// `memory.oom.group`, the *highest* such group is cleaned by killing
+/// every killable task in its subtree while the group's
+/// `memory.events.oom_group_kill` counter is bumped once per cleanup.
 ///
 /// Returns `Some(outcome)` when the memcg OOM path acted (kill issued and
 /// memory released, or the current task is the victim; or the refusal is
@@ -482,18 +490,169 @@ pub(crate) fn drain_pending_memcg_oom(
     if let Some(memcg) = exceeded.as_any().downcast_ref::<MemoryCss>() {
         memcg.note_memcg_oom();
     }
-    let outcome = oom::scoped_out_of_memory(ctx, pids);
-    match outcome {
-        OomOutcome::Retry | OomOutcome::CurrentTaskKilled => {
-            if let Some(memcg) = exceeded.as_any().downcast_ref::<MemoryCss>() {
-                memcg.note_memcg_oom_kill();
-            }
-            Some(outcome)
+    // `group_cleanup_done` makes the subtree cleanup fire at most once per
+    // drain: the state machine may kill several victims across retries and
+    // must not re-kill the whole group on every victim kill.
+    let mut group_cleanup_done = false;
+    let outcome = oom::scoped_out_of_memory(ctx, pids, &mut |killed| {
+        let Some(killed_tgid) = killed else {
+            return;
+        };
+        if let Some(memcg) = exceeded.as_any().downcast_ref::<MemoryCss>() {
+            memcg.note_memcg_oom_kill();
         }
+        if group_cleanup_done {
+            return;
+        }
+        group_cleanup_done = true;
+        // Linux `mem_cgroup_get_oom_group(victim, oom_domain)`: the group
+        // is resolved from the victim's *current* memory CSS chain; a
+        // victim that already migrated out of the offending subtree
+        // ignores oom.group (see `MemoryCss::find_oom_group`).
+        let Some(victim_css) = victim_memcg_css(killed_tgid) else {
+            return;
+        };
+        let Some(group) = MemoryCss::find_oom_group(&victim_css, &exceeded) else {
+            return;
+        };
+        // Linux `oom_kill_memcg_member` scans the group *subtree*
+        // (`for_each_mem_cgroup_tree` + `css_task_iter`) and kills every
+        // killable task; the main victim above was already SIGKILLed and
+        // counted, so the scan skips its tgid.  The group CSS was found
+        // inside the offending subtree; its node can only be rmdir'd once
+        // it is empty, in which case there is nothing left to clean.
+        let Some(group_memcg) = group.as_any().downcast_ref::<MemoryCss>() else {
+            return;
+        };
+        let Some(group_node) = group_memcg.try_cgroup() else {
+            return;
+        };
+        kill_oom_group_subtree(&group_node, killed_tgid);
+        group_memcg.note_memcg_oom_group_kill();
+    });
+    match outcome {
+        OomOutcome::Retry | OomOutcome::CurrentTaskKilled => Some(outcome),
         // Nothing killable inside the offending subtree: fall through to
         // the global OOM path (same behaviour as its own NoVictim).
         OomOutcome::NoVictim => None,
     }
+}
+
+/// The memory CSS the task `tgid` leader is charged to right now
+/// (Linux: `mem_cgroup_from_task(victim)`).
+fn victim_memcg_css(tgid: RawPid) -> Option<Arc<dyn CgroupSubsysState>> {
+    let pcb = ProcessManager::find(tgid)?;
+    pcb.task_cgroup_node().css(CgroupSubsysId::Memory)
+}
+
+/// Kill every OOM-killable task in the cgroup subtree rooted at `group`
+/// (Linux: `mem_cgroup_scan_tasks(oom_group, oom_kill_memcg_member)`; its
+/// css-task iteration is exactly our per-node `tasks()` walk).
+///
+/// `victim_tgid` is the process the OOM state machine just killed: Linux
+/// SIGKILLs the main victim *before* the scan, so `task_will_free_mem` is
+/// true for it and the member scan skips it; we skip it by tgid to keep
+/// the group cleanup idempotent.
+fn kill_oom_group_subtree(group: &Arc<CgroupNode>, victim_tgid: RawPid) {
+    use crate::arch::ipc::signal::Signal;
+    use crate::ipc::signal_types::{SigCode, SigInfo, SigType};
+    use crate::process::pid::PidType;
+
+    let pids = collect_subtree_tasks(group);
+    let targets = select_group_kill_targets(pids, victim_tgid, |pid| {
+        ProcessManager::find(pid).map(|task| {
+            let tgid = task.raw_tgid();
+            let leader = ProcessManager::find(tgid).unwrap_or(task);
+            // Linux `oom_kill_memcg_member`: init is never killed here,
+            // and tasks that pinned `oom_score_adj` to -1000 are
+            // protected.  The filter keys on the thread group leader so
+            // all threads of one process are treated as one unit.
+            GroupKillProbe {
+                tgid,
+                protected: tgid.data() <= 1
+                    || leader.sig_info_irqsave().oom_score_adj()
+                        == crate::mm::oom::OOM_SCORE_ADJ_MIN,
+            }
+        })
+    });
+    let killed = run_group_kill(&targets, &mut |tgid| {
+        let Some(leader) = ProcessManager::find(tgid) else {
+            return Err(SystemError::ESRCH);
+        };
+        let mut info = SigInfo::new(
+            Signal::SIGKILL,
+            0,
+            SigCode::Kernel,
+            SigType::Kill {
+                pid: RawPid::new(0),
+                uid: 0,
+            },
+        );
+        // PidType::TGID 把 SIGKILL 投递给整个线程组，与 Linux 对进程发
+        // PIDTYPE_TGID 信号一致；成员线程随组消亡。
+        Signal::SIGKILL.send_signal_info_to_pcb(Some(&mut info), leader, PidType::TGID)
+    });
+    log::error!(
+        "memcg oom.group: killed {} task groups in subtree of cgroup '{}'",
+        killed,
+        group.name()
+    );
+}
+
+/// `memory.oom.group` 子树扫描对单个候选 pid 的探测结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct GroupKillProbe {
+    tgid: RawPid,
+    protected: bool,
+}
+
+/// [`kill_oom_group_subtree`] 的纯选择内核：把按 cgroup 收集的线程 pid
+/// 归并到线程组（每组只杀一次），跳过状态机刚刚杀过的主 victim，
+/// 跳过受保护组（init / `oom_score_adj == -1000`），返回待 SIGKILL 的
+/// tgid（首次出现顺序）。
+///
+/// 单独拆出并注入探测闭包，使"越限组子树全部 killable 任务都收到
+/// kill、受保护任务不被误杀、victim 不被重复投递"的语义无需真实进程表
+/// 即可单元测试（见模块尾 `mod tests`）。
+fn select_group_kill_targets(
+    pids: impl IntoIterator<Item = RawPid>,
+    victim_tgid: RawPid,
+    mut probe: impl FnMut(RawPid) -> Option<GroupKillProbe>,
+) -> Vec<RawPid> {
+    let mut targets = Vec::new();
+    for pid in pids {
+        let Some(entry) = probe(pid) else {
+            continue;
+        };
+        if entry.tgid == victim_tgid || entry.protected {
+            continue;
+        }
+        if !targets.contains(&entry.tgid) {
+            targets.push(entry.tgid);
+        }
+    }
+    targets
+}
+
+/// 向每个选中的 tgid 通过 `send` 下发组杀并计数成功次数。选择与投递
+/// 之间消失的 tgid（`send` 返回 Err）只告警不计入，与 Linux 忽略单次
+/// `oom_kill_memcg_member` 迭代失败一致。
+fn run_group_kill(
+    targets: &[RawPid],
+    send: &mut dyn FnMut(RawPid) -> Result<i32, SystemError>,
+) -> usize {
+    let mut killed = 0usize;
+    for tgid in targets {
+        match send(*tgid) {
+            Ok(_) => killed += 1,
+            Err(err) => log::warn!(
+                "memcg oom.group: failed to SIGKILL tgid={:?}: {:?}",
+                tgid,
+                err
+            ),
+        }
+    }
+    killed
 }
 
 /// Walk the charge chain from `leaf` towards the root and return the
@@ -700,5 +859,124 @@ mod tests {
         assert_eq!(uncharged_pages, total as u64);
         assert_eq!(batches, 3);
         assert!(map.iter().all(|s| s.is_none()));
+    }
+
+    /// oom.group=1 越限整组被杀（issue #37）：组内每个进程（线程按
+    /// tgid 归并）都必须恰好收到一次派发，顺序按首次出现。
+    /// 宿主等价测例见 /tmp/pm37-selftest marker-slice（同一份源码）。
+    #[test]
+    fn group_kill_targets_every_process_in_subtree_once() {
+        // pids: 10(leader),11(10 的线程),10,20,30 —— 三个进程。
+        let pids = [10usize, 11, 10, 20, 30]
+            .iter()
+            .map(|p| RawPid::new(*p))
+            .collect::<Vec<_>>();
+        let table = [
+            (10usize, 10usize),
+            (11usize, 10usize),
+            (20usize, 20usize),
+            (30usize, 30usize),
+        ];
+        let targets = select_group_kill_targets(pids.clone(), RawPid::new(0), |pid| {
+            table
+                .iter()
+                .find(|(pid_, _)| *pid_ == pid.data())
+                .map(|(_, tgid)| GroupKillProbe {
+                    tgid: RawPid::new(*tgid),
+                    protected: false,
+                })
+        });
+        assert_eq!(
+            targets,
+            vec![RawPid::new(10), RawPid::new(20), RawPid::new(30)],
+            "越限组子树全部 killable 任务都必须被下发 kill"
+        );
+    }
+
+    /// Linux `oom_kill_memcg_member` 的保护条件：init(tgid<=1) 与
+    /// oom_score_adj=-1000 不杀；主 victim 已由状态机杀过，扫描跳过。
+    #[test]
+    fn group_kill_skips_protected_and_main_victim() {
+        let pids = [1usize, 2, 7, 8]
+            .iter()
+            .map(|p| RawPid::new(*p))
+            .collect::<Vec<_>>();
+        let table = [
+            (1usize, true),
+            (2usize, true),
+            (7usize, false),
+            (8usize, false),
+        ];
+        let targets = select_group_kill_targets(pids.clone(), RawPid::new(7), |pid| {
+            table
+                .iter()
+                .find(|(pid_, _)| *pid_ == pid.data())
+                .map(|(_, protected)| GroupKillProbe {
+                    tgid: pid,
+                    protected: *protected,
+                })
+        });
+        assert_eq!(
+            targets,
+            vec![RawPid::new(8)],
+            "受保护进程（init / adj=-1000）与主 victim 都不许再杀"
+        );
+    }
+
+    /// 进程表里已消失的 pid 不参与派发（探测返回 None）。
+    #[test]
+    fn group_kill_ignores_vanished_pids() {
+        let pids = [5usize, 6, 7]
+            .iter()
+            .map(|p| RawPid::new(*p))
+            .collect::<Vec<_>>();
+        let targets = select_group_kill_targets(pids, RawPid::new(0), |pid| {
+            if pid.data() == 6 {
+                None
+            } else {
+                Some(GroupKillProbe {
+                    tgid: pid,
+                    protected: false,
+                })
+            }
+        });
+        assert_eq!(targets, vec![RawPid::new(5), RawPid::new(7)]);
+    }
+
+    /// `run_group_kill` 只统计成功投递；失败只告警不计数。
+    #[test]
+    fn run_group_kill_counts_only_successes() {
+        let targets = [10usize, 11, 12]
+            .iter()
+            .map(|p| RawPid::new(*p))
+            .collect::<Vec<_>>();
+        let mut sent = Vec::new();
+        let killed = run_group_kill(&targets, &mut |tgid| {
+            sent.push(tgid);
+            if tgid.data() == 11 {
+                Err(SystemError::ESRCH)
+            } else {
+                Ok(0)
+            }
+        });
+        assert_eq!(sent, targets);
+        assert_eq!(killed, 2, "ESRCH 的组不计入成功数");
+    }
+
+    /// Linux `memory_oom_group_write`：仅 0/1 有效，其它一律 EINVAL。
+    #[test]
+    fn oom_group_write_accepts_only_zero_and_one() {
+        use crate::cgroup::controllers::memory::parse_oom_group_value;
+        assert_eq!(parse_oom_group_value("0"), Ok(false));
+        assert_eq!(parse_oom_group_value("1"), Ok(true));
+        assert_eq!(parse_oom_group_value("1\n"), Ok(true));
+        assert_eq!(parse_oom_group_value(" 0 "), Ok(false));
+        for bad in ["2", "-1", "max", "", " ", "0x1", "1a", "0.0", "11"] {
+            assert_eq!(
+                parse_oom_group_value(bad),
+                Err(SystemError::EINVAL),
+                "Linux 对 {bad:?} 返回 -EINVAL"
+            );
+        }
     }
 }

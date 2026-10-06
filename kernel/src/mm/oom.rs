@@ -90,7 +90,7 @@ struct OomCandidate {
     oom_score_adj: i16,
 }
 
-const OOM_SCORE_ADJ_MIN: i16 = -1000;
+pub(crate) const OOM_SCORE_ADJ_MIN: i16 = -1000;
 
 fn wake_oom_waiters() {
     OOM_WAITQ.wake_all();
@@ -432,6 +432,7 @@ fn wait_until_recoverable(generation: u64) -> Result<(), SystemError> {
 fn out_of_memory_loop(
     ctx: OomContext,
     select: &mut dyn FnMut() -> Option<OomCandidate>,
+    on_kill: &mut dyn FnMut(Option<RawPid>),
 ) -> OomOutcome {
     loop {
         if current_is_killed_or_exiting() {
@@ -471,6 +472,7 @@ fn out_of_memory_loop(
             Ok(killed_tgid) => {
                 if let Some(killed_tgid) = killed_tgid {
                     count_oom_kill();
+                    on_kill(Some(killed_tgid));
                     error!(
                         "oom-kill: trigger_pid={} trigger_tgid={} victim_tgid={} score={} adj={} rss={} order={} addr={:#x} ip={:#x}",
                         ctx.trigger_pid,
@@ -521,16 +523,26 @@ pub fn pagefault_out_of_memory(ctx: OomContext) -> OomOutcome {
     if let Some(outcome) = super::memcg::drain_pending_memcg_oom(ctx) {
         return outcome;
     }
-    out_of_memory_loop(ctx, &mut select_victim)
+    out_of_memory_loop(ctx, &mut select_victim, &mut |_| {})
 }
 
 /// Cgroup-scoped OOM (`memory.max`): victim selection is restricted to
 /// `candidate_pids` (the subtree of the CSS whose limit was exceeded);
 /// selection, kill and recovery still run through the shared state
 /// machine, so memcg and global OOM exclude each other and share the
-/// inflight-victim bookkeeping.
-pub fn scoped_out_of_memory(ctx: OomContext, candidate_pids: Vec<RawPid>) -> OomOutcome {
-    out_of_memory_loop(ctx, &mut || select_victim_from(candidate_pids.clone()))
+/// inflight-victim bookkeeping.  `on_kill` fires once per successful kill
+/// with the victim tgid, letting the memcg caller count `oom_kill` events
+/// and run the `memory.oom.group` subtree cleanup.
+pub fn scoped_out_of_memory(
+    ctx: OomContext,
+    candidate_pids: Vec<RawPid>,
+    on_kill: &mut dyn FnMut(Option<RawPid>),
+) -> OomOutcome {
+    out_of_memory_loop(
+        ctx,
+        &mut || select_victim_from(candidate_pids.clone()),
+        on_kill,
+    )
 }
 
 pub fn notify_mm_drop(mm_id: u64) {
