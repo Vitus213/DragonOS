@@ -1565,10 +1565,15 @@ pub fn cgroup_migrate_commit(
 /// 才进入不可失败的提交点（`cgroup_migrate_commit`），最后对已执行过
 /// can_attach 的控制器逐个 `attach` 收尾。
 ///
-/// 调用方必须持有 `cgroup_accounting_lock`（与 `rmdir`、fork 计费点
-/// 串行化，保证 `src` 在事务内不会消亡）与线程组变更锁
-/// （`cgroup_threadgroup_change_begin` 的对应物，见 `inode.rs`），
-/// 且 `to_move` 中的任务在锁序保证下不会在预演与提交之间退出。
+/// 调用方必须持有 `cgroup_accounting_lock`（与 `rmdir`、fork 计费点、
+/// do_exit 的锁内成员摘除串行化，保证 `src` 在事务内不会消亡），并向
+/// 本函数传入**取锁后复核过的存活快照**（`inode.rs::write_procs` 的
+/// `task_attachable` retain，issue #29 的线性化点）：do_exit 对成员表
+/// 的 remove_task 在同一把 accounting 锁内执行，因此锁内复核后，
+/// `to_move` 中的任务不会被摘出 `src`，提交点（`set_task_cgroup_node`
+/// 对 src 的 remove_task）不可失败。Linux 用 `cgroup_threadgroup_rwsem`
+/// 读侧达成同一保证；DragonOS 无该锁，由 accounting 锁 + 复核承担。
+/// fork 新增的线程不在本快照内，与 Linux 对单线程快照迁移的语义一致。
 /// 目标合法性 vet（`cgroup_migrate_vet_dst`）由调用方在事务前执行
 /// （对应 Linux `cgroup_attach_task` 先 vet_dst 再 `cgroup_migrate`）。
 pub fn cgroup_migrate_execute(

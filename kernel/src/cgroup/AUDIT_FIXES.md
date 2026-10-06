@@ -181,4 +181,5 @@ Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 1
 - 验证：`make kernel ARCH=x86_64` 通过；在树 pids.rs 迁移事务单测
   3 例（跨层级预搬-回退互逆 / 预演内前缀自撤 ENOENT / max 不阻塞组织
   迁移）宿主切片执行全绿；失败回滚与半迁移对照的组成员/freezer 级证明
-  见 issue #38 评论的 before/after 取证用例（6 例全绿）。
+  见 issue #38 评论的 before/after 取证用例（before 5 例复现基线缺陷、
+  after 6 例证明回滚，全绿）。
