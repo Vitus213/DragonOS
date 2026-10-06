@@ -348,7 +348,9 @@ pub(super) fn submit_default_read_batch<B: PageCacheBackend + ?Sized + 'static>(
     // io.stat 记账会落到恰好跑工作线程的内核任务上（根组）。
     let io_owner = super::current_block_io_owner();
     let work = Work::new(move || {
-        let _owner_guard = io_owner.map(crate::driver::base::block::blkcg::set_io_owner);
+        let _owner_guard = io_owner
+            .as_ref()
+            .map(|owner| crate::driver::base::block::blkcg::set_io_owner(owner.clone()));
         for offset in 0..request.page_count {
             let mut payload = [0u8; MMArch::PAGE_SIZE];
             let page_index = request.start_index + offset;

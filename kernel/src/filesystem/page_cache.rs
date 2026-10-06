@@ -2743,7 +2743,9 @@ impl PageCache {
             let Some(_domain_io) = work_state.lock().take() else {
                 return;
             };
-            let _owner_guard = io_owner.map(crate::driver::base::block::blkcg::set_io_owner);
+            let _owner_guard = io_owner
+                .as_ref()
+                .map(|owner| crate::driver::base::block::blkcg::set_io_owner(owner.clone()));
             let read_len = if let Some(backend) = backend.as_ref() {
                 backend.read_page_async(page_index, &page).wait()
             } else if let Some(inode) = inode.as_ref().and_then(|inode| inode.upgrade()) {
