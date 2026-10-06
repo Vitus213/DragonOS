@@ -30,3 +30,20 @@ Darwin arm64 无 KVM，TCG guest smoke 启动不可接受；此前连续观察 1
 ### 未做
 
 - `dma_alloc_pages_raw`/`E1000EBuffer::new` 的 `.expect`：被外部 crate virtio-drivers `Hal::dma_alloc`（无 Result 签名）与 smoltcp token 接口锁死，DragonOS 侧无法本质传播；属"panic 与全局 OOM handler 同档"的遗留面，整改表已定界，待 fork 上游或 bounce-pool 预取方案另卡处理。
+
+## issue #28 — memcg 锁序与中断纪律倒置修复
+
+- `memcg_free_uncharge` 两段式：持 `PAGE_OWNERS`（irqsave）仅把连续同归属
+  页帧摘取进 `FREE_RUN_BATCH=8` 栈批（锁内零分配、零嵌套），放锁后逐段
+  `uncharge_css`。消除原实现的 PAGE_OWNERS→MEMORY_CHARGE_LOCK 嵌套边
+  （与 charge 侧顺序使用两锁的方向相反）。
+- memcg 锁族全部获取点统一 `lock_irqsave()`：`PAGE_OWNERS` 3 处（init /
+  `record_frame_owners` / free 摘取循环）、`MEMORY_CHARGE_LOCK` 4 处、
+  `MemoryCss::inner`/`flags` 39 处、`PENDING_MAX_OOM` 2 处——硬中断的帧
+  释放路径可达整条 charge 锁链，IRQ-on 持有者等于把同 CPU 重入非重入
+  CAS 自旋的死锁窗口留给下一次驱动释放。
+- 与进程侧锁（rq_lock/freezer task_lock/pi_lock/task_lock）无嵌套边：
+  `try_charge` 的 `wakeup_claim_thread` 调用点在事务块之外、freezer/OOM
+  链不含 memcg 锁（全序图与逐交叉点论证：`kernel/src/cgroup/LOCK_ORDER.md`）。
+- 验证：`make kernel ARCH=x86_64` 通过；`take_owner_runs` 纯函数宿主
+  单测 6 例全绿（摘取归并/缝隙/钳制/满批续扫收敛/边界不越批）。

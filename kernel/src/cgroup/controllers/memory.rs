@@ -32,6 +32,14 @@ const PAGE_SIZE: usize = MMArch::PAGE_SIZE;
 /// Serializes hierarchical charge transactions.  Holding this lock across the
 /// limit checks and updates makes a charge all-or-nothing for the whole CSS
 /// ancestry, rather than only for the leaf CSS.
+///
+/// 中断纪律（issue #28，全序图 `kernel/src/cgroup/LOCK_ORDER.md` §1.1）：
+/// 本锁及其内层的 `MemoryCss::inner`/`flags` 一律 `lock_irqsave()` 获取——
+/// 硬中断的页帧释放路径会经 `mm::memcg::memcg_free_uncharge` 单独取得
+/// 本锁族（free 两段式：PAGE_OWNERS 内只摘归属，放锁后才进到这里），
+/// IRQ-on 持有者会被同 CPU 硬中断重进非重入 CAS 自旋锁而死锁。
+/// 临界区内禁止睡眠/分配/回调页分配器/获取调度器锁；与 PAGE_OWNERS
+/// 互不嵌套（不变式 I3）。
 static MEMORY_CHARGE_LOCK: SpinLock<()> = SpinLock::new(());
 
 /// Memory 控制器状态
