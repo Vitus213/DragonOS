@@ -78,11 +78,15 @@ impl ProcessManager {
             }
             return Ok(());
         }
-        // 冻结任务吞掉唤醒请求：对应 Linux refrigerator 的 while(frozen) 回睡
-        // 循环——冻结期间任何事件唤醒（包括 spurious wakeup）都不允许把任务
-        // 带回 RUNNING；解冻路径（freezer::unfreeze_task）是唯一恢复出口。
-        // 与 freeze_task()/__refrigerator() 的 FROZEN 置位同在 pi_lock 下串行。
+        // 冻结任务暂存唤醒请求：对应 Linux 冻结任务“唤醒不丢失”的语义——
+        // Linux 中冻结睡眠（TASK_FROZEN / freezer trap）期间到达的事件唤醒
+        // 虽然不会立即把任务带回 RUNNING，但等待条件已被置位，任务离开
+        // refrigerator 后经由等待循环的条件重查恢复运行。DragonOS 的一次性
+        // 唤醒原语没有条件重查，故用 WAKE_PENDING 保存唤醒，由解冻路径
+        // （freezer::unfreeze_task / 迁移解冻）重放。与 freeze_task()/
+        // __refrigerator() 的 FROZEN 置位同在 pi_lock 下串行，无撕裂窗口。
         if pcb.flags().contains(ProcessFlags::FROZEN) {
+            pcb.flags().insert(ProcessFlags::WAKE_PENDING);
             return Ok(());
         }
         let was_uninterruptible = matches!(state, ProcessState::Blocked(false));

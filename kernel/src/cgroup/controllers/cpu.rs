@@ -147,14 +147,14 @@ impl CpuCss {
         (tg.quota_us, tg.period_us)
     }
 
-    /// 设置带宽限制
     pub fn set_bandwidth(&self, quota_us: Option<u64>, period_us: u64) -> Result<(), SystemError> {
-        // Linux 限制：period 范围 1ms-1s，quota 不超过 1s
+        // Linux CFS bandwidth accepts a 1ms..1s period.  A finite quota
+        // must be at least 1ms and no greater than the period.
         if period_us < 1000 || period_us > 1_000_000 {
             return Err(SystemError::EINVAL);
         }
-        if let Some(q) = quota_us {
-            if q > 1_000_000 {
+        if let Some(quota) = quota_us {
+            if quota < 1000 || quota > period_us {
                 return Err(SystemError::EINVAL);
             }
         }

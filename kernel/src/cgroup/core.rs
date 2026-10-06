@@ -614,16 +614,32 @@ impl CgroupNode {
     }
 
 
-    /// 获取 freeze 请求状态
+    /// Get whether this cgroup itself requested freezing, for cgroup.freeze.
+    /// 获取有效冻结请求（包括祖先传播的请求）。
     pub fn freeze_requested(&self) -> bool {
-        if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
-            if let Some(freezer) = freezer_css.as_any().downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>() {
+        if let Some(css) = self.css(CgroupSubsysId::Freezer) {
+            if let Some(freezer) = css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>()
+            {
                 return freezer.freeze_requested();
             }
         }
         false
     }
 
+    pub fn self_freeze_requested(&self) -> bool {
+        if let Some(css) = self.css(CgroupSubsysId::Freezer) {
+            if let Some(freezer) = css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>()
+            {
+                return freezer.self_freeze_requested();
+            }
+        }
+        false
+
+    }
     /// 设置 freeze 请求
     pub fn set_freeze_requested(&self, freeze: bool) {
         if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
@@ -634,9 +650,14 @@ impl CgroupNode {
     }
 
     /// 检查 cgroup 是否已冻结
+    /// The kernel v2 `cgroup.events` frozen bit reports whether this
+    /// cgroup's own freeze request has completed for its subtree.
     pub fn is_frozen(&self) -> bool {
         if let Some(freezer_css) = self.css(CgroupSubsysId::Freezer) {
-            if let Some(freezer) = freezer_css.as_any().downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>() {
+            if let Some(freezer) = freezer_css
+                .as_any()
+                .downcast_ref::<crate::cgroup::controllers::freezer::FreezerCss>()
+            {
                 return freezer.is_frozen();
             }
         }
@@ -715,6 +736,9 @@ impl CgroupRoot {
         }
 
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        // Freeze requests and CSS publication share the accounting lock so a
+        // child cannot miss an ancestor freeze racing with mkdir.
+        let _accounting_guard = cgroup_accounting_lock().lock();
         let child = CgroupNode::new_child(id, name.to_string(), parent);
         Self::initialize_css(&child, Some(parent))?;
         child.device_bpf.write().effective = parent.device_bpf.read().effective.clone();

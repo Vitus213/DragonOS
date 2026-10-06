@@ -544,6 +544,10 @@ impl Cgroup2Inode {
 
         for task in &to_move {
             task.set_task_cgroup_node(cgroup.clone());
+            // 换组点直接调用 freezer 迁移调整（对应 Linux 在
+            // css_set_move_task() 后调用 cgroup_freezer_migrate_task）：
+            // 按目标组状态冻结或解冻，并迁移/清理源组计数与 wakeable。
+            crate::cgroup::controllers::freezer::cgroup_freezer_migrate_task(task, &src, cgroup);
         }
         for id in crate::cgroup::subsys::CgroupSubsysId::all() {
             if let Some(css) = cgroup.css(*id) {

@@ -1236,14 +1236,10 @@ pub(crate) fn account_cgroup_runtime(
         .task_cgroup_node()
         .css(CgroupSubsysId::Cpu)?;
     let css = css_state.as_any().downcast_ref::<CpuCss>()?;
-
-    match css.account_runtime_checked(clock_ns, delta_ns, false) {
-        CpuRuntimeDecision::Throttle {
-            period_deadline_ns,
-            ..
-        } => Some(period_deadline_ns),
-        CpuRuntimeDecision::Unlimited
-        | CpuRuntimeDecision::Allow { .. } => None,
+    let user = false;
+    match css.account_runtime_checked(clock_ns, delta_ns, user) {
+        CpuRuntimeDecision::Throttle { period_deadline_ns, .. } => Some(period_deadline_ns),
+        CpuRuntimeDecision::Unlimited | CpuRuntimeDecision::Allow { .. } => None,
     }
 }
 

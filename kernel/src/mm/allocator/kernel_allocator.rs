@@ -56,7 +56,7 @@ impl KernelAllocator {
     unsafe fn alloc_in_buddy(&self, layout: Layout) -> Result<NonNull<[u8]>, AllocError> {
         let page_frame_count = buddy_frame_count(layout);
         let (phy_addr, allocated_frame_count) = LockedFrameAllocator
-            .allocate(page_frame_count)
+            .allocate_unaccounted(page_frame_count)
             .ok_or(AllocError)?;
         if allocated_frame_count != page_frame_count {
             LockedFrameAllocator.free(phy_addr, allocated_frame_count);

@@ -387,9 +387,11 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
             format!("populated {}\nfrozen {}\n", populated, frozen).into_bytes()
         }
         CgroupCoreFile::Type => format!("{}\n", cgroup.cgroup_type_name()).into_bytes(),
-        CgroupCoreFile::Freeze => {
-            format!("{}\n", if cgroup.freeze_requested() { 1 } else { 0 }).into_bytes()
-        }
+        CgroupCoreFile::Freeze => format!(
+            "{}\n",
+            if cgroup.self_freeze_requested() { 1 } else { 0 }
+        )
+        .into_bytes(),
         CgroupCoreFile::CpuStat => cpu_stat_for(cgroup),
         CgroupCoreFile::CpuWeight => cpu_bytes(cgroup, |cpu| {
             format!("{}\n", cpu.shares()).into_bytes()
@@ -404,8 +406,12 @@ pub(super) fn read_file(cgroup: &Arc<CgroupNode>, ty: CgroupCoreFile) -> Vec<u8>
         CgroupCoreFile::MemoryPeak => memory_bytes(cgroup, |memory| {
             format!("{}\n", memory.peak()).into_bytes()
         }),
-        CgroupCoreFile::MemoryMin => memory_bytes(cgroup, |memory| encode_max_u64(memory.min())),
-        CgroupCoreFile::MemoryLow => memory_bytes(cgroup, |memory| encode_max_u64(memory.low())),
+        CgroupCoreFile::MemoryMin => {
+            memory_bytes(cgroup, |memory| encode_zero_or_value(memory.min()))
+        }
+        CgroupCoreFile::MemoryLow => {
+            memory_bytes(cgroup, |memory| encode_zero_or_value(memory.low()))
+        },
         CgroupCoreFile::MemoryHigh => memory_bytes(cgroup, |memory| encode_max_u64(memory.high())),
         CgroupCoreFile::MemoryMax => memory_bytes(cgroup, |memory| encode_max_u64(memory.max())),
         CgroupCoreFile::MemoryEvents => memory_bytes(cgroup, |memory| memory.events().into_bytes()),
@@ -697,7 +703,13 @@ fn encode_max_u64(value: Option<u64>) -> Vec<u8> {
         None => b"max\n".to_vec(),
     }
 }
+fn encode_zero_or_value(value: Option<u64>) -> Vec<u8> {
+    match value {
+        Some(v) => format!("{}\n", v).into_bytes(),
+        None => b"0\n".to_vec(),
+    }
 
+}
 fn parse_max_u64(input: &str) -> Result<Option<u64>, SystemError> {
     let trimmed = input.trim();
     if trimmed == "max" {

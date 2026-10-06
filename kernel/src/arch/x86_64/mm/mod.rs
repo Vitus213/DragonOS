@@ -787,11 +787,18 @@ pub fn test_buddy() {
 pub struct LockedFrameAllocator;
 
 impl LockedFrameAllocator {
+    /// Allocate kernel-owned buddy frames without memory-cgroup charging.
+    pub unsafe fn allocate_unaccounted(
+        &self,
+        count: PageFrameCount,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        Self::allocate_inner(count.next_power_of_two())
+    }
     unsafe fn allocate_inner(count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.allocate(count);
+        if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+            allocator.allocate(count)
         } else {
-            return None;
+            None
         }
     }
 }
@@ -800,20 +807,13 @@ impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(&mut self, mut count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         count = count.next_power_of_two();
         if let Some((addr, actual)) = unsafe { Self::allocate_inner(count) } {
-            // memcg charge after the raw allocation, outside the inner
-            // allocator lock. On refusal the frames are returned below
-            // without recorded ownership, so the free path performs no
-            // uncharge — refused charges never touch any CSS counter.
             if crate::mm::memcg::memcg_alloc_charge(addr, actual.data() as u64).is_ok() {
                 return Some((addr, actual));
             }
-            unsafe {
-                if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
-                    allocator.free(addr, actual);
-                }
+            if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+                allocator.free(addr, actual);
             }
         }
-
         retry_oom_victim_page_frame_alloc(|| unsafe { Self::allocate_inner(count) })
     }
 
@@ -830,10 +830,8 @@ impl FrameAllocator for LockedFrameAllocator {
         };
         let (addr, actual) = allocation?;
         if crate::mm::memcg::memcg_alloc_charge(addr, actual.data() as u64).is_err() {
-            unsafe {
-                if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
-                    allocator.free(addr, actual);
-                }
+            if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+                allocator.free(addr, actual);
             }
             return None;
         }
@@ -842,17 +840,15 @@ impl FrameAllocator for LockedFrameAllocator {
 
     unsafe fn free(&mut self, address: crate::mm::PhysAddr, count: PageFrameCount) {
         assert!(count.data().is_power_of_two());
-        // Uncharge the CSS that owns these frames (if any) before they
-        // return to the buddy allocator.
         crate::mm::memcg::memcg_free_uncharge(address, count.data() as u64);
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.free(address, count);
+        if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+            allocator.free(address, count);
         }
     }
 
     unsafe fn usage(&self) -> PageFrameUsage {
-        if let Some(ref mut allocator) = *INNER_ALLOCATOR.lock_irqsave() {
-            return allocator.usage();
+        if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+            allocator.usage()
         } else {
             panic!("usage error");
         }

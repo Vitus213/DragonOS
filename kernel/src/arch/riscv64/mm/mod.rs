@@ -472,6 +472,20 @@ pub unsafe fn kernel_page_flags<A: MemoryManagementArch>(_virt: VirtAddr) -> Ent
 #[derive(Debug, Clone, Copy, Hash)]
 pub struct LockedFrameAllocator;
 
+impl LockedFrameAllocator {
+    /// Allocate kernel-owned frames without memory-cgroup charging.
+    pub unsafe fn allocate_unaccounted(
+        &self,
+        count: PageFrameCount,
+    ) -> Option<(PhysAddr, PageFrameCount)> {
+        if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+            allocator.allocate(count)
+        } else {
+            None
+        }
+    }
+}
+
 impl FrameAllocator for LockedFrameAllocator {
     unsafe fn allocate(&mut self, count: PageFrameCount) -> Option<(PhysAddr, PageFrameCount)> {
         let allocation = if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
@@ -480,15 +494,9 @@ impl FrameAllocator for LockedFrameAllocator {
             None
         };
         let (addr, actual) = allocation?;
-        // memcg charge after the raw allocation, outside the inner
-        // allocator lock. On refusal the frames are returned below
-        // without recorded ownership, so the free path performs no
-        // uncharge — refused charges never touch any CSS counter.
         if crate::mm::memcg::memcg_alloc_charge(addr, actual.data() as u64).is_err() {
-            unsafe {
-                if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
-                    allocator.free(addr, actual);
-                }
+            if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+                allocator.free(addr, actual);
             }
             return None;
         }
@@ -507,10 +515,8 @@ impl FrameAllocator for LockedFrameAllocator {
         };
         let (addr, actual) = allocation?;
         if crate::mm::memcg::memcg_alloc_charge(addr, actual.data() as u64).is_err() {
-            unsafe {
-                if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
-                    allocator.free(addr, actual);
-                }
+            if let Some(allocator) = &mut *INNER_ALLOCATOR.lock_irqsave() {
+                allocator.free(addr, actual);
             }
             return None;
         }

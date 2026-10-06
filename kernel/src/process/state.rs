@@ -229,6 +229,10 @@ bitflags! {
         const FROZEN = 1 << 26;
         /// Task is being frozen (transition state).
         const FREEZING = 1 << 27;
+        /// 冻结期间到达、被暂存的唤醒请求（对应 Linux 冻结任务的唤醒不丢失语义）。
+        /// wakeup() 遇到 FROZEN 任务时置位；解冻路径（unfreeze_task / 迁移解冻）
+        /// 消费此标志并重放唤醒，保证冻结期的唤醒不丢失。
+        const WAKE_PENDING = 1 << 28;
     }
 }
 

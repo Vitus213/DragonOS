@@ -158,13 +158,12 @@ impl MemoryCss {
         self.high_trip.swap(false, Ordering::Relaxed)
     }
 
-    /// Whether this CSS's usage currently exceeds its own `memory.max`.
-    /// Used to re-derive the scope of a refused charge on the OOM path.
+
+    /// Whether this CSS's usage is still at or above its own `memory.max`.
     pub(crate) fn max_exceeded_now(&self) -> bool {
         let inner = self.inner.lock();
-        inner.max.is_some_and(|max| inner.usage > max)
+        inner.max.is_some_and(|max| inner.usage >= max)
     }
-
     /// Count a `memory.events` `oom` event (scoped OOM machinery entered).
     pub(crate) fn note_memcg_oom(&self) {
         self.inner.lock().events.oom.fetch_add(1, Ordering::Relaxed);

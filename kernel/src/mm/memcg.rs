@@ -25,7 +25,7 @@
 //!   `mem_cgroup_handle_over_high()` and the memcg OOM handler.
 
 use alloc::{
-    sync::{Arc, Weak},
+    sync::Arc,
     vec::Vec,
 };
 use system_error::SystemError;
@@ -59,10 +59,9 @@ const MEMORY_HIGH_MAX_ROUNDS: u32 = 8;
 static PAGE_OWNERS: SpinLock<Option<Vec<Option<Arc<dyn CgroupSubsysState>>>>> = SpinLock::new(None);
 
 /// Leaf memory CSS of the most recent charge refused by a `memory.max`
-/// limit.  The fault path drains this through the `oom.rs` state machine
-/// (cgroup-scoped victim selection), which may sleep — hence it must not
-/// run inside the allocator hook.
-static PENDING_MAX_OOM: SpinLock<Option<Weak<dyn CgroupSubsysState>>> = SpinLock::new(None);
+/// limit.  The refusal is retained until the fault path consumes it;
+/// concurrent refusals are serialized instead of overwriting one another.
+static PENDING_MAX_OOM: SpinLock<Option<Arc<dyn CgroupSubsysState>>> = SpinLock::new(None);
 
 /// Size the per-frame ownership map from the physical memory map.
 ///
@@ -143,10 +142,13 @@ pub fn memcg_alloc_charge(start: PhysAddr, pages: u64) -> Result<(), SystemError
             Ok(())
         }
         Err(err) => {
-            // A memory.max somewhere on the hierarchy refused the charge.
-            // Remember the leaf CSS; the fault path drains this through
-            // oom::scoped_out_of_memory, outside every allocator lock.
-            *PENDING_MAX_OOM.lock() = Some(Arc::downgrade(&css));
+            // Keep the first refusal until the fault path consumes it.
+            // Later concurrent refusals are coalesced instead of replacing
+            // the CSS that identified the active OOM scope.
+            let mut pending = PENDING_MAX_OOM.lock();
+            if pending.is_none() {
+                *pending = Some(css.clone());
+            }
             Err(err)
         }
     }
@@ -266,10 +268,7 @@ pub(crate) fn drain_pending_memcg_oom(
 ) -> Option<crate::mm::oom::OomOutcome> {
     use crate::mm::oom::{self, OomOutcome};
 
-    let leaf = PENDING_MAX_OOM
-        .lock()
-        .take()
-        .and_then(|weak| weak.upgrade())?;
+    let leaf = PENDING_MAX_OOM.lock().take()?;
 
     // The refusal may already have been relieved (a kill from another
     // charger, task exits, or a raised limit).
